@@ -1,0 +1,14 @@
+{
+  "permissions": {
+    "allow": [
+      "PowerShell(cd \"C:\\\\Users\\\\David\\\\Downloads\\\\verdict-app\"; Start-Process -NoNewWindow -FilePath \"npm\" -ArgumentList \"run\",\"dev\" -RedirectStandardOutput \"$env:TEMP\\\\verdict-dev.log\" -RedirectStandardError \"$env:TEMP\\\\verdict-dev-err.log\"; Start-Sleep 4; Get-Content \"$env:TEMP\\\\verdict-dev.log\",\"$env:TEMP\\\\verdict-dev-err.log\" -ErrorAction SilentlyContinue)",
+      "PowerShell(cd \"C:\\\\Users\\\\David\\\\Downloads\\\\verdict-app\"; $job = Start-Job { Set-Location \"C:\\\\Users\\\\David\\\\Downloads\\\\verdict-app\"; npm run dev 2>&1 }; Start-Sleep 5; Receive-Job $job)",
+      "PowerShell(Start-Sleep 3; Receive-Job -Id \\($job = Get-Job | Select-Object -Last 1\\).Id)",
+      "PowerShell(Get-Job)",
+      "Bash(mkdir -p \"C:\\\\Users\\\\David\\\\Downloads\\\\verdict-app\\\\.claude\")",
+      "mcp__Claude_Preview__preview_start",
+      "Bash(npm install *)",
+      "Bash(node --input-type=module)"
+    ]
+  }
+}
