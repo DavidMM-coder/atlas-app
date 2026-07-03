@@ -3,6 +3,11 @@ html, body, #root {
   margin: 0;
 }
 body {
-  background: #060a06;
+  background: #0B0B10;
+  color: #F4F4F6;
+  font-family: 'Inter', system-ui, -apple-system, sans-serif;
   -webkit-font-smoothing: antialiased;
+  -moz-osx-font-smoothing: grayscale;
+  text-rendering: optimizeLegibility;
 }
+a { color: inherit; }

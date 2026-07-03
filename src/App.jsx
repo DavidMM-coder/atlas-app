@@ -1,27 +1,79 @@
-import React, { useState, useEffect, useRef } from "react";
-import Backtester from "./Backtester.jsx";
+import React, { useState, useEffect, useRef, useCallback, Suspense, lazy } from "react";
 import AuthScreen from "./Auth.jsx";
-import { auth, onAuthStateChanged, signOut, saveUserToFirestore } from "./firebase.js";
-import * as XLSX from "xlsx";
+import { auth, onAuthStateChanged, signOut, saveUserToFirestore, loadUserData, saveUserData } from "./firebase.js";
+import { API_BASE, apiUrl } from "./lib/api.js";
+import { color as c, font, type, radius, shadow, space, scoreColor, grade, actionColor } from "./ui/tokens.js";
+
+// Loaded on demand: the backtester is a whole screen most sessions never open, and xlsx is a
+// ~400KB parser only needed the moment a spreadsheet is actually imported. Keeping both out
+// of the entry chunk cuts the initial download for every visit.
+const Backtester = lazy(() => import("./Backtester.jsx"));
+import {
+  AtlasStyles, AtlasMotionProvider, AtlasMark, Overline, Text,
+  Button, IconButton, Card, Divider, Input, TextArea, Field, Select,
+  SegmentedControl, Tabs, Badge, Tag, CallChip, AnimatedNumber, ScoreRing, MeterBar,
+  StatTile, MetricTable, Sparkline, InfoTip, Spinner, Skeleton, LoadingBlock,
+  ErrorBanner, EmptyState, Modal, SlideOver, motion, AnimatePresence,
+} from "./ui/primitives.jsx";
+import { fetchHistoricalStats, historicalStatsText, runBuyAndHold, calcStats, backtestSmaCrossover } from "./lib/marketStats.js";
+
+// Catches a render error in whichever screen is active and shows a recoverable message instead
+// of letting it unmount the entire app (React's default with no error boundary is a blank page).
+class ScreenErrorBoundary extends React.Component {
+  constructor(props) { super(props); this.state = { error: null }; }
+  static getDerivedStateFromError(error) { return { error }; }
+  componentDidCatch(error, info) { console.error("Screen render error:", error, info); }
+  render() {
+    if (this.state.error) {
+      return (
+        <Card>
+          <EmptyState
+            title="This screen hit a snag"
+            hint={this.state.error?.message || "Something didn't render right. Try again, or switch tabs."}
+            action={<Button onClick={() => this.setState({ error: null })}>Try again</Button>}
+          />
+        </Card>
+      );
+    }
+    return this.props.children;
+  }
+}
+
+// The four main screens are built as plain inline JSX in VerdictApp's own render body (not
+// separate components React can defer), so any inline expression that throws while CONSTRUCTING
+// the active tab's tree — e.g. holdings.map() or result.pillars.x on an unexpected shape — throws
+// synchronously out of VerdictApp itself, before React ever gets to ScreenErrorBoundary below.
+// That's the "black screen, can't even click nav" failure: the whole component call throws, so
+// nothing renders at all, not even the boundary. Catching it right here, at construction time,
+// is what actually contains it to the one broken screen.
+function renderSafely(label, build) {
+  try { return build(); }
+  catch (e) {
+    console.error(`${label} screen failed to render:`, e);
+    return (
+      <Card>
+        <EmptyState title="This screen hit a snag" hint={e?.message || "Something didn't render right. Try switching tabs and back."} />
+      </Card>
+    );
+  }
+}
 
 // ============================================================
-//  VERDICT v3
-//  Trading-style shell · Discover / Portfolio / Research
-//  Deep personalized onboarding · holdings with buy/hold/sell calls
-//  Evaluation by Claude with bounded live web search.
+//  ATLAS — "Obsidian" build
+//  Dark, premium fintech. Discover / Portfolio / Research / Backtest.
+//  Presentation rebuilt on the central design system; all data,
+//  state, prompts and API logic preserved unchanged.
 // ============================================================
 
-const P = {
-  paper: "#060a06", card: "#0b110b", ink: "#e8f5e9", slate: "#a5d6a7",
-  faint: "#4a7a4a", line: "#163016", brass: "#00e676", red: "#ff5252",
-  amber: "#ffab40", green: "#00e676", wash: "#080d08",
-  cardBorder: "#1a301a", accent: "#00e676", dim: "#1e3a1e",
-  accentDim: "#00e67622", accentBorder: "#00e67644",
-  header: "#040804", rowHover: "#0f1a0f",
-};
-const F = { serif: "Inter, sans-serif", sans: "Inter, sans-serif", mono: "'IBM Plex Mono', monospace" };
-
-const ACTION_COLOR = { "Buy more": "#00e5a0", "Add": "#00e5a0", "Hold": "#4a5568", "Trim": "#f5a623", "Sell": "#ff4d4d" };
+function useIsMobile() {
+  const [mobile, setMobile] = useState(() => window.innerWidth < 768);
+  useEffect(() => {
+    const handler = () => setMobile(window.innerWidth < 768);
+    window.addEventListener("resize", handler);
+    return () => window.removeEventListener("resize", handler);
+  }, []);
+  return mobile;
+}
 
 // ---------- glossary + tooltip ----------
 const GLOSSARY = {
@@ -39,151 +91,39 @@ const GLOSSARY = {
   "Beta": "How much a stock moves relative to the market. Beta of 1.5 means it typically moves 50% more than the market — up or down.",
   "Total Return": "How much your investment grew overall, including price gains and any dividends reinvested. The most honest single performance number.",
 };
-
-function Tooltip({ term, children }) {
-  const [visible, setVisible] = useState(false);
-  const def = GLOSSARY[term];
-  if (!def) return children || null;
-  return (
-    <span style={{ position: "relative", display: "inline-flex", alignItems: "center", gap: 4 }}>
-      {children}
-      <span
-        onMouseEnter={() => setVisible(true)}
-        onMouseLeave={() => setVisible(false)}
-        style={{ display: "inline-flex", alignItems: "center", justifyContent: "center", width: 15, height: 15, borderRadius: "50%", border: `1px solid ${P.faint}`, fontFamily: F.sans, fontSize: 9, fontWeight: 700, color: P.faint, cursor: "default", flexShrink: 0, lineHeight: 1 }}
-      >?</span>
-      {visible && (
-        <span style={{ position: "absolute", bottom: "calc(100% + 8px)", left: "50%", transform: "translateX(-50%)", width: 260, background: P.card, border: `1px solid ${P.accent}55`, borderRadius: 8, padding: "10px 12px", zIndex: 999, boxShadow: `0 4px 20px #000a`, pointerEvents: "none" }}>
-          <span style={{ display: "block", fontFamily: F.sans, fontSize: 11, fontWeight: 700, color: P.accent, marginBottom: 4 }}>{term}</span>
-          <span style={{ display: "block", fontFamily: F.sans, fontSize: 12, color: P.slate, lineHeight: 1.5 }}>{def}</span>
-        </span>
-      )}
-    </span>
-  );
+// Fuzzy-matches a dossier metric label ("P/E (TTM)", "RSI (14d) + interpretation", "3yr EPS
+// CAGR") to a glossary entry so beginners get a plain-English explainer on hover — the glossary
+// existed but was never wired into the dossier tables before.
+const GLOSSARY_MATCHERS = [
+  ["p/e", "P/E Ratio"], ["p/b", "P/B Ratio"], ["price/book", "P/B Ratio"], ["cagr", "CAGR"],
+  ["sharpe", "Sharpe Ratio"], ["drawdown", "Max Drawdown"], ["rsi", "RSI"], ["sma", "SMA"],
+  ["moving average", "SMA"], ["dividend yield", "Dividend Yield"], ["volatility", "Volatility"],
+  ["market cap", "Market Cap"], ["beta", "Beta"], ["total return", "Total Return"], ["eps", "EPS"],
+];
+function GlossLabel({ text }) {
+  const l = String(text).toLowerCase();
+  const hit = GLOSSARY_MATCHERS.find(([needle]) => l.includes(needle));
+  if (!hit) return text;
+  return <InfoTip title={hit[1]} body={GLOSSARY[hit[1]]}><span>{text}</span></InfoTip>;
 }
 
-// ---------- home screen ----------
-function HomeScreen({ profile, setNav }) {
-  const name = profile?.name || "Investor";
-
-  const features = [
-    {
-      tab: "discover",
-      label: "Discover",
-      headline: "Find your next move",
-      desc: "Atlas scans global markets and surfaces stocks that actually fit you — your risk tolerance, your timeline, your goals. Not a generic hot list.",
-      cta: "See picks →",
-      accent: P.accent,
-    },
-    {
-      tab: "research",
-      label: "Research",
-      headline: "Know before you buy",
-      desc: "Type any ticker and get a full picture: financials, technicals, risk, recent news, and a straight-talking verdict on whether this stock belongs in your portfolio.",
-      cta: "Research a stock →",
-      accent: P.accent,
-    },
-    {
-      tab: "portfolio",
-      label: "Portfolio",
-      headline: "See the full picture",
-      desc: "Add what you own and Atlas reviews the whole portfolio — balance, exposure, how to deploy spare cash, and where you might be overexposed.",
-      cta: "Review my portfolio →",
-      accent: P.accent,
-    },
-    {
-      tab: "backtest",
-      label: "Backtest",
-      headline: "Test before you trust",
-      desc: "Pick a strategy — value, momentum, earnings surprises — and see exactly how it performed against real historical prices. Honest answer: did it actually work?",
-      cta: "Run a backtest →",
-      accent: P.amber,
-    },
-  ];
-
-  return (
-    <div style={{ maxWidth: 900, margin: "0 auto", paddingBottom: 40 }}>
-      {/* Hero */}
-      <div style={{ textAlign: "center", padding: "56px 0 52px", position: "relative" }}>
-        {/* Subtle glow behind heading */}
-        <div style={{ position: "absolute", top: "30%", left: "50%", transform: "translateX(-50%)", width: 400, height: 200, background: `radial-gradient(ellipse, ${P.accent}0d 0%, transparent 70%)`, pointerEvents: "none" }} />
-        <div style={{ fontFamily: F.sans, fontSize: 13, fontWeight: 600, letterSpacing: 1.5, color: P.accent, marginBottom: 18, textTransform: "uppercase", opacity: 0.8 }}>
-          Good to see you, {name}
-        </div>
-        <h1 style={{ fontFamily: F.sans, fontWeight: 800, fontSize: 42, lineHeight: 1.15, color: P.ink, margin: "0 0 18px", letterSpacing: -1 }}>
-          Research smarter.<br />
-          <span style={{ color: P.accent }}>Invest with conviction.</span>
-        </h1>
-        <p style={{ fontFamily: F.sans, fontSize: 16, color: P.slate, margin: "0 auto", lineHeight: 1.65, maxWidth: 520 }}>
-          Atlas is your personal AI stock analyst. Every score, every recommendation, every verdict — calibrated to your profile, your portfolio, and your goals.
-        </p>
-      </div>
-
-      {/* Feature cards */}
-      <div style={{ display: "grid", gridTemplateColumns: "1fr 1fr", gap: 14 }}>
-        {features.map(f => (
-          <button
-            key={f.tab}
-            onClick={() => setNav(f.tab)}
-            className="home-card"
-            style={{ textAlign: "left", background: P.card, border: `1px solid ${P.cardBorder}`, borderRadius: 14, padding: "26px 28px", cursor: "pointer", display: "block", width: "100%" }}
-          >
-            <div style={{ display: "flex", alignItems: "center", justifyContent: "space-between", marginBottom: 14 }}>
-              <span style={{ fontFamily: F.sans, fontWeight: 700, fontSize: 11, letterSpacing: 1.2, textTransform: "uppercase", color: f.accent, opacity: 0.75 }}>{f.label}</span>
-              <span style={{ fontFamily: F.sans, fontSize: 12, color: P.faint }}>→</span>
-            </div>
-            <div style={{ fontFamily: F.sans, fontWeight: 700, fontSize: 20, color: P.ink, marginBottom: 10, lineHeight: 1.2 }}>{f.headline}</div>
-            <div style={{ fontFamily: F.sans, fontSize: 14, color: P.faint, lineHeight: 1.65, marginBottom: 20 }}>{f.desc}</div>
-            <div style={{ fontFamily: F.sans, fontSize: 13, fontWeight: 600, color: f.accent }}>{f.cta}</div>
-          </button>
-        ))}
-      </div>
-    </div>
-  );
-}
-
-// ---------- stock logo ----------
-function StockLogo({ ticker, size = 32 }) {
-  const [src, setSrc] = useState(`https://financialmodelingprep.com/image-stock/${ticker}.png`);
-  const [failed, setFailed] = useState(false);
-  const letters = (ticker || "").replace(/[^A-Z]/g, "").slice(0, 2);
-  const colors = ["#00e5a0", "#00b4d8", "#f5a623", "#a78bfa", "#fb923c", "#38bdf8", "#4ade80"];
-  const bg = colors[(ticker || "").charCodeAt(0) % colors.length];
-  if (failed) {
-    return (
-      <div style={{ width: size, height: size, borderRadius: 6, background: `${bg}22`, border: `1px solid ${bg}44`, display: "flex", alignItems: "center", justifyContent: "center", flexShrink: 0 }}>
-        <span style={{ fontFamily: F.mono, fontWeight: 600, fontSize: size * 0.3, color: bg }}>{letters}</span>
-      </div>
-    );
-  }
-  return (
-    <img
-      src={src}
-      alt={ticker}
-      width={size} height={size}
-      onError={() => setFailed(true)}
-      style={{ width: size, height: size, borderRadius: 6, objectFit: "contain", background: P.wash, flexShrink: 0, border: `1px solid ${P.cardBorder}` }}
-    />
-  );
-}
-
-// ---------- deeper onboarding ----------
+// ---------- onboarding steps (unchanged data) ----------
 const STEPS = [
-  { id: "name", kind: "text", title: "First — what should we call you?", sub: "This builds your investor profile. Verdict scores every stock and every holding against it.", ph: "Your name" },
+  { id: "name", kind: "text", title: "First — what should we call you?", sub: "This builds your investor profile. Atlas scores every stock and every holding against it.", ph: "Your name" },
   { id: "riskTolerance", kind: "choice", title: "How much risk can you stomach?", opts: [
     { v: "Conservative", note: "Protect what I have" }, { v: "Moderate", note: "Balanced" }, { v: "Aggressive", note: "Swing for growth" } ] },
   { id: "horizon", kind: "choice", title: "When will you likely need this money?", opts: [
     { v: "Short", note: "Under 1 year" }, { v: "Medium", note: "1 – 5 years" }, { v: "Long", note: "5 years or more" } ] },
-  { id: "budget", kind: "choice", title: "Roughly how much are you investing?", sub: "Shapes how Verdict thinks about position sizing.", opts: [
+  { id: "budget", kind: "choice", title: "Roughly how much are you investing?", sub: "Shapes how Atlas thinks about position sizing.", opts: [
     { v: "Under $1k" }, { v: "$1k – 10k" }, { v: "$10k – 50k" }, { v: "$50k – 250k" }, { v: "$250k +" } ] },
   { id: "goal", kind: "choice", title: "What are you mainly after?", opts: [
     { v: "Preserve capital", note: "Safety over upside" }, { v: "Income & dividends", note: "Steady cash" },
     { v: "Balanced growth", note: "Grow steadily" }, { v: "Aggressive growth", note: "Maximize upside" } ] },
-  { id: "philosophy", kind: "choice", title: "Which style feels most like you?", sub: "There's no wrong answer — it tells Verdict what 'good' means to you.", opts: [
+  { id: "philosophy", kind: "choice", title: "Which style feels most like you?", sub: "There's no wrong answer — it tells Atlas what 'good' means to you.", opts: [
     { v: "Value", note: "Buy cheap, be patient" }, { v: "Growth", note: "Pay up for growth" },
     { v: "Quality", note: "Great businesses, fair price" }, { v: "Momentum", note: "Ride strength" },
     { v: "Dividends / income", note: "Get paid to wait" }, { v: "No strong style", note: "Open to all" } ] },
-  { id: "targetReturn", kind: "choice", title: "What yearly return would make you happy?", sub: "Helps Verdict keep your expectations and risk in sync.", opts: [
+  { id: "targetReturn", kind: "choice", title: "What yearly return would make you happy?", sub: "Helps Atlas keep your expectations and risk in sync.", opts: [
     { v: "Safety first (~5%)", note: "Beat inflation" }, { v: "Solid (8–12%)", note: "Market-like" },
     { v: "Ambitious (15–20%)", note: "Beat the market" }, { v: "Swing big (20%+)", note: "High risk, high reward" } ] },
   { id: "positionConviction", kind: "choice", title: "How concentrated do you like to be?", opts: [
@@ -200,130 +140,373 @@ const STEPS = [
     { v: "Hold", note: "Ride it out" }, { v: "Buy more", note: "Average down" } ] },
   { id: "incomeStability", kind: "choice", title: "How stable is your income?", opts: [
     { v: "Stable", note: "Reliable paycheck" }, { v: "Somewhat variable", note: "It moves around" }, { v: "Unpredictable", note: "Lumpy or uncertain" } ] },
-  { id: "emergencyFund", kind: "choice", title: "Do you have a separate emergency fund?", sub: "So Verdict knows how much risk is actually prudent for you.", opts: [
+  { id: "emergencyFund", kind: "choice", title: "Do you have a separate emergency fund?", sub: "So Atlas knows how much risk is actually prudent for you.", opts: [
     { v: "Yes, fully", note: "Several months saved" }, { v: "Partly", note: "Building it" }, { v: "No", note: "This is most of my cash" } ] },
   { id: "region", kind: "choice", title: "Any home-market preference?", opts: [
     { v: "United States" }, { v: "Europe" }, { v: "Global mix" }, { v: "No preference" } ] },
-  { id: "interests", kind: "multi", title: "Any sectors you're drawn to?", sub: "Optional. Verdict will lean toward these.", opts: ["Technology", "Energy", "Healthcare", "Financials", "Consumer", "Industrials", "Materials", "Real estate", "Utilities", "Communications"] },
-  { id: "avoid", kind: "multi", title: "Anything you'd rather not own?", sub: "Optional. Verdict will exclude and flag these.", opts: ["Tobacco", "Weapons", "Fossil fuels", "Gambling", "Alcohol", "Adult"] },
-  { id: "intentions", kind: "longtext", title: "In your own words — what are you really trying to achieve?", sub: "Optional, but this is the single best way to make Verdict's read accurate. e.g. 'Build a retirement nest egg I won't touch for 20 years' or 'grow $5k aggressively, I can afford to lose it.'", ph: "Type as much or as little as you like…", optional: true },
+  { id: "interests", kind: "multi", title: "Any sectors you're drawn to?", sub: "Optional. Atlas will lean toward these.", opts: ["Technology", "Energy", "Healthcare", "Financials", "Consumer", "Industrials", "Materials", "Real estate", "Utilities", "Communications"] },
+  { id: "avoid", kind: "multi", title: "Anything you'd rather not own?", sub: "Optional. Atlas will exclude and flag these.", opts: ["Tobacco", "Weapons", "Fossil fuels", "Gambling", "Alcohol", "Adult"] },
+  { id: "intentions", kind: "longtext", title: "In your own words — what are you really trying to achieve?", sub: "Optional, but this is the single best way to make Atlas's read accurate. e.g. 'Build a retirement nest egg I won't touch for 20 years' or 'grow $5k aggressively, I can afford to lose it.'", ph: "Type as much or as little as you like…", optional: true },
+];
+// chapters for the onboarding progress spine
+const CHAPTERS = [
+  { label: "Profile", start: 0, end: 0 },
+  { label: "Risk & horizon", start: 1, end: 2 },
+  { label: "Goals & returns", start: 3, end: 6 },
+  { label: "Style & experience", start: 7, end: 12 },
+  { label: "Preferences", start: 13, end: 16 },
 ];
 
-// ---------- profile editor (quick panel, no re-doing all 17 steps) ----------
-function ProfileEditor({ profile, onSave, onClose }) {
-  const [p, setP] = useState({ ...profile });
-  function set(k, v) { setP(prev => ({ ...prev, [k]: v })); }
-
-  const Field = ({ label, id, opts, multi }) => (
-    <div style={{ marginBottom: 20 }}>
-      <div style={{ fontFamily: F.mono, fontSize: 10, letterSpacing: 1.5, color: P.accent, opacity: 0.7, marginBottom: 8, textTransform: "uppercase" }}>{label}</div>
-      {multi ? (
-        <div style={{ display: "flex", flexWrap: "wrap", gap: 6 }}>
-          {opts.map(o => {
-            const on = (p[id] || []).includes(o);
-            return <button key={o} onClick={() => set(id, on ? (p[id]||[]).filter(x=>x!==o) : [...(p[id]||[]),o])}
-              style={{ padding: "6px 14px", borderRadius: 999, border: `1.5px solid ${on ? P.accent : P.dim}`, background: on ? `${P.accent}18` : "transparent", fontFamily: F.sans, fontSize: 13, color: on ? P.accent : P.slate, cursor: "pointer" }}>{o}</button>;
-          })}
-        </div>
-      ) : (
-        <div style={{ display: "flex", flexWrap: "wrap", gap: 6 }}>
-          {opts.map(o => {
-            const on = p[id] === o.v;
-            return <button key={o.v} onClick={() => set(id, o.v)}
-              style={{ padding: "7px 16px", borderRadius: 6, border: `1.5px solid ${on ? P.accent : P.dim}`, background: on ? `${P.accent}18` : "transparent", fontFamily: F.sans, fontSize: 13, color: on ? P.accent : P.slate, cursor: "pointer", whiteSpace: "nowrap" }}>
-              {o.v}{o.note ? <span style={{ color: P.faint, marginLeft: 6, fontSize: 11 }}>{o.note}</span> : null}
-            </button>;
-          })}
-        </div>
-      )}
-    </div>
-  );
-
-  return (
-    <div style={{ position: "fixed", inset: 0, zIndex: 200, background: "rgba(0,0,0,.7)", display: "flex", justifyContent: "flex-end" }} onClick={onClose}>
-      <div onClick={e => e.stopPropagation()} style={{ width: "min(560px, 100%)", height: "100%", background: P.card, borderLeft: `1px solid ${P.cardBorder}`, overflowY: "auto", padding: "28px 28px 60px" }}>
-        {/* Header */}
-        <div style={{ display: "flex", alignItems: "center", justifyContent: "space-between", marginBottom: 28 }}>
-          <div>
-            <div style={{ fontFamily: F.mono, fontSize: 10, letterSpacing: 2, color: P.accent, marginBottom: 4 }}>INVESTOR PROFILE</div>
-            <h2 style={{ fontFamily: F.sans, fontWeight: 700, fontSize: 20, color: P.ink, margin: 0 }}>Edit your profile</h2>
-            <p style={{ fontFamily: F.sans, fontSize: 13, color: P.faint, margin: "4px 0 0" }}>Changes update all stock scores immediately.</p>
-          </div>
-          <button onClick={onClose} style={{ fontFamily: F.sans, fontSize: 20, color: P.faint, background: "none", border: "none", cursor: "pointer", padding: "4px 8px", lineHeight: 1 }}>✕</button>
-        </div>
-
-        {/* Name */}
-        <div style={{ marginBottom: 20 }}>
-          <div style={{ fontFamily: F.mono, fontSize: 10, letterSpacing: 1.5, color: P.accent, opacity: 0.7, marginBottom: 8, textTransform: "uppercase" }}>Your name</div>
-          <input className="vd-input" value={p.name || ""} onChange={e => set("name", e.target.value)} placeholder="Your name"
-            style={{ width: "100%", boxSizing: "border-box", fontFamily: F.sans, fontSize: 16, fontWeight: 600, color: P.ink, background: P.wash, border: `1px solid ${P.dim}`, borderRadius: 6, padding: "10px 14px" }} />
-        </div>
-
-        <Field label="Risk tolerance" id="riskTolerance" opts={[{v:"Conservative",note:"Protect what I have"},{v:"Moderate",note:"Balanced"},{v:"Aggressive",note:"Swing for growth"}]} />
-        <Field label="Time horizon" id="horizon" opts={[{v:"Short",note:"Under 1yr"},{v:"Medium",note:"1–5 yrs"},{v:"Long",note:"5yrs+"}]} />
-        <Field label="Investment budget" id="budget" opts={[{v:"Under $1k"},{v:"$1k – 10k"},{v:"$10k – 50k"},{v:"$50k – 250k"},{v:"$250k +"}]} />
-        <Field label="Primary goal" id="goal" opts={[{v:"Preserve capital"},{v:"Income & dividends"},{v:"Balanced growth"},{v:"Aggressive growth"}]} />
-        <Field label="Investing style" id="philosophy" opts={[{v:"Value"},{v:"Growth"},{v:"Quality"},{v:"Momentum"},{v:"Dividends / income"},{v:"No strong style"}]} />
-        <Field label="Target annual return" id="targetReturn" opts={[{v:"Safety first (~5%)"},{v:"Solid (8–12%)"},{v:"Ambitious (15–20%)"},{v:"Swing big (20%+)"}]} />
-        <Field label="Position sizing preference" id="positionConviction" opts={[{v:"Spread across many"},{v:"Balanced mix"},{v:"Few high-conviction bets"}]} />
-        <Field label="How hands-on are you?" id="activityLevel" opts={[{v:"Set and forget"},{v:"Check now and then"},{v:"Active"},{v:"Very hands-on"}]} />
-        <Field label="Experience level" id="experience" opts={[{v:"New"},{v:"Some"},{v:"Experienced"},{v:"Professional"}]} />
-        <Field label="If a stock drops 20%, you…" id="drawdownReaction" opts={[{v:"Sell most of it"},{v:"Trim a little"},{v:"Hold"},{v:"Buy more"}]} />
-        <Field label="Income stability" id="incomeStability" opts={[{v:"Stable"},{v:"Somewhat variable"},{v:"Unpredictable"}]} />
-        <Field label="Emergency fund" id="emergencyFund" opts={[{v:"Yes, fully"},{v:"Partly"},{v:"No"}]} />
-        <Field label="Market preference" id="region" opts={[{v:"United States"},{v:"Europe"},{v:"Global mix"},{v:"No preference"}]} />
-        <Field label="Sectors of interest" id="interests" multi opts={["Technology","Energy","Healthcare","Financials","Consumer","Industrials","Materials","Real estate","Utilities","Communications"]} />
-        <Field label="Industries to avoid" id="avoid" multi opts={["Tobacco","Weapons","Fossil fuels","Gambling","Alcohol","Adult"]} />
-
-        <div style={{ marginBottom: 28 }}>
-          <div style={{ fontFamily: F.mono, fontSize: 10, letterSpacing: 1.5, color: P.accent, opacity: 0.7, marginBottom: 8, textTransform: "uppercase" }}>In your own words (optional)</div>
-          <textarea className="vd-input" value={p.intentions || ""} onChange={e => set("intentions", e.target.value)} placeholder="e.g. 'Build a retirement fund I won't touch for 20 years'" rows={3}
-            style={{ width: "100%", boxSizing: "border-box", fontFamily: F.sans, fontSize: 14, lineHeight: 1.6, color: P.ink, background: P.wash, border: `1px solid ${P.dim}`, borderRadius: 6, padding: "10px 14px", resize: "vertical" }} />
-        </div>
-
-        <button className="vd-eval" onClick={() => onSave(p)} style={{ width: "100%", fontFamily: F.sans, fontWeight: 700, fontSize: 15, color: "#000", background: P.accent, border: "none", borderRadius: 8, padding: "14px", cursor: "pointer" }}>
-          Save profile
-        </button>
-      </div>
-    </div>
-  );
-}
-
-const DOSSIER_TABS = ["Verdict", "Fundamentals", "Technicals", "Risk", "News", "Catalysts", "Your fit"];
+const DOSSIER_TABS = ["Fundamentals", "Technicals", "Risk", "News", "Catalysts", "Your fit"];
 const LOADING_MSGS = ["Searching Yahoo Finance & Stockanalysis…", "Pulling live financials and balance sheet…", "Reading price action and technicals…", "Scanning recent news and sentiment…", "Checking analyst ratings and targets…", "Matching everything to your profile…", "Writing the full dossier…"];
 
-// ---------- helpers ----------
-function scoreColor(s) {
-  if (s == null) return P.faint;
-  if (s >= 78) return P.green; if (s >= 60) return "#5C8A3A";
-  if (s >= 45) return P.amber; if (s >= 30) return "#C2703A"; return P.red;
-}
-function grade(s) {
-  if (s == null) return "—";
-  const t = [[90,"A+"],[85,"A"],[80,"A−"],[75,"B+"],[70,"B"],[65,"B−"],[60,"C+"],[55,"C"],[50,"C−"],[40,"D"]];
-  for (const [n, g] of t) if (s >= n) return g; return "F";
-}
+// ---------- helpers (unchanged) ----------
 function parseNum(x) { const n = parseFloat(String(x ?? "").replace(/[^0-9.\-]/g, "")); return isNaN(n) ? null : n; }
-function money(n) { if (n == null) return "—"; return "$" + n.toLocaleString(undefined, { maximumFractionDigits: 2 }); }
+// The LSE quotes in pence, not pounds — Yahoo Finance returns "GBp" (lowercase p) as the currency for
+// .L tickers, and spreadsheets/brokers commonly label the same 1/100-of-a-pound unit "GBX". Both must map
+// to one internal code. NOTE: this check must NOT be case-insensitive on the third letter — "GBP" (real
+// pounds, uppercase P) is a completely different currency from "GBp" (pence, lowercase p), and a careless
+// /i-flag regex here previously matched both, causing infinite recursion in fxToUSD (GBP normalized back
+// to GBX, which recursed into GBP, forever).
+const SUBUNIT_CURRENCIES = { GBX: { base: "GBP", factor: 0.01 } };
+function normalizeCurrencyCode(code) {
+  const c = String(code || "").trim();
+  if (!c) return c;
+  if (c === "GBp" || /^GBX$/i.test(c)) return "GBX";
+  return c.toUpperCase();
+}
+function isKnownCurrency(code) {
+  const c = normalizeCurrencyCode(code);
+  return CURRENCIES.includes(c) || !!SUBUNIT_CURRENCIES[c];
+}
+// Currency-aware formatter — never hardcodes "$"; renders the right symbol/code for any holding's own currency.
+function fmtCurrency(n, currency = "USD") {
+  if (n == null || isNaN(n)) return "—";
+  const cur = normalizeCurrencyCode(currency);
+  try {
+    return new Intl.NumberFormat(undefined, { style: "currency", currency: cur, maximumFractionDigits: 2 }).format(n);
+  } catch {
+    return `${cur} ${n.toLocaleString(undefined, { maximumFractionDigits: 2 })}`;
+  }
+}
+// fxRates is Frankfurter's USD-base table: { EUR: 0.92, GBP: 0.79, ... } = units of that currency per 1 USD.
+// Returns null (not a silently-wrong passthrough) when a rate isn't loaded yet — callers must show "—", not fake a number.
+function fxToUSD(amount, currency, fxRates) {
+  if (amount == null) return null;
+  const cur = normalizeCurrencyCode(currency);
+  if (!cur || cur === "USD") return amount;
+  const sub = SUBUNIT_CURRENCIES[cur];
+  if (sub) return fxToUSD(amount * sub.factor, sub.base, fxRates);
+  const rate = fxRates?.[cur];
+  return rate ? amount / rate : null;
+}
+function fxConvert(amount, from, to, fxRates) {
+  if (amount == null) return null;
+  const f = normalizeCurrencyCode(from), t = normalizeCurrencyCode(to);
+  if (!f || !t || f === t) return amount;
+  const usd = fxToUSD(amount, f, fxRates);
+  if (usd == null) return null;
+  if (t === "USD") return usd;
+  const subT = SUBUNIT_CURRENCIES[t];
+  if (subT) { const baseAmt = fxConvert(usd, "USD", subT.base, fxRates); return baseAmt == null ? null : baseAmt / subT.factor; }
+  const rate = fxRates?.[t];
+  return rate ? usd * rate : null;
+}
 function pct(n) { if (n == null) return "—"; return (n >= 0 ? "+" : "") + n.toFixed(1) + "%"; }
 function fmtShares(x) {
   const n = parseNum(x); if (n == null) return "—";
   if (Number.isInteger(n)) return n.toLocaleString();
-  // up to 4 sig decimal places, strip trailing zeros
   return parseFloat(n.toFixed(4)).toLocaleString(undefined, { maximumFractionDigits: 4 });
 }
-
-// Local persistence: profile + holdings survive page reloads in your browser.
 async function kvGet(k) { try { const v = localStorage.getItem(k); return v ? JSON.parse(v) : null; } catch { return null; } }
 async function kvSet(k, v) { try { localStorage.setItem(k, JSON.stringify(v)); } catch {} }
+function kvDel(k) { try { localStorage.removeItem(k); } catch {} }
+
+// ---------- spreadsheet import: column detection + currency inference ----------
+function looksLikeTicker(v) {
+  const s = String(v ?? "").trim();
+  if (!s || /\s/.test(s) || s.length > 14) return false;
+  // A bare trailing "." is a real LSE ticker convention (National Grid is "NG.", Aviva is "AV." — the dot
+  // disambiguates from an unrelated US ticker of the same letters). Then up to two more suffix segments,
+  // covering a class suffix plus an exchange suffix together — Yahoo's symbol for Volvo B is "VOLV-B.ST".
+  return /^[A-Za-z0-9]{1,8}\.?([.\-][A-Za-z0-9]{1,5}){0,2}$/.test(s);
+}
+const CURRENCIES = ["USD","EUR","GBP","CAD","AUD","CHF","JPY","HKD","SGD","CNY","KRW","INR","BRL","MXN","SEK","NOK","DKK","NZD","THB","IDR","RON","PLN","CZK","HUF","ILS","TRY","ZAR"];
+// Exchange suffix → currency, so non-US tickers (e.g. "SHEL.L", "SAP.DE") don't need the user to specify currency manually.
+const EXCHANGE_CURRENCY = {
+  L: "GBP", PA: "EUR", DE: "EUR", F: "EUR", MI: "EUR", AS: "EUR", BR: "EUR", MC: "EUR", HE: "EUR", LS: "EUR", VI: "EUR", IR: "EUR",
+  SW: "CHF", ST: "SEK", OL: "NOK", CO: "DKK",
+  TO: "CAD", V: "CAD", CN: "CAD",
+  AX: "AUD", NZ: "NZD",
+  HK: "HKD", T: "JPY",
+  SS: "CNY", SZ: "CNY",
+  KS: "KRW", KQ: "KRW",
+  SI: "SGD", NS: "INR", BO: "INR",
+  SA: "BRL", MX: "MXN",
+  BK: "THB", JK: "IDR",
+};
+function inferCurrencyFromTicker(ticker) {
+  const m = /\.([A-Za-z]{1,4})$/.exec(String(ticker || "").toUpperCase());
+  if (m && EXCHANGE_CURRENCY[m[1]]) return EXCHANGE_CURRENCY[m[1]];
+  return "USD";
+}
+
+const IMPORT_TICKER_KEYS = ["ticker","symbol","stockticker","stocksymbol","tickersymbol"];
+const IMPORT_NAME_KEYS = ["name","company","companyname","security","securityname","securitydescription","description","holding"];
+const IMPORT_SHARES_KEYS = ["shares","quantity","qty","units","amount","position","numshares","numberofshares","sharesowned","sharesheld"];
+const IMPORT_COST_KEYS = ["avgcost","averagecost","avgprice","averageprice","purchaseprice","buyprice","cost","price","entryprice","costpershare","avgcostpershare","unitcost","pricepershare"];
+const IMPORT_TOTALCOST_KEYS = ["totalcost","costbasis","totalcostbasis","totalamountinvested","amountinvested","totalinvested","totalpaid","bookvalue","invested"];
+const IMPORT_CURRENCY_KEYS = ["currency","cur","ccy","curr","currencycode"];
+const IMPORT_EXCHANGE_KEYS = ["exchange","market","listingexchange","primaryexchange","stockexchange","venue"];
+const IMPORT_ISIN_KEYS = ["isin","isincode","securityid"];
+const IMPORT_TYPE_KEYS = ["type","assettype","category","instrumenttype","securitytype","assetclass"];
+const IMPORT_VALUE_KEYS = ["marketvalue","currentvalue","value","balance","currentbalance","cashbalance","totalvalue"];
+// Matches a row that represents idle/uninvested cash rather than a tradable security — "CASH", "Free cash
+// (GBP)", "Cash & Cash Equivalents", "Main Pot (uninvested)", etc. Anchored to the start so it doesn't
+// accidentally match a real ticker/name that merely contains "cash" as a substring somewhere.
+const CASH_LABEL_RE = /^(free\s*cash|uninvested\s*cash|idle\s*cash|available\s*cash|core\s*cash|main\s*pot|cash\s*balance|cash\s*(&|and)\s*(cash\s*)?equivalents?|cash)\b/i;
+function looksLikeCashRow(row, mapping) {
+  const { tickerColumn, nameColumn, typeColumn } = mapping;
+  if (typeColumn) {
+    const t = String(row[typeColumn] ?? "").trim();
+    if (/^cash\b/i.test(t) || /money\s*market/i.test(t)) return true;
+  }
+  const tickerVal = tickerColumn ? String(row[tickerColumn] ?? "").trim() : "";
+  const nameVal = nameColumn ? String(row[nameColumn] ?? "").trim() : "";
+  return CASH_LABEL_RE.test(tickerVal) || CASH_LABEL_RE.test(nameVal);
+}
+// Sums any cash-like rows into a single amount so it can be routed into Spare Cash instead of vanishing —
+// these rows have no shares/price (there's nothing to buy), so they'd otherwise just get dropped as invalid.
+function detectCashAmount(rawRows, mapping) {
+  const { valueColumn, totalCostColumn, costColumn, currencyColumn, sheetCurrency } = mapping;
+  let total = 0, currency = null, found = false;
+  for (const row of rawRows) {
+    if (!looksLikeCashRow(row, mapping)) continue;
+    let amt = valueColumn ? parseNum(row[valueColumn]) : null;
+    if (amt == null && totalCostColumn) amt = parseNum(row[totalCostColumn]);
+    if (amt == null && costColumn) amt = parseNum(row[costColumn]);
+    if (amt == null) continue;
+    let cur = null;
+    if (currencyColumn) { const raw = normalizeCurrencyCode(row[currencyColumn]); if (isKnownCurrency(raw)) cur = raw; }
+    if (!cur && sheetCurrency) cur = sheetCurrency;
+    total += amt;
+    currency = currency || cur || "USD";
+    found = true;
+  }
+  return found ? { amount: total, currency } : null;
+}
+
+// Currency symbol/code that may be embedded in a header itself (e.g. "Avg Cost (€)") rather than a
+// dedicated currency column — common in brokerage exports that report everything in one home currency.
+const CURRENCY_SYMBOL_MAP = { "€": "EUR", "£": "GBP", "¥": "JPY", "₹": "INR", "₩": "KRW", "R$": "BRL" };
+const CURRENCY_CODE_RE = new RegExp(`\\b(${CURRENCIES.join("|")}|GBX)\\b`, "i");
+function detectCurrencyInText(text) {
+  const s = String(text || "");
+  if (!s) return null;
+  for (const [sym, code] of Object.entries(CURRENCY_SYMBOL_MAP)) if (s.includes(sym)) return code;
+  const m = CURRENCY_CODE_RE.exec(s);
+  if (m) return normalizeCurrencyCode(m[1]);
+  if (/\blei\b/i.test(s)) return "RON";
+  if (/\bzł\b|\bzloty/i.test(s)) return "PLN";
+  if (s.includes("p") && /\bpence\b/i.test(s)) return "GBX";
+  if (s.includes("$")) return "USD";
+  return null;
+}
+// Looks at the headers we're actually reading money out of (cost/total-cost columns) — that tells us the
+// currency the NUMBERS are expressed in, which can differ from where the stock itself trades (e.g. a
+// broker showing everything converted to the account's home currency).
+function detectHeaderCurrency(headerCandidates) {
+  for (const h of headerCandidates) { const found = detectCurrencyInText(h); if (found) return found; }
+  return null;
+}
+
+// Ordered [substrings to match in the normalized exchange name, Yahoo-style ticker suffix, currency].
+// Order matters: more specific names MUST come before the generic US catch-all, since several real
+// exchanges are literally branded "Nasdaq <City>" (Nasdaq owns the Nordic/Baltic markets) and would
+// otherwise match the bare "nasdaq" substring first. The catch-all stays last for that reason.
+const EXCHANGE_INFO = [
+  [["londonstockexchange", "lse", "aim", "(lse)"], ".L", "GBP"],
+  [["euronextparis", "parisbourse", "(par)", "xpar"], ".PA", "EUR"],
+  [["euronextamsterdam", "(ams)", "xams"], ".AS", "EUR"],
+  [["euronextbrussels", "(bru)"], ".BR", "EUR"],
+  [["euronextlisbon", "(lis)"], ".LS", "EUR"],
+  [["euronextdublin", "irishstockexchange"], ".IR", "EUR"],
+  [["xetra", "frankfurtstockexchange", "deutscheborse", "boersefrankfurt", "(fra)", "(de)", "(etr)"], ".DE", "EUR"],
+  [["borsaitaliana", "milanstockexchange", "milan"], ".MI", "EUR"],
+  [["bolsademadrid", "bme", "madrid"], ".MC", "EUR"],
+  [["sixswissexchange", "sixswiss", "swissstockexchange", "zurich"], ".SW", "CHF"],
+  [["nasdaqstockholm", "stockholmstockexchange", "stockholm"], ".ST", "SEK"],
+  [["oslostockexchange", "oslobors", "oslo"], ".OL", "NOK"],
+  [["nasdaqcopenhagen", "copenhagenstockexchange", "copenhagen"], ".CO", "DKK"],
+  [["nasdaqhelsinki", "helsinkistockexchange", "helsinki"], ".HE", "EUR"],
+  [["torontostockexchange", "torontotsx", "(tsx)", "tsx"], ".TO", "CAD"],
+  [["tsxventure", "tsxv"], ".V", "CAD"],
+  [["australiansecuritiesexchange", "asx"], ".AX", "AUD"],
+  [["newzealandexchange", "nzx"], ".NZ", "NZD"],
+  [["hongkongstockexchange", "hkex", "hongkong"], ".HK", "HKD"],
+  [["tokyostockexchange", "tokyotse", "jpx", "tse"], ".T", "JPY"],
+  [["shanghaistockexchange", "sse"], ".SS", "CNY"],
+  [["shenzhenstockexchange", "szse"], ".SZ", "CNY"],
+  [["koreaexchange", "krxkorea", "krx", "kospi", "kosdaq"], ".KS", "KRW"],
+  [["singaporeexchange", "sgx"], ".SI", "SGD"],
+  [["nationalstockexchangeofindia", "nse"], ".NS", "INR"],
+  [["bombaystockexchange", "bse"], ".BO", "INR"],
+  [["b3brazil", "b3", "bovespa", "brazil"], ".SA", "BRL"],
+  [["bolsamexicana", "mexico"], ".MX", "MXN"],
+  [["bangkokstockexchange", "setthailand"], ".BK", "THB"],
+  [["indonesiastockexchange", "idx"], ".JK", "IDR"],
+  [["bucharest", "bursadevalori", "bvb"], ".RO", "RON"],
+  [["warsawstockexchange", "gpw"], ".WA", "PLN"],
+  [["pragueexchange", "pse"], ".PR", "CZK"],
+  [["budapeststockexchange", "bet"], ".BD", "HUF"],
+  [["telavivstockexchange", "tase"], ".TA", "ILS"],
+  [["borsaistanbul", "istanbulstockexchange"], ".IS", "TRY"],
+  [["johannesburgstockexchange", "jse"], ".JO", "ZAR"],
+  [["nasdaq", "nyse", "amex", "arca", "bats", "otc", "pinksheets", "cboe"], "", "USD"],
+];
+function resolveExchangeInfo(exchangeRaw) {
+  // Keep digits — codes like "B3" or "9988.HK"-style exchange labels rely on them; only strip punctuation/spaces.
+  const norm = String(exchangeRaw || "").toLowerCase().replace(/[^a-z0-9]/g, "");
+  if (!norm) return null;
+  for (const [substrings, suffix, currency] of EXCHANGE_INFO) {
+    if (substrings.some(s => norm.includes(s))) return { suffix, currency };
+  }
+  return null;
+}
+
+// Fast, deterministic pass — handles clean/well-labeled exports instantly without calling the model.
+function detectImportMapping(headers, rawRows) {
+  // Strip a trailing qualifier in parens/brackets BEFORE stripping non-letters — otherwise "Market Value
+  // (GBP)" becomes "marketvaluegbp" (the currency code glues onto the end) and never exactly matches
+  // "marketvalue". A currency/unit annotation is extremely common in real exports and shouldn't break
+  // column detection just because it happens to be spelled out in letters instead of a symbol.
+  const norm = (s) => String(s).replace(/\s*[\(\[][^)\]]*[\)\]]\s*$/, "").toLowerCase().replace(/[^a-z]/g, "");
+  const find = (keys) => headers.find(h => keys.includes(norm(h))) ?? null;
+  const tickerColumn = find(IMPORT_TICKER_KEYS);
+  const nameColumn = find(IMPORT_NAME_KEYS);
+  const sharesColumn = find(IMPORT_SHARES_KEYS);
+  const costColumn = find(IMPORT_COST_KEYS);
+  const totalCostColumn = find(IMPORT_TOTALCOST_KEYS);
+  const currencyColumn = find(IMPORT_CURRENCY_KEYS);
+  const exchangeColumn = find(IMPORT_EXCHANGE_KEYS);
+  const isinColumn = find(IMPORT_ISIN_KEYS);
+  const typeColumn = find(IMPORT_TYPE_KEYS);
+  const valueColumn = find(IMPORT_VALUE_KEYS);
+
+  const sampleVals = (col) => rawRows.slice(0, 15).map(r => String(r[col] ?? "").trim()).filter(Boolean);
+  let tickerLooksValid = false;
+  if (tickerColumn) {
+    const vals = sampleVals(tickerColumn);
+    tickerLooksValid = vals.length > 0 && vals.filter(looksLikeTicker).length / vals.length >= 0.7;
+  }
+  // Confident only when we found real ticker symbols (not just a header name match) plus shares and some cost figure —
+  // otherwise we hand off to the model, which can read company names and odd layouts. Note: format-valid
+  // does NOT mean correct — a bare "TSCO" passes this check but is a different US company (Tractor Supply)
+  // from UK Tesco plc ("TSCO.L"). The caller layers an additional non-USD check on top of this for that reason.
+  const confident = !!(tickerColumn && tickerLooksValid && sharesColumn && (costColumn || totalCostColumn));
+  return { tickerColumn: tickerColumn || nameColumn, nameColumn, sharesColumn, costColumn, totalCostColumn, currencyColumn, exchangeColumn, isinColumn, typeColumn, valueColumn, confident };
+}
+
+// Pure + synchronous so the user can re-map columns by hand afterward with no extra AI round-trip.
+function computeImportRows(headers, rawRows, mapping, nameMap = {}) {
+  const { tickerColumn, sharesColumn, costColumn, totalCostColumn, currencyColumn, exchangeColumn, sheetCurrency } = mapping;
+  const rows = rawRows.filter(row => !looksLikeCashRow(row, mapping)).map((row) => {
+    let ticker = "";
+    let sourceLabel = null;
+    if (tickerColumn) {
+      const raw = String(row[tickerColumn] ?? "").trim();
+      if (raw) {
+        const resolved = nameMap[raw];
+        if (resolved) {
+          ticker = resolved.ticker ? resolved.ticker.toUpperCase() : "";
+          sourceLabel = raw;
+        } else if (looksLikeTicker(raw)) {
+          ticker = raw.toUpperCase();
+        } else {
+          ticker = raw.toUpperCase();
+          sourceLabel = raw;
+        }
+      }
+    }
+
+    // International recognition: append the right Yahoo-style exchange suffix when we know the listing
+    // venue and the ticker doesn't already carry one (e.g. "SAF" + "Euronext Paris" -> "SAF.PA").
+    let exchangeInfo = null;
+    if (exchangeColumn) {
+      exchangeInfo = resolveExchangeInfo(row[exchangeColumn]);
+      // Only guard against a ticker that already carries a dot-suffix (e.g. raw value "9988.HK" plus an
+      // Exchange column would otherwise become "9988.HK.HK"). A hyphenated class suffix like "VOLV-B" or
+      // "BRK-B" still needs the real exchange suffix appended when the listing isn't US (Yahoo's actual
+      // symbol for Volvo B is "VOLV-B.ST") — appending "" for US exchanges is a harmless no-op either way.
+      if (ticker && exchangeInfo?.suffix && !ticker.includes(".")) {
+        ticker = ticker + exchangeInfo.suffix;
+      }
+    }
+
+    const shares = sharesColumn ? parseNum(row[sharesColumn]) : null;
+    let cost = costColumn ? parseNum(row[costColumn]) : null;
+    if (cost == null && totalCostColumn && shares) {
+      const total = parseNum(row[totalCostColumn]);
+      if (total != null && shares > 0) cost = total / shares;
+    }
+
+    // Currency priority: explicit per-row column > sheet-wide currency (detected from header symbols like
+    // "(€)", or the user's override below) > the row's own listing exchange > the ticker's own suffix > USD.
+    // Sheet-wide wins over exchange/ticker inference because it describes the actual unit of the number we
+    // just parsed for cost — e.g. a broker showing every position's cost converted to one home currency.
+    let currency = null;
+    if (currencyColumn) {
+      const raw = normalizeCurrencyCode(row[currencyColumn]);
+      if (isKnownCurrency(raw)) currency = raw;
+    }
+    if (!currency && sheetCurrency && isKnownCurrency(sheetCurrency)) currency = normalizeCurrencyCode(sheetCurrency);
+    if (!currency && exchangeInfo?.currency) currency = exchangeInfo.currency;
+    if (!currency) {
+      const mappedCur = sourceLabel ? nameMap[sourceLabel]?.currency : null;
+      currency = (mappedCur && isKnownCurrency(mappedCur)) ? normalizeCurrencyCode(mappedCur) : inferCurrencyFromTicker(ticker);
+    }
+    const valid = ticker.length > 0 && looksLikeTicker(ticker) && shares != null && shares > 0 && cost != null && cost > 0;
+    return {
+      ticker, shares: shares == null ? "" : String(shares),
+      cost: cost == null ? "" : String(Math.round(cost * 10000) / 10000),
+      currency, valid, sourceLabel,
+    };
+  }).filter(r => r.ticker || r.shares || r.cost || r.sourceLabel);
+  return rows;
+}
+
+const IMPORT_MAPPING_SYSTEM_PROMPT = `You analyze raw spreadsheet exports of a person's stock portfolio (from brokerages like Schwab, Fidelity, Robinhood, Interactive Brokers, or a manual tracker) so an app can import the holdings automatically. Layouts vary wildly between sources. Be decisive.
+
+Return ONE JSON object only. No prose, no markdown fences.
+
+From the given HEADERS and SAMPLE ROWS, identify the following (return the EXACT header text as it appears in HEADERS, or null if no suitable column exists):
+- tickerColumn: column containing real stock ticker symbols (e.g. "AAPL", "SHEL.L", "9988.HK").
+- nameColumn: column containing company/security names (e.g. "Apple Inc.") if there is no real ticker column.
+- sharesColumn: column containing number of shares/units/quantity held.
+- costColumn: column containing the investor's AVERAGE PURCHASE PRICE PER SHARE.
+- totalCostColumn: column containing the TOTAL amount paid for the whole position (cost basis total) — only set this if costColumn is null and such a column exists; the app will divide by shares to get a per-share cost.
+- currencyColumn: column containing a currency code (e.g. "USD").
+- exchangeColumn: column naming the listing exchange/market (e.g. "NASDAQ", "Euronext Paris", "Hong Kong Stock Exchange"). Null if none.
+
+If a list of unique security identifiers is provided, resolve or VERIFY each one to its real, currently-listed, Yahoo-Finance-compatible ticker symbol (include the exchange suffix if not US-listed, e.g. "SAP.DE", "TSCO.L", or the US ADR ticker like "TSM" for TSMC) and the ISO currency code that ticker primarily trades in. Each identifier is an object that may include helpful context — use it:
+- "value": the raw ticker or company name as it appeared in the sheet. Always echo this back exactly as "input" in your answer.
+- "isin": an ISIN code, if present — this is a globally unique, authoritative identifier. When given, trust it over the ticker text: the ISIN's country prefix tells you the true listing country (e.g. "GB..." = UK-listed, "US..." = US-listed), which resolves ambiguous cases.
+- "currency"/"exchange": additional hints about where this trades.
+
+IMPORTANT — bare tickers are often ambiguous across markets and must not be taken at face value. A classic trap: the plain ticker "TSCO" with no suffix is "Tractor Supply Co." on NASDAQ (US) — completely unrelated to "Tesco PLC", the UK grocer, whose real Yahoo symbol is "TSCO.L". If isin/currency/exchange context implies a non-US listing, you MUST resolve to the correctly-suffixed non-US ticker, never the coincidentally-matching US one. The same applies broadly: always cross-check a bare-looking ticker against any provided currency/exchange/ISIN context before trusting it as-is.
+
+If a value clearly represents cash, a money-market fund, or anything that isn't a real individual tradable security, set its ticker to null rather than guessing. Never guess blindly — if you cannot confidently identify a real, currently-listed company or fund even with web search, set ticker to null.
+
+Schema:
+{"tickerColumn":null,"nameColumn":null,"sharesColumn":null,"costColumn":null,"totalCostColumn":null,"currencyColumn":null,"exchangeColumn":null,"nameMappings":[{"input":"","ticker":"","currency":""}]}`;
 
 function closeJSON(raw) {
   let s = raw, inStr = false, esc = false;
-  for (let i = 0; i < s.length; i++) { const c = s[i]; if (inStr) { if (esc) esc = false; else if (c === "\\") esc = true; else if (c === '"') inStr = false; } else if (c === '"') inStr = true; }
+  for (let i = 0; i < s.length; i++) { const ch = s[i]; if (inStr) { if (esc) esc = false; else if (ch === "\\") esc = true; else if (ch === '"') inStr = false; } else if (ch === '"') inStr = true; }
   if (inStr) s += '"';
   s = s.replace(/[\s,]*$/, "").replace(/"[^"]*"\s*:\s*$/, "").replace(/[\s,]*$/, "");
   const st = []; inStr = false; esc = false;
-  for (let i = 0; i < s.length; i++) { const c = s[i]; if (inStr) { if (esc) esc = false; else if (c === "\\") esc = true; else if (c === '"') inStr = false; } else { if (c === '"') inStr = true; else if (c === "{") st.push("}"); else if (c === "[") st.push("]"); else if (c === "}" || c === "]") st.pop(); } }
+  for (let i = 0; i < s.length; i++) { const ch = s[i]; if (inStr) { if (esc) esc = false; else if (ch === "\\") esc = true; else if (ch === '"') inStr = false; } else { if (ch === '"') inStr = true; else if (ch === "{") st.push("}"); else if (ch === "[") st.push("]"); else if (ch === "}" || ch === "]") st.pop(); } }
   while (st.length) s += st.pop();
   return s;
 }
@@ -334,30 +517,81 @@ function extractJSON(text) {
   try { return JSON.parse(closeJSON(text.slice(start))); } catch { return null; }
 }
 
-// Points to Vercel in production/desktop, local proxy in dev
-const API_BASE = import.meta.env.VITE_API_URL || "";
+// The AI proxy requires a signed-in user when Firebase is configured (it verifies this token
+// server-side before spending the Anthropic API key). getIdToken() is cached by the SDK and
+// auto-refreshes, so this is cheap to call per request.
+async function aiAuthHeaders() {
+  try {
+    const u = auth?.currentUser;
+    if (!u) return {};
+    return { Authorization: `Bearer ${await u.getIdToken()}` };
+  } catch { return {}; }
+}
 
-// One shared call. maxSearches bounds latency.
-async function callClaude(system, user, { maxTokens = 4000, maxSearches = 4 } = {}) {
+const AI_MODEL = "claude-sonnet-5";
+
+async function callClaudeOnce(system, user, maxTokens, maxSearches) {
   const resp = await fetch(`${API_BASE}/api/messages`, {
-    method: "POST", headers: { "Content-Type": "application/json" },
+    method: "POST", headers: { "Content-Type": "application/json", ...(await aiAuthHeaders()) },
     body: JSON.stringify({
-      model: "claude-sonnet-4-6", max_tokens: maxTokens, system,
+      model: AI_MODEL, max_tokens: maxTokens, system,
       messages: [{ role: "user", content: user }],
-      tools: [{ type: "web_search_20250305", name: "web_search", max_uses: maxSearches }],
+      tools: [{ type: "web_search_20260209", name: "web_search", max_uses: maxSearches }],
     }),
   });
   const data = await resp.json();
   if (data.error) throw new Error(data.error.message || "API error");
   const text = (data.content || []).filter((b) => b.type === "text").map((b) => b.text).join("\n");
-  const parsed = extractJSON(text);
+  return { parsed: extractJSON(text), stopReason: data.stop_reason, text };
+}
+
+async function callClaude(system, user, { maxTokens = 4000, maxSearches = 4 } = {}) {
+  let { parsed, stopReason, text } = await callClaudeOnce(system, user, maxTokens, maxSearches);
+  // A truncated response almost always means the answer just needed more room, not a different query —
+  // the search results and reasoning were fine, only the OUTPUT budget ran out. Heal it silently with one
+  // automatic retry at a much larger budget (same search depth, same prompt) before ever bothering the
+  // user with an error they'd have to act on themselves.
+  if (!parsed && stopReason === "max_tokens") {
+    ({ parsed, stopReason, text } = await callClaudeOnce(system, user, Math.round(maxTokens * 1.8) + 1500, maxSearches));
+  }
   if (!parsed) {
-    const stopReason = data.stop_reason;
-    if (stopReason === "max_tokens") throw new Error("The response was too long and got cut off. Try again — it usually works on the second attempt.");
+    if (stopReason === "max_tokens") throw new Error("The response was too long even after retrying with more room. Try again in a moment.");
     console.error("extractJSON failed, raw text:", text.slice(0, 500));
+    // When web search is rate-limited upstream, the model explains that in prose instead of
+    // returning JSON — surface the real cause instead of a generic "unreadable" error.
+    if (/limit exceeded|rate.?limit|temporarily unavailable|tool.*(unavailable|error)/i.test(text)) {
+      throw new Error("Live web search is temporarily rate-limited upstream. Wait a minute or two and try again.");
+    }
     throw new Error("The response came back unreadable. Try again.");
   }
   return parsed;
+}
+
+// The model doesn't always obey the "no vague aggregate rows" prompt instruction (e.g. still
+// occasionally returns "Multiple open-market purchases" / "Undisclosed per-filing total" instead
+// of one clean dated filing). Prompting alone can't guarantee this, so every insider transaction
+// is validated here before it's ever stored/rendered — vague rows are silently dropped rather than
+// shown, regardless of what the model returns. The underlying pattern can still surface in the
+// prose summary; only the structured per-row data is held to this hard bar.
+const VAGUE_INSIDER_RE = /multiple|various|several|unspecified|undisclosed|aggregate|n\/a|not retrieved|unknown|unconfirmed|approx(imately)?ly unknown/i;
+function isCleanInsiderTxn(t) {
+  if (!t || typeof t !== "object") return false;
+  const { insider, shares, value, date } = t;
+  if (!insider || !shares || !value || !date) return false;
+  if ([insider, shares, value, date].some((f) => VAGUE_INSIDER_RE.test(String(f)))) return false;
+  if (!/\d/.test(String(shares)) || !/\d/.test(String(value))) return false;
+  return true;
+}
+function cleanInsiderActivity(ia) {
+  if (!ia) return null;
+  return { ...ia, transactions: (ia.transactions || []).filter(isCleanInsiderTxn) };
+}
+
+function fmtHistoryDate(iso) {
+  if (!iso) return "";
+  const d = new Date(iso);
+  if (isNaN(d.getTime())) return "";
+  return `${d.toLocaleDateString(undefined, { month: "short", day: "numeric" })} · ${d.toLocaleTimeString(undefined, { hour: "numeric", minute: "2-digit" })}`;
 }
 
 function profileText(p) {
@@ -375,150 +609,35 @@ function profileText(p) {
 }
 function holdingsText(h) { return h && h.length ? h.map((x) => `${x.ticker}: ${x.shares} shares @ ${x.cost}${x.currency && x.currency !== "USD" ? ` ${x.currency}` : ""} avg cost`).join("\n") : "none"; }
 
-// ---------- shared UI ----------
-function Gauge({ score, size = 168 }) {
-  const r = 78, c = 2 * Math.PI * r, p = Math.max(0, Math.min(100, score || 0)) / 100, col = scoreColor(score);
-  return (
-    <svg viewBox="0 0 200 200" style={{ width: size, height: size }}>
-      <circle cx="100" cy="100" r={r} fill="none" stroke={P.cardBorder} strokeWidth="8" />
-      <circle cx="100" cy="100" r={r} fill="none" stroke={col} strokeWidth="8" strokeLinecap="round" strokeDasharray={c} strokeDashoffset={c * (1 - p)} transform="rotate(-90 100 100)" style={{ transition: "stroke-dashoffset 1s cubic-bezier(.2,.7,.2,1)", filter: `drop-shadow(0 0 6px ${col}88)` }} />
-      <text x="100" y="95" textAnchor="middle" style={{ fontFamily: F.mono, fontSize: 48, fontWeight: 600, fill: col }}>{score != null ? Math.round(score) : "—"}</text>
-      <text x="100" y="118" textAnchor="middle" style={{ fontFamily: F.mono, fontSize: 11, letterSpacing: 3, fill: P.faint }}>/ 100</text>
-    </svg>
-  );
-}
-function MiniBar({ label, score }) {
-  const col = scoreColor(score);
-  return (
-    <div>
-      <div style={{ display: "flex", justifyContent: "space-between", marginBottom: 5 }}>
-        <span style={{ fontFamily: F.mono, fontSize: 10, letterSpacing: 1, color: P.faint, textTransform: "uppercase" }}>{label}</span>
-        <span style={{ fontFamily: F.mono, fontSize: 12, fontWeight: 600, color: col }}>{score != null ? Math.round(score) : "—"}</span>
+// ---------- stock logo (dark) ----------
+function StockLogo({ ticker, size = 32 }) {
+  const [failed, setFailed] = useState(false);
+  const src = `https://financialmodelingprep.com/image-stock/${ticker}.png`;
+  const letters = (ticker || "").replace(/[^A-Z]/g, "").slice(0, 2);
+  const palette = [c.accent, c.seriesAlt, c.positive, c.warning, "#C77DFF", "#5BA8FF"];
+  const bg = palette[((ticker || "X").charCodeAt(0)) % palette.length];
+  if (failed) {
+    return (
+      <div style={{ width: size, height: size, borderRadius: radius.sm, background: `${bg}22`, border: `1px solid ${bg}44`, display: "flex", alignItems: "center", justifyContent: "center", flexShrink: 0 }}>
+        <span style={{ fontFamily: font.mono, fontWeight: 600, fontSize: size * 0.32, color: bg }}>{letters}</span>
       </div>
-      <div style={{ height: 3, background: P.dim, borderRadius: 2, overflow: "hidden" }}>
-        <div style={{ height: "100%", width: `${Math.max(0, Math.min(100, score || 0))}%`, background: col, borderRadius: 2, transition: "width 1s cubic-bezier(.2,.7,.2,1)", boxShadow: `0 0 6px ${col}88` }} />
-      </div>
-    </div>
-  );
-}
-function MetricGroup({ group }) {
-  if (!group?.items?.length) return null;
+    );
+  }
   return (
-    <div style={{ marginBottom: 22 }}>
-      <div style={{ fontFamily: F.mono, fontSize: 9, letterSpacing: 2, textTransform: "uppercase", color: P.accent, marginBottom: 6, opacity: 0.8 }}>{group.title}</div>
-      <div style={{ border: `1px solid ${P.cardBorder}`, borderRadius: 6, overflow: "hidden" }}>
-        {group.items.map((m, i) => (
-          <div key={i} style={{ display: "flex", alignItems: "baseline", justifyContent: "space-between", gap: 16, padding: "9px 14px", background: i % 2 === 0 ? P.wash : "transparent", borderBottom: i < group.items.length - 1 ? `1px solid ${P.cardBorder}55` : "none" }}>
-            <span style={{ fontFamily: F.sans, fontSize: 12.5, color: P.faint, flexShrink: 0 }}>{m.label}</span>
-            <span style={{ fontFamily: F.mono, fontSize: 13, fontWeight: 600, color: m.value === "N/A" ? P.faint : P.ink, textAlign: "right" }}>{m.value}</span>
-          </div>
-        ))}
-      </div>
-    </div>
-  );
-}
-function Conclusion({ text }) {
-  if (!text) return null;
-  return (
-    <div style={{ marginTop: 4, background: `${P.accent}08`, border: `1px solid ${P.accent}22`, borderLeft: `3px solid ${P.accent}`, borderRadius: 6, padding: "13px 16px" }}>
-      <div style={{ fontFamily: F.mono, fontSize: 9, letterSpacing: 2, textTransform: "uppercase", color: P.accent, marginBottom: 7, opacity: 0.8 }}>Summary</div>
-      <p style={{ fontFamily: F.sans, fontSize: 13.5, lineHeight: 1.65, color: P.slate, margin: 0 }}>{text}</p>
-    </div>
-  );
-}
-function ScoreBadge({ label, score, hint }) {
-  const col = scoreColor(score);
-  return (
-    <div style={{ display: "flex", alignItems: "center", gap: 16, marginBottom: 22, padding: "14px 18px", background: P.wash, border: `1px solid ${P.cardBorder}`, borderRadius: 8 }}>
-      <div style={{ width: 52, height: 52, borderRadius: "50%", border: `3px solid ${col}`, display: "flex", alignItems: "center", justifyContent: "center", flexShrink: 0, boxShadow: `0 0 16px ${col}33` }}>
-        <span style={{ fontFamily: F.mono, fontSize: 18, fontWeight: 700, color: col }}>{score != null ? Math.round(score) : "—"}</span>
-      </div>
-      <div>
-        <div style={{ fontFamily: F.sans, fontWeight: 600, fontSize: 14, color: P.ink }}>{label}</div>
-        <div style={{ fontFamily: F.sans, fontSize: 12, color: P.faint, marginTop: 2 }}>{hint || "Score 0–100"}</div>
-      </div>
-    </div>
-  );
-}
-function Spinner({ title, sub }) {
-  return (
-    <div style={{ textAlign: "center", padding: "40px 0 8px" }}>
-      <div style={{ fontFamily: F.mono, fontSize: 11, letterSpacing: 2, color: P.accent, marginBottom: 10, opacity: 0.8 }}>◈ PROCESSING</div>
-      <div style={{ fontFamily: F.sans, fontSize: 16, color: P.slate }}>{title}</div>
-      <div style={{ fontFamily: F.mono, fontSize: 10, letterSpacing: 1, color: P.faint, marginTop: 8 }}>{sub}</div>
-    </div>
-  );
-}
-function ErrorBox({ msg, onRetry, label = "Retry" }) {
-  return (
-    <div style={{ marginTop: 16, background: `${P.red}11`, border: `1px solid ${P.red}44`, borderLeft: `3px solid ${P.red}`, borderRadius: 4, padding: "12px 16px", display: "flex", alignItems: "center", gap: 14, flexWrap: "wrap" }}>
-      <span style={{ fontFamily: F.mono, fontSize: 11, letterSpacing: 0.5, color: P.red, flex: "1 1 220px" }}>⚠ {msg}</span>
-      <button className="vd-eval" onClick={onRetry} style={{ fontFamily: F.mono, fontWeight: 600, fontSize: 11, letterSpacing: 1, color: P.red, background: "none", border: `1px solid ${P.red}`, borderRadius: 4, padding: "7px 16px", cursor: "pointer" }}>{label.toUpperCase()}</button>
-    </div>
+    <img src={src} alt={ticker} width={size} height={size} loading="lazy" decoding="async" onError={() => setFailed(true)}
+      style={{ width: size, height: size, borderRadius: radius.sm, objectFit: "contain", background: "#fff", padding: 2, flexShrink: 0, border: `1px solid ${c.hairline}` }} />
   );
 }
 
-// ---------- recommendation card ----------
-function RecCard({ pick, rank, onOpen }) {
-  const col = scoreColor(pick.fitScore);
-  const score = pick.fitScore != null ? Math.round(pick.fitScore) : null;
-  return (
-    <div onClick={onOpen} className="vd-row" style={{ padding: "14px 20px", borderBottom: `1px solid ${P.cardBorder}`, cursor: "pointer", transition: "background .12s" }}>
-      <div style={{ display: "grid", gridTemplateColumns: "24px 36px 1fr auto", alignItems: "center", gap: 14 }}>
-        {/* Rank */}
-        <span style={{ fontFamily: F.mono, fontSize: 11, color: P.faint, textAlign: "center" }}>{rank}</span>
-        {/* Logo */}
-        <StockLogo ticker={pick.ticker} size={34} />
-        {/* Name + sector + tags */}
-        <div style={{ minWidth: 0 }}>
-          <div style={{ display: "flex", alignItems: "center", gap: 10, marginBottom: 3, flexWrap: "wrap" }}>
-            <span style={{ fontFamily: F.mono, fontWeight: 700, fontSize: 13, color: P.accent }}>{pick.ticker}</span>
-            <span style={{ fontFamily: F.sans, fontWeight: 600, fontSize: 14, color: P.ink }}>{pick.company}</span>
-            {pick.sector && <span style={{ fontFamily: F.sans, fontSize: 11, color: P.faint, background: P.dim, borderRadius: 4, padding: "2px 8px" }}>{pick.sector}</span>}
-          </div>
-          <div style={{ display: "flex", gap: 6, flexWrap: "wrap" }}>
-            {(pick.tags || []).slice(0, 3).map((t, i) => <span key={i} className="vd-tag">{t}</span>)}
-          </div>
-        </div>
-        {/* Score */}
-        <div style={{ textAlign: "center", flexShrink: 0, minWidth: 60 }}>
-          <div style={{ fontFamily: F.mono, fontSize: 28, fontWeight: 700, color: col, lineHeight: 1, textShadow: `0 0 16px ${col}44` }}>{score ?? "—"}</div>
-          <div style={{ fontFamily: F.sans, fontSize: 10, color: P.faint, marginTop: 2 }}>fit score</div>
-        </div>
-      </div>
-      {/* Why now + concern + metrics row */}
-      <div style={{ marginTop: 10, marginLeft: 74, display: "flex", gap: 16, flexWrap: "wrap", alignItems: "flex-start" }}>
-        <div style={{ flex: "1 1 280px" }}>
-          {pick.reason && (
-            <div style={{ display: "flex", gap: 8, marginBottom: 5 }}>
-              <span style={{ fontFamily: F.mono, fontSize: 10, color: P.accent, flexShrink: 0, marginTop: 1 }}>↑</span>
-              <span style={{ fontFamily: F.sans, fontSize: 12.5, color: P.slate, lineHeight: 1.5 }}>{pick.reason}</span>
-            </div>
-          )}
-          {pick.concern && (
-            <div style={{ display: "flex", gap: 8 }}>
-              <span style={{ fontFamily: F.mono, fontSize: 10, color: P.amber, flexShrink: 0, marginTop: 1 }}>⚠</span>
-              <span style={{ fontFamily: F.sans, fontSize: 12, color: P.faint, lineHeight: 1.5 }}>{pick.concern}</span>
-            </div>
-          )}
-        </div>
-        <div style={{ display: "flex", flexDirection: "column", gap: 3, alignItems: "flex-end", flexShrink: 0 }}>
-          {(pick.snapshot || []).slice(0, 3).map((m, i) => (
-            <span key={i} style={{ fontFamily: F.mono, fontSize: 11, color: P.faint, whiteSpace: "nowrap" }}>{m.label} <b style={{ color: P.ink }}>{m.value}</b></span>
-          ))}
-          <span style={{ fontFamily: F.sans, fontSize: 11, fontWeight: 600, color: P.accent, marginTop: 2 }}>Full dossier →</span>
-        </div>
-      </div>
-    </div>
-  );
-}
-
-// ---------- onboarding ----------
+// ============================================================
+//  ONBOARDING — full-bleed, progress spine, one question at a time
+// ============================================================
 function Onboarding({ initial, onDone, onExit }) {
   const [i, setI] = useState(0);
   const [profile, setProfile] = useState(initial || {});
   const step = STEPS[i], last = i === STEPS.length - 1, total = STEPS.length;
   const isExisting = !!(initial && initial.name);
+  const chapterIdx = CHAPTERS.findIndex(ch => i >= ch.start && i <= ch.end);
   function setVal(v) { setProfile((p) => ({ ...p, [step.id]: v })); }
   function next() { last ? onDone(profile) : setI(i + 1); }
   function choose(v) { const np = { ...profile, [step.id]: v }; setProfile(np); last ? onDone(np) : setI(i + 1); }
@@ -527,473 +646,688 @@ function Onboarding({ initial, onDone, onExit }) {
   const canContinue = step.id === "name" ? (profile.name || "").trim().length > 0 : true;
 
   return (
-    <div style={{ maxWidth: 560, margin: "0 auto", padding: "0 20px", minHeight: "100%" }}>
-      {/* Top bar */}
-      <div style={{ paddingTop: 32, display: "flex", alignItems: "center", justifyContent: "space-between" }}>
-        <div style={{ flex: 1 }}>
-          <div style={{ height: 4, background: P.line, borderRadius: 4, overflow: "hidden" }}>
-            <div style={{ height: "100%", width: `${((i + 1) / total) * 100}%`, background: P.accent, transition: "width .4s ease" }} />
+    <div style={{ minHeight: "100dvh", background: c.canvas, display: "flex" }}>
+      {/* spine */}
+      <div className="ob-spine" style={{ width: 280, flexShrink: 0, borderRight: `1px solid ${c.hairline}`, padding: "40px 32px", flexDirection: "column", justifyContent: "space-between", background: c.sunken }}>
+        <div>
+          <div style={{ display: "flex", alignItems: "center", gap: 11, marginBottom: 44 }}>
+            <AtlasMark size={30} /><span style={{ ...type.title, color: c.text }}>Atlas</span>
           </div>
-          <div style={{ fontFamily: F.mono, fontSize: 11, color: P.faint, marginTop: 8 }}>{i + 1} / {total}</div>
-        </div>
-        {/* Exit button — only show if user already has a profile */}
-        {isExisting && onExit && (
-          <button onClick={onExit} style={{ marginLeft: 20, fontFamily: F.sans, fontSize: 13, color: P.faint, background: "none", border: `1px solid ${P.dim}`, borderRadius: 6, padding: "6px 14px", cursor: "pointer", whiteSpace: "nowrap" }}>
-            ✕ Back to app
-          </button>
-        )}
-      </div>
-      <div className="vd-reveal" key={step.id} style={{ marginTop: 28 }}>
-        <h2 style={{ fontFamily: F.sans, fontWeight: 700, fontSize: 26, lineHeight: 1.2, color: P.ink, margin: 0 }}>{step.title}</h2>
-        {step.sub && <p style={{ fontFamily: F.sans, fontSize: 14, color: P.faint, marginTop: 8, lineHeight: 1.55 }}>{step.sub}</p>}
-        <div style={{ marginTop: 22 }}>
-          {step.kind === "text" && (
-            <input autoFocus value={profile.name || ""} onChange={(e) => setVal(e.target.value)} onKeyDown={(e) => e.key === "Enter" && canContinue && next()} placeholder={step.ph} className="vd-input"
-              style={{ width: "100%", boxSizing: "border-box", fontFamily: F.sans, fontSize: 22, fontWeight: 500, color: P.ink, background: P.card, border: `1px solid ${P.dim}`, borderRadius: 8, padding: "14px 16px" }} />
-          )}
-          {step.kind === "longtext" && (
-            <textarea autoFocus value={profile.intentions || ""} onChange={(e) => setVal(e.target.value)} placeholder={step.ph} className="vd-input" rows={4}
-              style={{ width: "100%", boxSizing: "border-box", fontFamily: F.sans, fontSize: 15, lineHeight: 1.6, color: P.ink, background: P.card, border: `1px solid ${P.dim}`, borderRadius: 8, padding: "14px 16px", resize: "vertical" }} />
-          )}
-          {step.kind === "choice" && (
-            <div style={{ display: "flex", flexDirection: "column", gap: 8 }}>
-              {step.opts.map((o) => {
-                const active = profile[step.id] === o.v;
-                return (
-                  <button key={o.v} onClick={() => choose(o.v)} className="vd-opt" style={{ textAlign: "left", cursor: "pointer", padding: "14px 18px", borderRadius: 8, border: `2px solid ${active ? P.accent : P.dim}`, background: active ? `${P.accent}18` : P.card, transition: "all .15s ease" }}>
-                    <span style={{ fontFamily: F.sans, fontWeight: 600, fontSize: 15, color: active ? P.accent : P.ink }}>{o.v}</span>
-                    {o.note && <span style={{ fontFamily: F.sans, fontSize: 13, color: P.faint, marginLeft: 10 }}>{o.note}</span>}
-                  </button>
-                );
-              })}
-            </div>
-          )}
-          {step.kind === "multi" && (
-            <div style={{ display: "flex", flexWrap: "wrap", gap: 8 }}>
-              {step.opts.map((o) => {
-                const active = (profile[step.id] || []).includes(o);
-                return (
-                  <button key={o} onClick={() => toggle(o)} className="vd-opt" style={{ cursor: "pointer", padding: "10px 18px", borderRadius: 999, border: `2px solid ${active ? P.accent : P.dim}`, background: active ? `${P.accent}18` : P.card, fontFamily: F.sans, fontWeight: 500, fontSize: 14, color: active ? P.accent : P.ink, transition: "all .15s ease" }}>{o}</button>
-                );
-              })}
-            </div>
-          )}
-        </div>
-        <div style={{ display: "flex", alignItems: "center", gap: 14, marginTop: 28 }}>
-          {i > 0 && (
-            <button onClick={() => setI(i - 1)} style={{ fontFamily: F.sans, fontSize: 14, fontWeight: 500, color: P.slate, background: "none", border: `1px solid ${P.dim}`, borderRadius: 6, padding: "10px 18px", cursor: "pointer" }}>← Back</button>
-          )}
-          {(isText || step.kind === "multi") && (
-            <button onClick={next} disabled={!canContinue} className="vd-eval" style={{ marginLeft: "auto", fontFamily: F.sans, fontWeight: 600, fontSize: 15, color: "#000", background: P.accent, border: "none", borderRadius: 8, padding: "12px 28px", cursor: canContinue ? "pointer" : "default", opacity: canContinue ? 1 : 0.4 }}>
-              {last ? "Finish" : (step.optional || step.kind === "multi") && !(profile[step.id] && profile[step.id].length) ? "Skip" : "Continue →"}
-            </button>
-          )}
-        </div>
-      </div>
-    </div>
-  );
-}
-
-// ---------- dossier ----------
-function Results({ result, profile }) {
-  const [tab, setTab] = useState("Verdict");
-  const r = result, overall = r.overall?.score;
-  const act = r.overall?.action;
-  const actColor = act === "Strong Buy" || act === "Buy" ? P.green : act === "Sell" || act === "Avoid" ? P.red : act === "Trim" ? P.amber : P.slate;
-
-  const DataSources = () => r.dataSources?.length > 0 ? (
-    <div style={{ marginTop: 24, paddingTop: 16, borderTop: `1px solid ${P.cardBorder}` }}>
-      <div style={{ fontFamily: F.mono, fontSize: 9, letterSpacing: 2, color: P.faint, marginBottom: 8, textTransform: "uppercase" }}>Sources</div>
-      <div style={{ display: "flex", flexWrap: "wrap", gap: 6 }}>
-        {r.dataSources.map((s, i) => <span key={i} className="vd-tag">{s}</span>)}
-      </div>
-    </div>
-  ) : null;
-
-  return (
-    <div className="vd-reveal" style={{ marginTop: 20 }}>
-      {/* ── Header card ── */}
-      <div style={{ background: P.card, border: `1px solid ${P.cardBorder}`, borderRadius: "10px 10px 0 0", padding: "20px 24px 0" }}>
-        <div style={{ display: "flex", alignItems: "flex-start", gap: 16, flexWrap: "wrap", marginBottom: 16 }}>
-          {r.ticker && <StockLogo ticker={r.ticker} size={48} />}
-          <div style={{ flex: "1 1 200px" }}>
-            <div style={{ display: "flex", alignItems: "center", gap: 10, flexWrap: "wrap" }}>
-              {r.ticker && <span style={{ fontFamily: F.mono, fontWeight: 700, fontSize: 14, color: P.accent, letterSpacing: 1 }}>{r.ticker}</span>}
-              <h2 style={{ fontFamily: F.sans, fontWeight: 700, fontSize: 20, color: P.ink, margin: 0 }}>{r.company}</h2>
-              {act && <span style={{ padding: "4px 12px", borderRadius: 5, border: `1px solid ${actColor}55`, background: `${actColor}18`, fontFamily: F.sans, fontWeight: 700, fontSize: 12, color: actColor, whiteSpace: "nowrap" }}>{act}</span>}
-            </div>
-            {r.asOf && <div style={{ fontFamily: F.sans, fontSize: 11, color: P.faint, marginTop: 4 }}>Analysis as of {r.asOf}</div>}
-          </div>
-          {/* Pillar score pills */}
-          <div style={{ display: "flex", gap: 8, flexWrap: "wrap", marginLeft: "auto" }}>
-            {[["Fundamentals", r.pillars?.fundamentals], ["Valuation", r.pillars?.valuation], ["Technicals", r.pillars?.technicals], ["Risk", r.pillars?.risk]].map(([label, score]) => {
-              const col = scoreColor(score);
+          <div style={{ display: "flex", flexDirection: "column", gap: 4 }}>
+            {CHAPTERS.map((ch, ci) => {
+              const active = ci === chapterIdx, done = ci < chapterIdx;
               return (
-                <div key={label} style={{ textAlign: "center", padding: "8px 14px", background: P.wash, border: `1px solid ${P.cardBorder}`, borderRadius: 8 }}>
-                  <div style={{ fontFamily: F.mono, fontWeight: 700, fontSize: 17, color: col, lineHeight: 1 }}>{score != null ? Math.round(score) : "—"}</div>
-                  <div style={{ fontFamily: F.sans, fontSize: 10, color: P.faint, marginTop: 3 }}>{label}</div>
+                <div key={ch.label} style={{ display: "flex", alignItems: "center", gap: 12, padding: "10px 0" }}>
+                  <div style={{ width: 9, height: 9, borderRadius: "50%", flexShrink: 0,
+                    background: active ? c.accent : done ? c.accent : c.surface2,
+                    border: `1px solid ${active || done ? c.accent : c.border}`, boxShadow: active ? `0 0 0 4px ${c.accentSoft}` : "none" }} />
+                  <span style={{ ...type.small, fontWeight: active ? 600 : 400, color: active ? c.text : done ? c.text2 : c.text3 }}>{ch.label}</span>
                 </div>
               );
             })}
           </div>
         </div>
-        {/* Tabs */}
-        <div style={{ display: "flex", gap: 0, borderBottom: `1px solid ${P.cardBorder}`, overflowX: "auto" }}>
-          {DOSSIER_TABS.map((t) => {
-            const on = t === tab;
-            return <button key={t} onClick={() => setTab(t)} style={{ fontFamily: F.sans, fontWeight: on ? 600 : 400, fontSize: 13, whiteSpace: "nowrap", color: on ? P.accent : P.faint, background: "none", border: "none", borderBottom: `2px solid ${on ? P.accent : "transparent"}`, padding: "10px 18px", marginBottom: -1, cursor: "pointer", transition: "color .15s" }}>{t}</button>;
-          })}
-        </div>
+        <div style={{ ...type.caption, color: c.text3 }}>Step {i + 1} of {total}</div>
       </div>
 
-      {/* ── Tab body ── */}
-      <div style={{ background: P.card, border: `1px solid ${P.cardBorder}`, borderTop: "none", borderRadius: "0 0 10px 10px", padding: "24px" }}>
+      {/* question */}
+      <div style={{ flex: 1, display: "flex", flexDirection: "column", padding: "0 20px", minWidth: 0 }}>
+        {/* mobile top progress */}
+        <div className="ob-topbar" style={{ paddingTop: 24, display: "flex", alignItems: "center", gap: 14 }}>
+          <div style={{ flex: 1, height: 4, background: c.surface2, borderRadius: 99, overflow: "hidden" }}>
+            <motion.div initial={false} animate={{ width: `${((i + 1) / total) * 100}%` }} transition={{ duration: 0.4, ease: [0.16,1,0.3,1] }} style={{ height: "100%", background: c.accent, borderRadius: 99 }} />
+          </div>
+          {isExisting && onExit && <Button variant="ghost" size="sm" onClick={onExit}>Close</Button>}
+        </div>
 
-        {/* VERDICT */}
-        {tab === "Verdict" && (
-          <div>
-            {/* Thesis banner */}
-            <div style={{ background: P.wash, border: `1px solid ${actColor}33`, borderLeft: `3px solid ${actColor}`, borderRadius: 8, padding: "16px 20px", marginBottom: 24 }}>
-              <div style={{ fontFamily: F.mono, fontSize: 9, letterSpacing: 2, color: P.accent, opacity: 0.8, marginBottom: 8, textTransform: "uppercase" }}>Atlas Verdict</div>
-              <p style={{ fontFamily: F.sans, fontSize: 15, lineHeight: 1.6, color: P.ink, margin: 0, fontWeight: 500 }}>{r.overall?.thesis}</p>
-            </div>
+        <div style={{ flex: 1, display: "flex", alignItems: "center", justifyContent: "center", paddingBottom: 40 }}>
+          <div style={{ width: "100%", maxWidth: 560 }}>
+            <AnimatePresence mode="wait">
+              <motion.div key={step.id}
+                initial={{ opacity: 0, y: 12 }} animate={{ opacity: 1, y: 0 }} exit={{ opacity: 0, y: -8 }}
+                transition={{ duration: 0.25, ease: [0.16,1,0.3,1] }}>
+                <Overline color={c.accent} style={{ marginBottom: 14 }}>{CHAPTERS[chapterIdx]?.label}</Overline>
+                <h2 style={{ ...type.displayL, color: c.text, margin: 0 }}>{step.title}</h2>
+                {step.sub && <p style={{ ...type.bodyL, color: c.text3, marginTop: 12, lineHeight: 1.55 }}>{step.sub}</p>}
 
-            <div style={{ display: "flex", gap: 28, flexWrap: "wrap", alignItems: "flex-start" }}>
-              {/* Score gauge */}
-              <div style={{ display: "flex", flexDirection: "column", alignItems: "center", gap: 8, flexShrink: 0 }}>
-                <Gauge score={overall} />
-                <span style={{ fontFamily: F.mono, fontWeight: 700, fontSize: 18, color: scoreColor(overall), letterSpacing: 2 }}>{grade(overall)}</span>
-                <span style={{ fontFamily: F.mono, fontSize: 9, letterSpacing: 1, color: P.faint }}>SCORE FOR {(profile.name || "YOU").toUpperCase()}</span>
-              </div>
-
-              {/* Right column */}
-              <div style={{ flex: "1 1 280px", display: "flex", flexDirection: "column", gap: 16 }}>
-                {/* Pillar bars */}
-                <div style={{ border: `1px solid ${P.cardBorder}`, borderRadius: 8, overflow: "hidden" }}>
-                  {[["Fundamentals", r.pillars?.fundamentals, "earnings, margins, balance sheet"], ["Valuation", r.pillars?.valuation, "cheapness vs peers & history"], ["Technicals", r.pillars?.technicals, "trend, momentum, chart setup"], ["Risk (safety)", r.pillars?.risk, "higher = safer investment"]].map(([label, score, sub], i, arr) => {
-                    const col = scoreColor(score);
-                    return (
-                      <div key={label} style={{ padding: "11px 16px", background: i % 2 === 0 ? P.wash : "transparent", borderBottom: i < arr.length - 1 ? `1px solid ${P.cardBorder}55` : "none" }}>
-                        <div style={{ display: "flex", justifyContent: "space-between", alignItems: "center", marginBottom: 6 }}>
-                          <div>
-                            <span style={{ fontFamily: F.sans, fontSize: 13, fontWeight: 500, color: P.ink }}>{label}</span>
-                            <span style={{ fontFamily: F.sans, fontSize: 11, color: P.faint, marginLeft: 8 }}>{sub}</span>
-                          </div>
-                          <span style={{ fontFamily: F.mono, fontSize: 14, fontWeight: 700, color: col, minWidth: 28, textAlign: "right" }}>{score != null ? Math.round(score) : "—"}</span>
-                        </div>
-                        <div style={{ height: 4, background: P.dim, borderRadius: 2, overflow: "hidden" }}>
-                          <div style={{ height: "100%", width: `${Math.max(0, Math.min(100, score || 0))}%`, background: col, borderRadius: 2, transition: "width 1s cubic-bezier(.2,.7,.2,1)" }} />
-                        </div>
-                      </div>
-                    );
-                  })}
-                </div>
-
-                {/* Sentiment + consensus row */}
-                <div style={{ display: "flex", gap: 12, flexWrap: "wrap" }}>
-                  {r.news?.overallSentiment && (() => {
-                    const sc = r.news.sentimentScore || 0;
-                    const sCol = sc > 20 ? P.green : sc < -20 ? P.red : P.amber;
-                    return (
-                      <div style={{ flex: "1 1 160px", padding: "12px 16px", background: P.wash, border: `1px solid ${P.cardBorder}`, borderRadius: 8 }}>
-                        <div style={{ fontFamily: F.sans, fontSize: 10, color: P.faint, marginBottom: 4 }}>News sentiment</div>
-                        <div style={{ fontFamily: F.sans, fontWeight: 700, fontSize: 15, color: sCol, marginBottom: 6 }}>{r.news.overallSentiment}</div>
-                        <div style={{ height: 3, background: P.dim, borderRadius: 2 }}>
-                          <div style={{ height: "100%", width: `${Math.max(0, Math.min(100, (sc + 100) / 2))}%`, background: sCol, borderRadius: 2 }} />
-                        </div>
-                      </div>
-                    );
-                  })()}
-                  {r.analystConsensus?.rating && (
-                    <div style={{ flex: "1 1 200px", padding: "12px 16px", background: P.wash, border: `1px solid ${P.cardBorder}`, borderRadius: 8 }}>
-                      <div style={{ fontFamily: F.sans, fontSize: 10, color: P.faint, marginBottom: 4 }}>Wall Street consensus</div>
-                      <div style={{ display: "flex", gap: 16, alignItems: "baseline", flexWrap: "wrap" }}>
-                        <span style={{ fontFamily: F.sans, fontWeight: 700, fontSize: 15, color: r.analystConsensus.rating.includes("Buy") ? P.green : r.analystConsensus.rating.includes("Sell") ? P.red : P.slate }}>{r.analystConsensus.rating}</span>
-                        {r.analystConsensus.targetPrice && <span style={{ fontFamily: F.mono, fontSize: 13, color: P.ink }}>PT {r.analystConsensus.targetPrice}</span>}
-                        {r.analystConsensus.upside && <span style={{ fontFamily: F.mono, fontSize: 13, color: P.green }}>{r.analystConsensus.upside} upside</span>}
-                      </div>
-                      {r.analystConsensus.numAnalysts > 0 && <div style={{ fontFamily: F.sans, fontSize: 11, color: P.faint, marginTop: 4 }}>{r.analystConsensus.numAnalysts} analysts · {r.analystConsensus.recentRevisions}</div>}
+                <div style={{ marginTop: 28 }}>
+                  {step.kind === "text" && (
+                    <Input autoFocus value={profile.name || ""} onChange={(e) => setVal(e.target.value)} onKeyDown={(e) => e.key === "Enter" && canContinue && next()} placeholder={step.ph}
+                      style={{ fontSize: 22, fontWeight: 500, padding: "14px 16px" }} />
+                  )}
+                  {step.kind === "longtext" && (
+                    <TextArea autoFocus value={profile.intentions || ""} onChange={(e) => setVal(e.target.value)} placeholder={step.ph} rows={4} style={{ fontSize: 16 }} />
+                  )}
+                  {step.kind === "choice" && (
+                    <div style={{ display: "flex", flexDirection: "column", gap: 9 }}>
+                      {step.opts.map((o) => {
+                        const active = profile[step.id] === o.v;
+                        return (
+                          <motion.button key={o.v} onClick={() => choose(o.v)} whileTap={{ scale: 0.99 }}
+                            className="atlas-btn"
+                            style={{ textAlign: "left", cursor: "pointer", padding: "15px 18px", borderRadius: radius.md, width: "100%",
+                              border: `1px solid ${active ? c.accent : c.border}`, background: active ? c.accentSoft : c.surface1,
+                              boxShadow: active ? `0 0 0 1px ${c.accent}` : "none" }}>
+                            <span style={{ ...type.bodyL, fontWeight: 600, color: active ? c.accent : c.text }}>{o.v}</span>
+                            {o.note && <span style={{ ...type.small, color: c.text3, marginLeft: 10 }}>{o.note}</span>}
+                          </motion.button>
+                        );
+                      })}
+                    </div>
+                  )}
+                  {step.kind === "multi" && (
+                    <div style={{ display: "flex", flexWrap: "wrap", gap: 8 }}>
+                      {step.opts.map((o) => {
+                        const active = (profile[step.id] || []).includes(o);
+                        return (
+                          <motion.button key={o} onClick={() => toggle(o)} whileTap={{ scale: 0.97 }} className="atlas-btn"
+                            style={{ cursor: "pointer", padding: "10px 18px", borderRadius: radius.full,
+                              border: `1px solid ${active ? c.accent : c.border}`, background: active ? c.accentSoft : c.surface1,
+                              ...type.body, fontWeight: 500, color: active ? c.accent : c.text }}>{o}</motion.button>
+                        );
+                      })}
                     </div>
                   )}
                 </div>
-              </div>
-            </div>
-          </div>
-        )}
 
-        {/* FUNDAMENTALS */}
-        {tab === "Fundamentals" && (
-          <div>
-            <ScoreBadge label="Fundamentals" score={r.pillars?.fundamentals} hint="Quality of the business — earnings, margins, balance sheet strength" />
-            <div style={{ display: "grid", gridTemplateColumns: "repeat(auto-fill, minmax(340px, 1fr))", gap: 20 }}>
-              {(r.fundamentals?.groups || []).map((g, i) => <MetricGroup key={i} group={g} />)}
-            </div>
-            <Conclusion text={r.fundamentals?.conclusion} />
-            <DataSources />
+                <div style={{ display: "flex", alignItems: "center", gap: 12, marginTop: 32 }}>
+                  {i > 0 && <Button variant="secondary" onClick={() => setI(i - 1)}>← Back</Button>}
+                  {(isText || step.kind === "multi") && (
+                    <Button onClick={next} disabled={!canContinue} glow style={{ marginLeft: "auto" }}>
+                      {last ? "Finish" : (step.optional || step.kind === "multi") && !(profile[step.id] && profile[step.id].length) ? "Skip" : "Continue →"}
+                    </Button>
+                  )}
+                </div>
+              </motion.div>
+            </AnimatePresence>
           </div>
-        )}
+        </div>
+      </div>
+      <style>{`@media (max-width: 768px){ .ob-spine{ display:none !important; } } @media (min-width: 769px){ .ob-topbar{ display:none !important; } }`}</style>
+    </div>
+  );
+}
 
-        {/* TECHNICALS */}
-        {tab === "Technicals" && (
-          <div>
-            <ScoreBadge label="Technicals" score={r.pillars?.technicals} hint="Price trend, momentum, and chart setup right now" />
-            <div style={{ display: "grid", gridTemplateColumns: "repeat(auto-fill, minmax(340px, 1fr))", gap: 20 }}>
-              {(r.technicals?.groups || []).map((g, i) => <MetricGroup key={i} group={g} />)}
-            </div>
-            <Conclusion text={r.technicals?.conclusion} />
-            <DataSources />
-          </div>
-        )}
-
-        {/* RISK */}
-        {tab === "Risk" && (
-          <div>
-            <ScoreBadge label="Risk Safety Score" score={r.pillars?.risk} hint="Higher = safer. Accounts for debt, volatility, moat, and business risk." />
-            <div style={{ display: "grid", gridTemplateColumns: "repeat(auto-fill, minmax(340px, 1fr))", gap: 20 }}>
-              {(r.risk?.groups || []).map((g, i) => <MetricGroup key={i} group={g} />)}
-            </div>
-            <Conclusion text={r.risk?.conclusion} />
-            <DataSources />
-          </div>
-        )}
-
-        {/* NEWS */}
-        {tab === "News" && (() => {
-          const n = r.news;
-          if (!n) return <div style={{ fontFamily: F.sans, fontSize: 13, color: P.faint }}>No news data available.</div>;
-          const sc = n.sentimentScore || 0;
-          const sCol = sc > 20 ? P.green : sc < -20 ? P.red : P.amber;
-          const sentimentMap = { Positive: P.green, Negative: P.red, Neutral: P.faint };
+// ============================================================
+//  PROFILE EDITOR (slide-over)
+// ============================================================
+// Hoisted out of ProfileEditor so React reconciles the option chips instead of remounting all
+// of them on every keystroke/selection inside the editor.
+function Field2({ label, id, opts, multi, p, set }) {
+  return (
+    <div style={{ marginBottom: 20 }}>
+      <Overline color={c.text3} style={{ marginBottom: 8 }}>{label}</Overline>
+      <div style={{ display: "flex", flexWrap: "wrap", gap: 7 }}>
+        {opts.map(o => {
+          const val = multi ? o : o.v;
+          const on = multi ? (p[id] || []).includes(o) : p[id] === o.v;
           return (
-            <div>
-              {/* Sentiment bar */}
-              <div style={{ display: "flex", alignItems: "center", gap: 20, padding: "16px 20px", background: P.wash, border: `1px solid ${P.cardBorder}`, borderRadius: 8, marginBottom: 20, flexWrap: "wrap" }}>
-                <div style={{ flexShrink: 0 }}>
-                  <div style={{ fontFamily: F.sans, fontSize: 10, color: P.faint, marginBottom: 3 }}>Overall Sentiment</div>
-                  <div style={{ fontFamily: F.sans, fontWeight: 700, fontSize: 20, color: sCol }}>{n.overallSentiment}</div>
-                </div>
-                <div style={{ flex: "1 1 200px" }}>
-                  <div style={{ display: "flex", justifyContent: "space-between", marginBottom: 5 }}>
-                    <span style={{ fontFamily: F.sans, fontSize: 10, color: P.red }}>Bearish −100</span>
-                    <span style={{ fontFamily: F.mono, fontSize: 12, fontWeight: 600, color: sCol }}>{sc > 0 ? "+" : ""}{sc}</span>
-                    <span style={{ fontFamily: F.sans, fontSize: 10, color: P.green }}>+100 Bullish</span>
-                  </div>
-                  <div style={{ height: 6, background: P.dim, borderRadius: 3, overflow: "hidden" }}>
-                    <div style={{ height: "100%", width: `${Math.max(0, Math.min(100, (sc + 100) / 2))}%`, background: sCol, borderRadius: 3, transition: "width 1s ease" }} />
-                  </div>
-                </div>
-                {n.summary && <div style={{ flex: "2 1 300px", fontFamily: F.sans, fontSize: 13, lineHeight: 1.55, color: P.slate, borderLeft: `2px solid ${sCol}`, paddingLeft: 14 }}>{n.summary}</div>}
-              </div>
-
-              {/* News items */}
-              <div style={{ display: "flex", flexDirection: "column", gap: 10 }}>
-                {(n.items || []).map((item, i) => {
-                  const col = sentimentMap[item.sentiment] || P.faint;
-                  const hasUrl = item.url && item.url.startsWith("http");
-                  return (
-                    <div key={i} style={{ padding: "14px 18px", background: P.wash, border: `1px solid ${P.cardBorder}`, borderLeft: `3px solid ${col}`, borderRadius: 8 }}>
-                      <div style={{ display: "flex", alignItems: "flex-start", justifyContent: "space-between", gap: 12, marginBottom: 8 }}>
-                        <div style={{ flex: 1 }}>
-                          {hasUrl
-                            ? <a href={item.url} target="_blank" rel="noopener noreferrer" style={{ fontFamily: F.sans, fontWeight: 600, fontSize: 14, color: P.ink, lineHeight: 1.45, textDecoration: "none", borderBottom: `1px solid ${P.faint}55` }}
-                                onMouseEnter={e => e.currentTarget.style.color = P.accent}
-                                onMouseLeave={e => e.currentTarget.style.color = P.ink}>
-                                {item.headline} ↗
-                              </a>
-                            : <span style={{ fontFamily: F.sans, fontWeight: 600, fontSize: 14, color: P.ink, lineHeight: 1.45 }}>{item.headline}</span>}
-                        </div>
-                        <span style={{ fontFamily: F.sans, fontSize: 11, fontWeight: 600, color: col, whiteSpace: "nowrap", flexShrink: 0 }}>{item.sentiment}</span>
-                      </div>
-                      <div style={{ display: "flex", alignItems: "center", gap: 10, marginBottom: item.impact ? 10 : 0 }}>
-                        <span style={{ fontFamily: F.sans, fontSize: 11, fontWeight: 600, color: P.faint }}>{item.source}</span>
-                        <span style={{ fontFamily: F.mono, fontSize: 10, color: P.faint }}>·</span>
-                        <span style={{ fontFamily: F.mono, fontSize: 10, color: P.faint }}>{item.date}</span>
-                      </div>
-                      {item.impact && <div style={{ fontFamily: F.sans, fontSize: 12.5, color: P.slate, lineHeight: 1.55, borderTop: `1px solid ${P.dim}`, paddingTop: 10 }}>{item.impact}</div>}
-                    </div>
-                  );
-                })}
-              </div>
-              <DataSources />
-            </div>
+            <button key={val} onClick={() => multi ? set(id, on ? (p[id]||[]).filter(x=>x!==o) : [...(p[id]||[]),o]) : set(id, o.v)}
+              className="atlas-btn" aria-pressed={on}
+              style={{ padding: "7px 14px", borderRadius: multi ? radius.full : radius.sm, cursor: "pointer",
+                border: `1px solid ${on ? c.accent : c.border}`, background: on ? c.accentSoft : "transparent",
+                ...type.small, color: on ? c.accent : c.text2, whiteSpace: "nowrap" }}>
+              {val}{!multi && o.note ? <span style={{ color: c.text3, marginLeft: 6, fontSize: 11 }}>{o.note}</span> : null}
+            </button>
           );
-        })()}
+        })}
+      </div>
+    </div>
+  );
+}
 
-        {/* CATALYSTS */}
-        {tab === "Catalysts" && (
-          <div>
-            {r.analystConsensus?.rating && (
-              <div style={{ display: "flex", gap: 0, marginBottom: 24, border: `1px solid ${P.cardBorder}`, borderRadius: 8, overflow: "hidden" }}>
-                {[
-                  ["Consensus", r.analystConsensus.rating, r.analystConsensus.rating?.includes("Buy") ? P.green : r.analystConsensus.rating?.includes("Sell") ? P.red : P.slate],
-                  ["Price Target", r.analystConsensus.targetPrice || "—", P.ink],
-                  ["Upside", r.analystConsensus.upside || "—", P.green],
-                  ["High / Low", r.analystConsensus.highTarget && r.analystConsensus.lowTarget ? `${r.analystConsensus.highTarget} / ${r.analystConsensus.lowTarget}` : "—", P.ink],
-                  ["Analysts", r.analystConsensus.numAnalysts || "—", P.ink],
-                ].map(([label, val, col], i) => (
-                  <div key={label} style={{ flex: 1, padding: "14px 16px", background: i % 2 === 0 ? P.wash : "transparent", borderRight: i < 4 ? `1px solid ${P.cardBorder}` : "none" }}>
-                    <div style={{ fontFamily: F.sans, fontSize: 10, color: P.faint, marginBottom: 5 }}>{label}</div>
-                    <div style={{ fontFamily: F.mono, fontWeight: 700, fontSize: 15, color: col }}>{val}</div>
-                  </div>
-                ))}
-              </div>
-            )}
-            {r.analystConsensus?.recentRevisions && (
-              <div style={{ marginBottom: 20, padding: "10px 16px", background: P.wash, border: `1px solid ${P.cardBorder}`, borderRadius: 6, fontFamily: F.sans, fontSize: 12.5, color: P.slate }}>
-                <span style={{ color: P.faint, fontFamily: F.mono, fontSize: 9, letterSpacing: 1, marginRight: 8, textTransform: "uppercase" }}>Recent revisions</span>{r.analystConsensus.recentRevisions}
-              </div>
-            )}
-            <div style={{ fontFamily: F.sans, fontWeight: 600, fontSize: 14, color: P.ink, marginBottom: 12 }}>Upcoming Catalysts</div>
-            {(r.catalysts || []).length === 0 && <div style={{ fontFamily: F.sans, fontSize: 13, color: P.faint }}>No catalyst data available.</div>}
-            <div style={{ display: "flex", flexDirection: "column", gap: 8 }}>
-              {(r.catalysts || []).map((c, i) => {
-                const dirCol = c.direction === "Bullish" ? P.green : c.direction === "Bearish" ? P.red : P.amber;
-                return (
-                  <div key={i} style={{ display: "flex", gap: 0, border: `1px solid ${P.cardBorder}`, borderLeft: `3px solid ${dirCol}`, borderRadius: 8, overflow: "hidden" }}>
-                    <div style={{ padding: "14px 16px", flex: 1 }}>
-                      <div style={{ display: "flex", alignItems: "center", gap: 10, marginBottom: 6, flexWrap: "wrap" }}>
-                        <span style={{ fontFamily: F.sans, fontWeight: 700, fontSize: 13.5, color: P.ink }}>{c.label}</span>
-                        {c.timeframe && <span style={{ fontFamily: F.mono, fontSize: 10, color: P.faint, background: P.wash, border: `1px solid ${P.dim}`, borderRadius: 4, padding: "2px 8px" }}>{c.timeframe}</span>}
-                      </div>
-                      <div style={{ fontFamily: F.sans, fontSize: 13, color: P.slate, lineHeight: 1.55 }}>{c.description}</div>
-                    </div>
-                    <div style={{ padding: "14px 16px", background: P.wash, borderLeft: `1px solid ${P.cardBorder}`, display: "flex", alignItems: "center", flexShrink: 0 }}>
-                      <span style={{ fontFamily: F.sans, fontSize: 12, fontWeight: 700, color: dirCol }}>{c.direction}</span>
-                    </div>
-                  </div>
-                );
-              })}
-            </div>
-          </div>
-        )}
+function ProfileEditor({ profile, onSave, onClose, onSignOut }) {
+  const [p, setP] = useState({ ...profile });
+  function set(k, v) { setP(prev => ({ ...prev, [k]: v })); }
 
-        {/* YOUR FIT */}
-        {tab === "Your fit" && (() => {
-          const fitAct = r.fit?.action;
-          const fitActCol = fitAct?.includes("Buy") ? P.green : fitAct?.includes("Sell") || fitAct?.includes("Avoid") ? P.red : fitAct?.includes("Trim") ? P.amber : P.accent;
-          return (
-            <div>
-              <div style={{ display: "flex", gap: 24, flexWrap: "wrap", alignItems: "flex-start", marginBottom: 20 }}>
-                <div style={{ display: "flex", flexDirection: "column", alignItems: "center", gap: 6, flexShrink: 0 }}>
-                  <Gauge score={r.fit?.score} size={120} />
-                  <span style={{ fontFamily: F.sans, fontSize: 11, color: P.faint }}>Fit score for {profile.name || "you"}</span>
-                </div>
-                <div style={{ flex: "1 1 280px" }}>
-                  <p style={{ fontFamily: F.sans, fontSize: 14, lineHeight: 1.65, color: P.slate, margin: "0 0 14px" }}>{r.fit?.summary}</p>
-                  {fitAct && <div style={{ display: "inline-block", padding: "9px 20px", borderRadius: 7, border: `1px solid ${fitActCol}55`, background: `${fitActCol}18`, fontFamily: F.sans, fontWeight: 700, fontSize: 14, color: fitActCol }}>{fitAct}</div>}
-                </div>
-              </div>
-
-              {r.fit?.positionSizing && (
-                <div style={{ marginBottom: 16, background: `${P.accent}08`, border: `1px solid ${P.accent}22`, borderLeft: `3px solid ${P.accent}`, borderRadius: 8, padding: "13px 18px" }}>
-                  <div style={{ fontFamily: F.mono, fontSize: 9, letterSpacing: 2, color: P.accent, opacity: 0.8, marginBottom: 6, textTransform: "uppercase" }}>Position Sizing</div>
-                  <p style={{ fontFamily: F.sans, fontSize: 13.5, lineHeight: 1.6, color: P.slate, margin: 0 }}>{r.fit.positionSizing}</p>
-                </div>
-              )}
-
-              {Array.isArray(r.fit?.watchouts) && r.fit.watchouts.length > 0 && (
-                <div>
-                  <div style={{ fontFamily: F.sans, fontWeight: 600, fontSize: 13, color: P.amber, marginBottom: 10 }}>Watchouts for {profile.name || "you"}</div>
-                  <div style={{ display: "flex", flexDirection: "column", gap: 8 }}>
-                    {r.fit.watchouts.map((w, i) => (
-                      <div key={i} style={{ display: "flex", gap: 12, fontFamily: F.sans, fontSize: 13.5, color: P.slate, padding: "11px 16px", background: `${P.amber}09`, border: `1px solid ${P.amber}30`, borderRadius: 7, lineHeight: 1.55 }}>
-                        <span style={{ color: P.amber, fontFamily: F.mono, flexShrink: 0, marginTop: 1 }}>!</span>{w}
-                      </div>
-                    ))}
-                  </div>
-                </div>
-              )}
-              <DataSources />
-            </div>
-          );
-        })()}
+  return (
+    <div style={{ padding: "26px 26px 60px" }}>
+      <div style={{ display: "flex", alignItems: "flex-start", justifyContent: "space-between", marginBottom: 26 }}>
+        <div>
+          <Overline color={c.accent} style={{ marginBottom: 6 }}>Investor profile</Overline>
+          <h2 style={{ ...type.title, color: c.text, margin: 0 }}>Edit your profile</h2>
+          <p style={{ ...type.small, color: c.text3, margin: "4px 0 0" }}>Changes update all stock scores immediately.</p>
+        </div>
+        <IconButton label="Close" onClick={onClose}><CloseIcon /></IconButton>
       </div>
 
-      {/* Flags footer */}
-      {Array.isArray(r.flags) && r.flags.length > 0 && (
-        <div style={{ marginTop: 12, padding: "12px 18px", background: P.wash, border: `1px solid ${P.cardBorder}`, borderRadius: 8 }}>
-          <div style={{ fontFamily: F.mono, fontSize: 9, letterSpacing: 2, color: P.faint, marginBottom: 8, textTransform: "uppercase" }}>Caveats & Limitations</div>
-          {r.flags.map((f, i) => <div key={i} style={{ fontFamily: F.sans, fontSize: 12, color: P.faint, padding: "3px 0", lineHeight: 1.5 }}>· {f}</div>)}
-        </div>
+      <Field label="Your name" style={{ marginBottom: 20 }}>
+        <Input value={p.name || ""} onChange={e => set("name", e.target.value)} placeholder="Your name" style={{ fontWeight: 600, fontSize: 16 }} />
+      </Field>
+
+      <Field2 p={p} set={set} label="Risk tolerance" id="riskTolerance" opts={[{v:"Conservative",note:"Protect what I have"},{v:"Moderate",note:"Balanced"},{v:"Aggressive",note:"Swing for growth"}]} />
+      <Field2 p={p} set={set} label="Time horizon" id="horizon" opts={[{v:"Short",note:"Under 1yr"},{v:"Medium",note:"1–5 yrs"},{v:"Long",note:"5yrs+"}]} />
+      <Field2 p={p} set={set} label="Investment budget" id="budget" opts={[{v:"Under $1k"},{v:"$1k – 10k"},{v:"$10k – 50k"},{v:"$50k – 250k"},{v:"$250k +"}]} />
+      <Field2 p={p} set={set} label="Primary goal" id="goal" opts={[{v:"Preserve capital"},{v:"Income & dividends"},{v:"Balanced growth"},{v:"Aggressive growth"}]} />
+      <Field2 p={p} set={set} label="Investing style" id="philosophy" opts={[{v:"Value"},{v:"Growth"},{v:"Quality"},{v:"Momentum"},{v:"Dividends / income"},{v:"No strong style"}]} />
+      <Field2 p={p} set={set} label="Target annual return" id="targetReturn" opts={[{v:"Safety first (~5%)"},{v:"Solid (8–12%)"},{v:"Ambitious (15–20%)"},{v:"Swing big (20%+)"}]} />
+      <Field2 p={p} set={set} label="Position sizing preference" id="positionConviction" opts={[{v:"Spread across many"},{v:"Balanced mix"},{v:"Few high-conviction bets"}]} />
+      <Field2 p={p} set={set} label="How hands-on are you?" id="activityLevel" opts={[{v:"Set and forget"},{v:"Check now and then"},{v:"Active"},{v:"Very hands-on"}]} />
+      <Field2 p={p} set={set} label="Experience level" id="experience" opts={[{v:"New"},{v:"Some"},{v:"Experienced"},{v:"Professional"}]} />
+      <Field2 p={p} set={set} label="If a stock drops 20%, you…" id="drawdownReaction" opts={[{v:"Sell most of it"},{v:"Trim a little"},{v:"Hold"},{v:"Buy more"}]} />
+      <Field2 p={p} set={set} label="Income stability" id="incomeStability" opts={[{v:"Stable"},{v:"Somewhat variable"},{v:"Unpredictable"}]} />
+      <Field2 p={p} set={set} label="Emergency fund" id="emergencyFund" opts={[{v:"Yes, fully"},{v:"Partly"},{v:"No"}]} />
+      <Field2 p={p} set={set} label="Market preference" id="region" opts={[{v:"United States"},{v:"Europe"},{v:"Global mix"},{v:"No preference"}]} />
+      <Field2 p={p} set={set} label="Sectors of interest" id="interests" multi opts={["Technology","Energy","Healthcare","Financials","Consumer","Industrials","Materials","Real estate","Utilities","Communications"]} />
+      <Field2 p={p} set={set} label="Industries to avoid" id="avoid" multi opts={["Tobacco","Weapons","Fossil fuels","Gambling","Alcohol","Adult"]} />
+
+      <Field label="In your own words (optional)" style={{ marginBottom: 24 }}>
+        <TextArea value={p.intentions || ""} onChange={e => set("intentions", e.target.value)} placeholder="e.g. 'Build a retirement fund I won't touch for 20 years'" rows={3} />
+      </Field>
+
+      <Button size="lg" full glow onClick={() => onSave(p)}>Save profile</Button>
+      {onSignOut && (
+        <Button variant="ghost" full size="md" onClick={onSignOut} style={{ marginTop: 12, color: c.text3 }}>
+          Sign out
+        </Button>
       )}
     </div>
   );
 }
 
-// ---------- portfolio ----------
-function HoldingRow({ h, costUSD, livePrice, review, onOpen, onRemove }) {
-  const curPrice = livePrice?.price ?? (review ? parseNum(review.currentPrice) : null);
-  const cost = costUSD ?? parseNum(h.cost);
-  const sh = parseNum(h.shares);
-  const foreignCur = h.currency && h.currency !== "USD" ? h.currency : null;
-  const pl = curPrice != null && cost != null ? (curPrice - cost) * sh : null;
-  const plPct = curPrice != null && cost ? ((curPrice - cost) / cost) * 100 : null;
-  const value = curPrice != null && sh != null ? curPrice * sh : null;
-  const act = review?.action;
-  const pillonClass = act === "Buy more" || act === "Add" ? "vd-pill-buy" : act === "Sell" ? "vd-pill-sell" : act === "Trim" ? "vd-pill-trim" : "vd-pill-hold";
-  const name = livePrice?.name ?? review?.company ?? "";
-  const isUp = plPct != null && plPct >= 0;
+// ============================================================
+//  DOSSIER — two-column: sticky brief + scrolling evidence
+// ============================================================
+function Conclusion({ text }) {
+  if (!text) return null;
   return (
-    <div className="vd-row" style={{ borderBottom: `1px solid ${P.cardBorder}22`, transition: "background .12s" }}>
-      <div style={{ display: "grid", gridTemplateColumns: "44px 1fr 95px 80px 90px 105px 120px 90px 36px", alignItems: "center", gap: 0, padding: "0 4px" }}>
-        {/* Logo + ticker */}
-        <div style={{ padding: "14px 0 14px 12px" }}><StockLogo ticker={h.ticker} size={30} /></div>
-        <button onClick={onOpen} style={{ textAlign: "left", background: "none", border: "none", cursor: "pointer", padding: "14px 12px 14px 10px", minWidth: 0 }}>
-          <div style={{ display: "flex", alignItems: "center", gap: 7, marginBottom: 2 }}>
-            <span style={{ fontFamily: F.mono, fontWeight: 700, fontSize: 13, color: P.accent }}>{h.ticker}</span>
-            {foreignCur && <span style={{ fontFamily: F.mono, fontSize: 8, fontWeight: 600, color: P.amber, background: `${P.amber}15`, border: `1px solid ${P.amber}40`, borderRadius: 3, padding: "1px 4px" }}>{foreignCur}</span>}
-          </div>
-          {name && <div style={{ fontFamily: F.sans, fontSize: 11, color: P.faint, whiteSpace: "nowrap", overflow: "hidden", textOverflow: "ellipsis", maxWidth: 160 }}>{name}</div>}
-        </button>
-        {/* Price */}
-        <div style={{ padding: "14px 8px", textAlign: "right" }}>
-          {curPrice != null
-            ? <span style={{ fontFamily: F.mono, fontSize: 13, fontWeight: 600, color: P.ink }}>{money(curPrice)}</span>
-            : <span style={{ fontFamily: F.mono, fontSize: 11, color: P.faint }}>—</span>}
-        </div>
-        {/* Qty */}
-        <div style={{ padding: "14px 8px", textAlign: "right" }}>
-          <span style={{ fontFamily: F.mono, fontSize: 12, color: P.slate }}>{fmtShares(h.shares)}</span>
-        </div>
-        {/* Avg cost */}
-        <div style={{ padding: "14px 8px", textAlign: "right" }}>
-          <span style={{ fontFamily: F.mono, fontSize: 12, color: P.slate }}>{money(cost)}</span>
-          {foreignCur && <div style={{ fontFamily: F.mono, fontSize: 9, color: P.faint }}>{h.currency} {parseNum(h.cost)?.toFixed(2)}</div>}
-        </div>
-        {/* Market value */}
-        <div style={{ padding: "14px 8px", textAlign: "right" }}>
-          {value != null
-            ? <span style={{ fontFamily: F.mono, fontSize: 13, fontWeight: 600, color: P.ink }}>{money(value)}</span>
-            : <span style={{ fontFamily: F.mono, fontSize: 11, color: P.faint }}>—</span>}
-        </div>
-        {/* P&L */}
-        <div style={{ padding: "14px 8px", textAlign: "right" }}>
-          {pl != null ? (
-            <>
-              <div style={{ fontFamily: F.mono, fontSize: 13, fontWeight: 600, color: isUp ? P.green : P.red }}>{isUp ? "+" : ""}{money(pl)}</div>
-              <div style={{ fontFamily: F.mono, fontSize: 10, color: isUp ? P.green : P.red, opacity: 0.8 }}>{isUp ? "+" : ""}{plPct.toFixed(2)}%</div>
-            </>
-          ) : <span style={{ fontFamily: F.mono, fontSize: 11, color: P.faint }}>—</span>}
-        </div>
-        {/* Call */}
-        <div style={{ padding: "14px 8px", display: "flex", alignItems: "center", justifyContent: "center" }}>
-          {act
-            ? <span className={pillonClass} style={{ fontFamily: F.sans, fontWeight: 700, fontSize: 10, borderRadius: 4, padding: "3px 9px", whiteSpace: "nowrap" }}>{act}</span>
-            : review?.scoreForYou != null
-              ? <span style={{ fontFamily: F.mono, fontSize: 13, fontWeight: 700, color: scoreColor(review.scoreForYou) }}>{Math.round(review.scoreForYou)}</span>
-              : null}
-        </div>
-        {/* Remove */}
-        <div style={{ padding: "14px 6px 14px 0", textAlign: "center" }}>
-          <button onClick={onRemove} title="Remove" style={{ fontSize: 14, color: P.faint, background: "none", border: "none", cursor: "pointer", lineHeight: 1, padding: "2px 4px", opacity: 0.5 }}>×</button>
-        </div>
+    <Card accentEdge pad={16} style={{ background: c.accentSoft, borderColor: c.accentBorder, marginTop: 16 }}>
+      <Overline color={c.accent} style={{ marginBottom: 7 }}>Summary</Overline>
+      <p style={{ ...type.small, lineHeight: 1.65, color: c.text2, margin: 0 }}>{text}</p>
+    </Card>
+  );
+}
+function PillarRow({ label, score, sub }) {
+  const col = scoreColor(score);
+  return (
+    <div style={{ marginBottom: 12 }}>
+      <div style={{ display: "flex", justifyContent: "space-between", alignItems: "baseline", marginBottom: 6 }}>
+        <span style={{ ...type.small, fontWeight: 500, color: c.text }}>{label}{sub && <span style={{ ...type.caption, color: c.text3, marginLeft: 8 }}>{sub}</span>}</span>
+        <span style={{ ...type.data, fontWeight: 600, color: col }}>{score != null ? Math.round(score) : "—"}</span>
       </div>
-      {review?.rationale && <div style={{ fontFamily: F.sans, fontSize: 11.5, lineHeight: 1.5, color: P.slate, padding: "0 16px 12px 64px", opacity: 0.85 }}>{review.rationale}</div>}
+      <MeterBar score={score} />
     </div>
   );
 }
 
-// ---------- help chat ----------
+function Results({ result, profile, backtestSnapshot, onOpenBacktest }) {
+  const [tab, setTab] = useState("Fundamentals");
+  const isMobile = useIsMobile();
+  const r = result, overall = r.overall?.score;
+  const act = r.overall?.action;
+  const actColor = actionColor(act || "");
+
+  const DataSources = () => r.dataSources?.length > 0 ? (
+    <div style={{ marginTop: 24, paddingTop: 16, borderTop: `1px solid ${c.hairline}` }}>
+      <Overline color={c.text3} style={{ marginBottom: 8 }}>Sources</Overline>
+      <div style={{ display: "flex", flexWrap: "wrap", gap: 6 }}>{r.dataSources.map((s, i) => <Tag key={i}>{s}</Tag>)}</div>
+    </div>
+  ) : null;
+
+  const sc = r.news?.sentimentScore || 0;
+  const sCol = sc > 20 ? c.positive : sc < -20 ? c.negative : c.warning;
+
+  // ── left brief ──
+  const Brief = (
+    <div style={{ display: "flex", flexDirection: "column", gap: 14 }}>
+      <Card pad={20}>
+        <div style={{ display: "flex", alignItems: "center", gap: 12, marginBottom: 16 }}>
+          {r.ticker && <StockLogo ticker={r.ticker} size={44} />}
+          <div style={{ minWidth: 0 }}>
+            <div style={{ display: "flex", alignItems: "center", gap: 8, flexWrap: "wrap" }}>
+              {r.ticker && <span style={{ fontFamily: font.mono, fontWeight: 700, fontSize: 13, color: c.accent }}>{r.ticker}</span>}
+              {act && <CallChip action={act} />}
+            </div>
+            <h2 style={{ ...type.heading, color: c.text, margin: "2px 0 0" }}>{r.company}</h2>
+          </div>
+        </div>
+
+        {r._savedAt && (
+          <div style={{ ...type.caption, color: c.warning, background: c.warningSoft, border: `1px solid rgba(251,184,69,0.3)`, borderRadius: radius.sm, padding: "8px 12px", marginBottom: 14, lineHeight: 1.5 }}>
+            Saved dossier from {fmtHistoryDate(r._savedAt)} — prices, news and scores reflect that moment. Use "Update" in Past research for a fresh read.
+          </div>
+        )}
+
+        <div style={{ display: "flex", flexDirection: "column", alignItems: "center", gap: 6, padding: "8px 0 16px" }}>
+          <ScoreRing score={overall} size={172} showGrade />
+          <span style={{ ...type.overline, color: c.text3 }}>Score for {(profile.name || "you").toUpperCase()}</span>
+        </div>
+
+        {r.overall?.thesis && (
+          <div style={{ background: c.surface2, borderLeft: `2px solid ${actColor}`, borderRadius: radius.sm, padding: "13px 15px", marginBottom: 16 }}>
+            <p style={{ ...type.small, lineHeight: 1.6, color: c.text, margin: 0, fontWeight: 500 }}>{r.overall.thesis}</p>
+          </div>
+        )}
+
+        <Overline color={c.accent} style={{ marginBottom: 12 }}>Pillars</Overline>
+        <PillarRow label="Fundamentals" score={r.pillars?.fundamentals} />
+        <PillarRow label="Valuation" score={r.pillars?.valuation} />
+        <PillarRow label="Technicals" score={r.pillars?.technicals} />
+        <PillarRow label="Risk (safety)" score={r.pillars?.risk} />
+      </Card>
+
+      {(r.analystConsensus?.rating || r.news?.overallSentiment) && (
+        <Card pad={16}>
+          {r.analystConsensus?.rating && (
+            <div style={{ marginBottom: r.news?.overallSentiment ? 14 : 0 }}>
+              <Overline color={c.text3} style={{ marginBottom: 8 }}>Wall Street consensus</Overline>
+              <div style={{ display: "flex", gap: 12, alignItems: "baseline", flexWrap: "wrap" }}>
+                <span style={{ ...type.bodyStrong, color: r.analystConsensus.rating.includes("Buy") ? c.positive : r.analystConsensus.rating.includes("Sell") ? c.negative : c.text2 }}>{r.analystConsensus.rating}</span>
+                {r.analystConsensus.targetPrice && <span style={{ ...type.data, color: c.text }}>PT {r.analystConsensus.targetPrice}</span>}
+                {r.analystConsensus.upside && <span style={{ ...type.data, color: c.positive }}>{r.analystConsensus.upside}</span>}
+              </div>
+              {r.analystConsensus.numAnalysts > 0 && <div style={{ ...type.caption, color: c.text3, marginTop: 4 }}>{r.analystConsensus.numAnalysts} analysts · {r.analystConsensus.recentRevisions}</div>}
+            </div>
+          )}
+          {r.news?.overallSentiment && (
+            <div>
+              <Overline color={c.text3} style={{ marginBottom: 8 }}>News sentiment</Overline>
+              <div style={{ ...type.bodyStrong, color: sCol, marginBottom: 6 }}>{r.news.overallSentiment}</div>
+              <MeterBar score={(sc + 100) / 2} color={sCol} height={4} />
+            </div>
+          )}
+        </Card>
+      )}
+    </div>
+  );
+
+  // ── right evidence ──
+  const Evidence = (
+    <Card pad={20} style={{ minWidth: 0 }}>
+      <Tabs value={tab} onChange={setTab} items={DOSSIER_TABS} style={{ marginBottom: 20 }} />
+      <motion.div key={tab} initial={{ opacity: 0, y: 6 }} animate={{ opacity: 1, y: 0 }} transition={{ duration: 0.18 }}>
+          {(tab === "Fundamentals" || tab === "Technicals" || tab === "Risk") && (() => {
+            const map = { Fundamentals: ["fundamentals", "Quality of the business — earnings, margins, balance sheet"], Technicals: ["technicals", "Price trend, momentum, and chart setup right now"], Risk: ["risk", "Higher = safer. Debt, volatility, moat, business risk."] };
+            const [key, hint] = map[tab];
+            const sec = r[key];
+            const pscore = r.pillars?.[key];
+            return (
+              <div>
+                <div style={{ display: "flex", alignItems: "center", gap: 14, marginBottom: 20, padding: "14px 16px", background: c.surface2, border: `1px solid ${c.hairline}`, borderRadius: radius.sm }}>
+                  <ScoreRing score={pscore} size={56} stroke={5} />
+                  <div><div style={{ ...type.bodyStrong, color: c.text }}>{tab}</div><div style={{ ...type.caption, color: c.text3 }}>{hint}</div></div>
+                </div>
+                {tab === "Technicals" && backtestSnapshot && (
+                  <div style={{ padding: "16px 18px", background: c.surface2, border: `1px solid ${c.hairline}`, borderRadius: radius.sm, marginBottom: 18 }}>
+                    <div style={{ display: "flex", alignItems: "center", justifyContent: "space-between", marginBottom: 10, flexWrap: "wrap", gap: 8 }}>
+                      <Overline color={c.accent}>Backtest snapshot — SMA Crossover ({backtestSnapshot.fast}/{backtestSnapshot.slow})</Overline>
+                      {onOpenBacktest && <Button variant="ghost" size="sm" onClick={onOpenBacktest}>Explore in Backtester →</Button>}
+                    </div>
+                    <div style={{ display: "flex", gap: 20, flexWrap: "wrap", marginBottom: 10 }}>
+                      <div>
+                        <div style={{ ...type.caption, color: c.text3, marginBottom: 3 }}>Strategy CAGR ({backtestSnapshot.periodYears}y)</div>
+                        <div style={{ ...type.data, fontSize: 18, fontWeight: 600, color: backtestSnapshot.beats ? c.positive : c.negative }}>{backtestSnapshot.strategyStats.cagr}%</div>
+                      </div>
+                      <div>
+                        <div style={{ ...type.caption, color: c.text3, marginBottom: 3 }}>Buy & hold CAGR</div>
+                        <div style={{ ...type.data, fontSize: 18, fontWeight: 600, color: c.text2 }}>{backtestSnapshot.buyHoldStats.cagr}%</div>
+                      </div>
+                      <div>
+                        <div style={{ ...type.caption, color: c.text3, marginBottom: 3 }}>Max drawdown</div>
+                        <div style={{ ...type.data, fontSize: 18, fontWeight: 600, color: c.text2 }}>{backtestSnapshot.strategyStats.maxDrawdown}%</div>
+                      </div>
+                      <div>
+                        <div style={{ ...type.caption, color: c.text3, marginBottom: 3 }}>Signals triggered</div>
+                        <div style={{ ...type.data, fontSize: 18, fontWeight: 600, color: c.text2 }}>{backtestSnapshot.trades}</div>
+                      </div>
+                    </div>
+                    <div style={{ ...type.small, color: c.text3, lineHeight: 1.5 }}>
+                      {backtestSnapshot.beats
+                        ? `A simple 50/200-day moving-average crossover would have beaten just buying and holding this stock over the last ${backtestSnapshot.periodYears} years.`
+                        : `Just buying and holding this stock would have beaten a simple 50/200-day moving-average crossover over the last ${backtestSnapshot.periodYears} years — often the honest result for a strategy this simple.`}
+                    </div>
+                  </div>
+                )}
+                <div style={{ display: "grid", gridTemplateColumns: "repeat(auto-fill, minmax(300px, 1fr))", gap: 18 }}>
+                  {(sec?.groups || []).map((g, i) => (
+                    <MetricTable key={i} title={g.title} items={(g.items || []).map(it => ({ ...it, label: <GlossLabel text={it.label} /> }))} />
+                  ))}
+                </div>
+                <Conclusion text={sec?.conclusion} />
+                <DataSources />
+              </div>
+            );
+          })()}
+
+          {tab === "News" && (() => {
+            const n = r.news;
+            if (!n) return <EmptyState title="No news data" hint="No recent news was available for this name." />;
+            const sentimentMap = { Positive: c.positive, Negative: c.negative, Neutral: c.text3 };
+            return (
+              <div>
+                <div style={{ display: "flex", alignItems: "center", gap: 20, padding: "16px 18px", background: c.surface2, border: `1px solid ${c.hairline}`, borderRadius: radius.sm, marginBottom: 18, flexWrap: "wrap" }}>
+                  <div><div style={{ ...type.caption, color: c.text3, marginBottom: 3 }}>Overall sentiment</div><div style={{ ...type.title, fontSize: 20, color: sCol }}>{n.overallSentiment}</div></div>
+                  <div style={{ flex: "1 1 200px" }}>
+                    <div style={{ display: "flex", justifyContent: "space-between", marginBottom: 5 }}>
+                      <span style={{ ...type.caption, color: c.negative }}>Bearish −100</span>
+                      <span style={{ ...type.data, color: sCol }}>{sc > 0 ? "+" : ""}{sc}</span>
+                      <span style={{ ...type.caption, color: c.positive }}>+100 Bullish</span>
+                    </div>
+                    <MeterBar score={(sc + 100) / 2} color={sCol} height={6} />
+                  </div>
+                  {n.summary && <div style={{ flex: "2 1 300px", ...type.small, lineHeight: 1.55, color: c.text2, borderLeft: `2px solid ${sCol}`, paddingLeft: 14 }}>{n.summary}</div>}
+                </div>
+                {n.insiderActivity && (
+                  <div style={{ padding: "14px 16px", background: c.surface2, border: `1px solid ${c.hairline}`, borderRadius: radius.sm, marginBottom: 14 }}>
+                    <Overline color={c.accent} style={{ marginBottom: 8 }}>Insider activity</Overline>
+                    <div style={{ ...type.small, color: c.text2, lineHeight: 1.55, marginBottom: (n.insiderActivity.transactions || []).length ? 10 : 0 }}>{n.insiderActivity.summary}</div>
+                    {(n.insiderActivity.transactions || []).length > 0 && (
+                      <div style={{ display: "flex", flexDirection: "column", gap: 6 }}>
+                        {n.insiderActivity.transactions.map((t, i) => (
+                          <div key={i} style={{ display: "flex", alignItems: "center", gap: 8, flexWrap: "wrap", ...type.caption, color: c.text3 }}>
+                            <span style={{ fontWeight: 600, color: t.type === "Buy" ? c.positive : t.type === "Sell" ? c.negative : c.text2 }}>{t.type}</span>
+                            <span>{t.insider}</span>
+                            {t.shares && <span>· {t.shares} sh</span>}
+                            {t.value && <span>· {t.value}</span>}
+                            {t.date && <span>· {t.date}</span>}
+                          </div>
+                        ))}
+                      </div>
+                    )}
+                  </div>
+                )}
+                <div style={{ display: "flex", flexDirection: "column", gap: 10 }}>
+                  {(n.items || []).map((item, i) => {
+                    const col = sentimentMap[item.sentiment] || c.text3;
+                    const hasUrl = item.url && item.url.startsWith("http");
+                    return (
+                      <div key={i} style={{ padding: "14px 16px", background: c.surface2, border: `1px solid ${c.hairline}`, borderLeft: `3px solid ${col}`, borderRadius: radius.sm }}>
+                        <div style={{ display: "flex", alignItems: "flex-start", justifyContent: "space-between", gap: 12, marginBottom: 8 }}>
+                          {hasUrl
+                            ? <a href={item.url} target="_blank" rel="noopener noreferrer" className="atlas-link" style={{ ...type.bodyStrong, color: c.text, lineHeight: 1.45 }}>{item.headline} ↗</a>
+                            : <span style={{ ...type.bodyStrong, color: c.text, lineHeight: 1.45 }}>{item.headline}</span>}
+                          <span style={{ ...type.caption, fontWeight: 600, color: col, whiteSpace: "nowrap" }}>{item.sentiment}</span>
+                        </div>
+                        <div style={{ display: "flex", alignItems: "center", gap: 8, marginBottom: item.impact ? 10 : 0, flexWrap: "wrap" }}>
+                          {item.category && <Badge tone={item.category === "Insider Trading" ? "accent" : "neutral"}>{item.category}</Badge>}
+                          <span style={{ ...type.caption, fontWeight: 600, color: c.text3 }}>{item.source}</span>
+                          <span style={{ ...type.caption, color: c.text3 }}>· {item.date}</span>
+                        </div>
+                        {item.impact && <div style={{ ...type.small, color: c.text2, lineHeight: 1.55, borderTop: `1px solid ${c.hairline}`, paddingTop: 10 }}>{item.impact}</div>}
+                      </div>
+                    );
+                  })}
+                </div>
+                <DataSources />
+              </div>
+            );
+          })()}
+
+          {tab === "Catalysts" && (
+            <div>
+              {r.analystConsensus?.rating && (
+                <div style={{ display: "flex", flexWrap: "wrap", gap: 0, marginBottom: 20, border: `1px solid ${c.hairline}`, borderRadius: radius.sm, overflow: "hidden" }}>
+                  {[
+                    ["Consensus", r.analystConsensus.rating, r.analystConsensus.rating?.includes("Buy") ? c.positive : r.analystConsensus.rating?.includes("Sell") ? c.negative : c.text2],
+                    ["Price Target", r.analystConsensus.targetPrice || "—", c.text],
+                    ["Upside", r.analystConsensus.upside || "—", c.positive],
+                    ["High / Low", r.analystConsensus.highTarget && r.analystConsensus.lowTarget ? `${r.analystConsensus.highTarget} / ${r.analystConsensus.lowTarget}` : "—", c.text],
+                    ["Analysts", r.analystConsensus.numAnalysts || "—", c.text],
+                  ].map(([label, val, col], i) => (
+                    <div key={label} style={{ flex: "1 1 110px", padding: "13px 15px", background: i % 2 ? "transparent" : c.surface2, borderRight: `1px solid ${c.hairline}` }}>
+                      <div style={{ ...type.caption, color: c.text3, marginBottom: 5 }}>{label}</div>
+                      <div style={{ ...type.data, fontWeight: 600, color: col }}>{val}</div>
+                    </div>
+                  ))}
+                </div>
+              )}
+              <Overline color={c.text} style={{ marginBottom: 12, ...type.bodyStrong, color: c.text, textTransform: "none", letterSpacing: 0 }}>Upcoming catalysts</Overline>
+              {(r.catalysts || []).length === 0 && <div style={{ ...type.small, color: c.text3 }}>No catalyst data available.</div>}
+              <div style={{ display: "flex", flexDirection: "column", gap: 8 }}>
+                {(r.catalysts || []).map((cat, i) => {
+                  const dirCol = cat.direction === "Bullish" ? c.positive : cat.direction === "Bearish" ? c.negative : c.warning;
+                  return (
+                    <div key={i} style={{ display: "flex", border: `1px solid ${c.hairline}`, borderLeft: `3px solid ${dirCol}`, borderRadius: radius.sm, overflow: "hidden" }}>
+                      <div style={{ padding: "13px 15px", flex: 1 }}>
+                        <div style={{ display: "flex", alignItems: "center", gap: 10, marginBottom: 6, flexWrap: "wrap" }}>
+                          <span style={{ ...type.bodyStrong, color: c.text }}>{cat.label}</span>
+                          {cat.timeframe && <Badge>{cat.timeframe}</Badge>}
+                        </div>
+                        <div style={{ ...type.small, color: c.text2, lineHeight: 1.55 }}>{cat.description}</div>
+                      </div>
+                      <div style={{ padding: "13px 15px", background: c.surface2, borderLeft: `1px solid ${c.hairline}`, display: "flex", alignItems: "center" }}>
+                        <span style={{ ...type.caption, fontWeight: 700, color: dirCol }}>{cat.direction}</span>
+                      </div>
+                    </div>
+                  );
+                })}
+              </div>
+            </div>
+          )}
+
+          {tab === "Your fit" && (() => {
+            const fitAct = r.fit?.action;
+            const fitActCol = actionColor(fitAct || "") === c.text3 ? c.accent : actionColor(fitAct || "");
+            return (
+              <div>
+                <div style={{ display: "flex", gap: 24, flexWrap: "wrap", alignItems: "flex-start", marginBottom: 20 }}>
+                  <div style={{ display: "flex", flexDirection: "column", alignItems: "center", gap: 6 }}>
+                    <ScoreRing score={r.fit?.score} size={120} />
+                    <span style={{ ...type.caption, color: c.text3 }}>Fit for {profile.name || "you"}</span>
+                  </div>
+                  <div style={{ flex: "1 1 280px" }}>
+                    <p style={{ ...type.body, lineHeight: 1.65, color: c.text2, margin: "0 0 14px" }}>{r.fit?.summary}</p>
+                    {fitAct && <Badge tone={fitActCol === c.positive ? "positive" : fitActCol === c.negative ? "negative" : "accent"} style={{ fontSize: 13, padding: "8px 16px" }}>{fitAct}</Badge>}
+                  </div>
+                </div>
+                {r.fit?.positionSizing && (
+                  <Card accentEdge pad={14} style={{ background: c.accentSoft, borderColor: c.accentBorder, marginBottom: 14 }}>
+                    <Overline color={c.accent} style={{ marginBottom: 6 }}>Position sizing</Overline>
+                    <p style={{ ...type.small, lineHeight: 1.6, color: c.text2, margin: 0 }}>{r.fit.positionSizing}</p>
+                  </Card>
+                )}
+                {Array.isArray(r.fit?.watchouts) && r.fit.watchouts.length > 0 && (
+                  <div>
+                    <Overline color={c.warning} style={{ marginBottom: 10 }}>Watchouts for {profile.name || "you"}</Overline>
+                    <div style={{ display: "flex", flexDirection: "column", gap: 8 }}>
+                      {r.fit.watchouts.map((w, i) => (
+                        <div key={i} style={{ display: "flex", gap: 12, ...type.small, color: c.text2, padding: "11px 14px", background: c.warningSoft, border: `1px solid rgba(251,184,69,0.3)`, borderRadius: radius.sm, lineHeight: 1.55 }}>
+                          <span style={{ color: c.warning, flexShrink: 0 }}>!</span>{w}
+                        </div>
+                      ))}
+                    </div>
+                  </div>
+                )}
+                <DataSources />
+              </div>
+            );
+          })()}
+        </motion.div>
+    </Card>
+  );
+
+  return (
+    <motion.div initial={{ opacity: 0, y: 8 }} animate={{ opacity: 1, y: 0 }} transition={{ duration: 0.25 }} style={{ marginTop: 4 }}>
+      <div style={{ display: "grid", gridTemplateColumns: isMobile ? "1fr" : "minmax(0, 340px) 1fr", gap: 16, alignItems: "start" }}>
+        <div style={{ position: isMobile ? "static" : "sticky", top: 16 }}>{Brief}</div>
+        {Evidence}
+      </div>
+      {Array.isArray(r.flags) && r.flags.length > 0 && (
+        <Card pad={16} style={{ marginTop: 14 }}>
+          <Overline color={c.text3} style={{ marginBottom: 8 }}>Caveats & limitations</Overline>
+          {r.flags.map((f, i) => <div key={i} style={{ ...type.caption, color: c.text3, padding: "3px 0", lineHeight: 1.5 }}>· {f}</div>)}
+        </Card>
+      )}
+    </motion.div>
+  );
+}
+
+// ============================================================
+//  DISCOVER — hero pick + opportunity grid
+// ============================================================
+function OpportunityCard({ pick, rank, onOpen, hero }) {
+  const score = pick.fitScore != null ? Math.round(pick.fitScore) : null;
+  return (
+    <Card interactive onClick={onOpen} pad={hero ? 22 : 18} style={hero ? { gridColumn: "1 / -1" } : {}}>
+      <div style={{ display: "flex", gap: 16, alignItems: "flex-start" }}>
+        <StockLogo ticker={pick.ticker} size={hero ? 46 : 38} />
+        <div style={{ flex: 1, minWidth: 0 }}>
+          <div style={{ display: "flex", alignItems: "center", gap: 10, flexWrap: "wrap", marginBottom: 4 }}>
+            <span style={{ fontFamily: font.mono, fontWeight: 700, fontSize: 13, color: c.accent }}>{pick.ticker}</span>
+            <span style={{ ...type.bodyStrong, color: c.text }}>{pick.company}</span>
+            {pick.sector && <Badge>{pick.sector}</Badge>}
+            <span style={{ ...type.caption, color: c.text3, marginLeft: "auto" }}>#{rank}</span>
+          </div>
+          <div style={{ display: "flex", gap: 6, flexWrap: "wrap" }}>{(pick.tags || []).slice(0, 3).map((t, i) => <Tag key={i}>{t}</Tag>)}</div>
+        </div>
+        <div style={{ flexShrink: 0 }}><ScoreRing score={pick.fitScore} size={hero ? 76 : 64} stroke={hero ? 6 : 5} sub="fit" /></div>
+      </div>
+      <div style={{ marginTop: 14, display: "flex", gap: 16, flexWrap: "wrap", alignItems: "flex-start" }}>
+        <div style={{ flex: "1 1 280px" }}>
+          {pick.reason && (
+            <div style={{ display: "flex", gap: 8, marginBottom: 6 }}>
+              <span style={{ color: c.positive, flexShrink: 0, fontSize: 12, marginTop: 1 }}>▲</span>
+              <span style={{ ...type.small, color: c.text2, lineHeight: 1.5 }}>{pick.reason}</span>
+            </div>
+          )}
+          {pick.concern && (
+            <div style={{ display: "flex", gap: 8 }}>
+              <span style={{ color: c.warning, flexShrink: 0, fontSize: 12, marginTop: 1 }}>!</span>
+              <span style={{ ...type.small, color: c.text3, lineHeight: 1.5 }}>{pick.concern}</span>
+            </div>
+          )}
+        </div>
+        <div style={{ display: "flex", flexDirection: "column", gap: 4, alignItems: "flex-end" }}>
+          {(pick.snapshot || []).slice(0, 3).map((m, i) => (
+            <span key={i} style={{ ...type.caption, color: c.text3, whiteSpace: "nowrap" }}>{m.label} <b style={{ color: c.text, fontFamily: font.mono }}>{m.value}</b></span>
+          ))}
+          <span style={{ ...type.caption, fontWeight: 600, color: c.accent, marginTop: 2 }}>Full dossier →</span>
+        </div>
+      </div>
+    </Card>
+  );
+}
+
+// ============================================================
+//  PORTFOLIO — holding row
+// ============================================================
+function ExposureBar({ segments }) {
+  if (!segments.length) return null;
+  return (
+    <div style={{ display: "flex", height: 8, borderRadius: 99, overflow: "hidden", gap: 2, background: c.surface2 }}>
+      {segments.map((s, i) => (
+        <div key={i} title={`${s.ticker} · ${s.pct.toFixed(1)}%`} style={{ width: `${s.pct}%`, background: s.color, minWidth: 2 }} />
+      ))}
+    </div>
+  );
+}
+// Visible proof prices are actually live, not just "fetched once and frozen" — ticks its own label every
+// second off a real timestamp so the user can watch staleness count up between background refreshes.
+function LiveIndicator({ loading, lastUpdate }) {
+  const [, tick] = useState(0);
+  useEffect(() => {
+    if (!lastUpdate) return;
+    const id = setInterval(() => tick(t => t + 1), 1000);
+    return () => clearInterval(id);
+  }, [lastUpdate]);
+  if (loading) {
+    return <span style={{ ...type.overline, color: c.text3, display: "inline-flex", alignItems: "center", gap: 6 }}><Spinner size={10} /> Refreshing…</span>;
+  }
+  if (!lastUpdate) return null;
+  const secs = Math.max(0, Math.round((Date.now() - lastUpdate) / 1000));
+  const label = secs < 5 ? "just now" : secs < 60 ? `${secs}s ago` : `${Math.round(secs / 60)}m ago`;
+  return (
+    <span style={{ ...type.overline, color: c.text3, display: "inline-flex", alignItems: "center", gap: 6 }}>
+      <span style={{ width: 6, height: 6, borderRadius: "50%", background: c.positive, boxShadow: `0 0 6px ${c.positive}`, flexShrink: 0 }} />
+      Live · updated {label}
+    </span>
+  );
+}
+
+function HoldingRow({ h, livePrice, fxRates, review, onOpen, onRemove }) {
+  const isMobile = useIsMobile();
+  const [open, setOpen] = useState(false);
+  // Everything in this row displays in the holding's OWN recorded currency (h.currency) — never silently
+  // mixed with whatever currency the live quote happens to come back in. Cost is already native (no
+  // conversion needed); the live price is converted into h.currency only when its trading currency differs
+  // (e.g. a USD-listed stock bought via a EUR-reporting broker) so Price/Value/P&L stay one consistent unit.
+  const rowCurrency = normalizeCurrencyCode(h.currency || "USD");
+  const rawPrice = livePrice?.price ?? (review ? parseNum(review.currentPrice) : null);
+  const liveCurrency = normalizeCurrencyCode(livePrice?.currency || rowCurrency);
+  const curPrice = fxConvert(rawPrice, liveCurrency, rowCurrency, fxRates);
+  const wasConverted = curPrice != null && liveCurrency !== rowCurrency;
+  const cost = parseNum(h.cost);
+  const sh = parseNum(h.shares);
+  const foreignCur = rowCurrency !== "USD" ? rowCurrency : null;
+  const pl = curPrice != null && cost != null ? (curPrice - cost) * sh : null;
+  const plPct = curPrice != null && cost ? ((curPrice - cost) / cost) * 100 : null;
+  const value = curPrice != null && sh != null ? curPrice * sh : null;
+  const act = review?.action;
+  const name = livePrice?.name ?? review?.company ?? "";
+  const isUp = plPct != null && plPct >= 0;
+
+  if (isMobile) {
+    return (
+      <div className="atlas-row" style={{ borderBottom: `1px solid ${c.hairline}`, padding: "12px 14px", display: "flex", alignItems: "center", gap: 10 }}>
+        <StockLogo ticker={h.ticker} size={30} />
+        <button onClick={onOpen} style={{ flex: 1, textAlign: "left", background: "none", border: "none", cursor: "pointer", padding: 0, minWidth: 0 }}>
+          <div style={{ display: "flex", alignItems: "center", gap: 6, marginBottom: 2 }}>
+            <span style={{ fontFamily: font.mono, fontWeight: 700, fontSize: 13, color: c.accent }}>{h.ticker}</span>
+            {act && <CallChip action={act} />}
+          </div>
+          <div style={{ display: "flex", gap: 10, alignItems: "center" }}>
+            {value != null && <span style={{ ...type.data, color: c.text }}>{fmtCurrency(value, rowCurrency)}</span>}
+            {plPct != null && <span style={{ ...type.data, color: isUp ? c.positive : c.negative }}>{isUp ? "+" : ""}{plPct.toFixed(1)}%</span>}
+          </div>
+        </button>
+        <div style={{ textAlign: "right" }}>
+          {curPrice != null && <div style={{ ...type.data, color: c.text }}>{fmtCurrency(curPrice, rowCurrency)}</div>}
+          <div style={{ fontFamily: font.mono, fontSize: 10, color: c.text3 }}>{fmtShares(h.shares)} sh</div>
+        </div>
+        <IconButton label="Remove" onClick={onRemove} size={30} style={{ color: c.text3 }}>×</IconButton>
+      </div>
+    );
+  }
+
+  return (
+    <div style={{ borderBottom: `1px solid ${c.hairline}` }}>
+      <div className="atlas-row" style={{ display: "grid", gridTemplateColumns: "44px 1fr 95px 80px 95px 110px 120px 92px 60px", alignItems: "center", padding: "0 4px" }}>
+        <div style={{ padding: "13px 0 13px 12px" }}><StockLogo ticker={h.ticker} size={30} /></div>
+        <button onClick={onOpen} style={{ textAlign: "left", background: "none", border: "none", cursor: "pointer", padding: "13px 12px 13px 10px", minWidth: 0 }}>
+          <div style={{ display: "flex", alignItems: "center", gap: 7, marginBottom: 2 }}>
+            <span style={{ fontFamily: font.mono, fontWeight: 700, fontSize: 13, color: c.accent }}>{h.ticker}</span>
+            {foreignCur && <Badge tone="warning" style={{ fontSize: 9, padding: "1px 5px" }}>{foreignCur}</Badge>}
+          </div>
+          {name && <div style={{ ...type.caption, color: c.text3, whiteSpace: "nowrap", overflow: "hidden", textOverflow: "ellipsis", maxWidth: 170 }}>{name}</div>}
+        </button>
+        <div style={{ padding: "13px 8px", textAlign: "right" }}>
+          <span style={{ ...type.data, color: curPrice != null ? c.text : c.text3 }}>{curPrice != null ? fmtCurrency(curPrice, rowCurrency) : "—"}</span>
+          {wasConverted && <div style={{ fontFamily: font.mono, fontSize: 9, color: c.text3 }} title="Live price converted into this holding's recorded currency">{fmtCurrency(rawPrice, liveCurrency)} native</div>}
+        </div>
+        <div style={{ padding: "13px 8px", textAlign: "right", ...type.data, color: c.text2 }}>{fmtShares(h.shares)}</div>
+        <div style={{ padding: "13px 8px", textAlign: "right", ...type.data, color: c.text2 }}>{fmtCurrency(cost, rowCurrency)}</div>
+        <div style={{ padding: "13px 8px", textAlign: "right", ...type.data, color: value != null ? c.text : c.text3 }}>{value != null ? fmtCurrency(value, rowCurrency) : "—"}</div>
+        <div style={{ padding: "13px 8px", textAlign: "right" }}>
+          {pl != null ? (
+            <>
+              <div style={{ ...type.data, color: isUp ? c.positive : c.negative }}>{isUp ? "+" : ""}{fmtCurrency(pl, rowCurrency)}</div>
+              <div style={{ fontFamily: font.mono, fontSize: 10, color: isUp ? c.positive : c.negative, opacity: 0.85 }}>{isUp ? "+" : ""}{plPct.toFixed(2)}%</div>
+            </>
+          ) : <span style={{ ...type.data, color: c.text3 }}>—</span>}
+        </div>
+        <div style={{ padding: "13px 8px", display: "flex", alignItems: "center", justifyContent: "center" }}>
+          {act ? <CallChip action={act} /> : review?.scoreForYou != null
+            ? <span style={{ ...type.data, fontWeight: 700, color: scoreColor(review.scoreForYou) }}>{Math.round(review.scoreForYou)}</span> : null}
+        </div>
+        <div style={{ padding: "13px 6px 13px 0", display: "flex", gap: 2, alignItems: "center", justifyContent: "flex-end" }}>
+          {review?.rationale && <IconButton label="Details" size={28} onClick={() => setOpen(o => !o)}><ChevronIcon open={open} /></IconButton>}
+          <IconButton label="Remove" size={28} onClick={onRemove} style={{ color: c.text3 }}>×</IconButton>
+        </div>
+      </div>
+      <AnimatePresence>
+        {open && review?.rationale && (
+          <motion.div initial={{ height: 0, opacity: 0 }} animate={{ height: "auto", opacity: 1 }} exit={{ height: 0, opacity: 0 }} transition={{ duration: 0.2 }} style={{ overflow: "hidden" }}>
+            <div style={{ ...type.small, lineHeight: 1.55, color: c.text2, padding: "0 16px 14px 66px" }}>{review.rationale}</div>
+          </motion.div>
+        )}
+      </AnimatePresence>
+    </div>
+  );
+}
+
+// ============================================================
+//  HELP CHAT (floating)
+// ============================================================
 const HELP_SYSTEM = `You are Atlas Assistant — the in-app help guide for Atlas, an AI-powered stock research app.
 
 ABOUT ATLAS:
@@ -1016,34 +1350,35 @@ HOW TO RESPOND:
 - Keep responses under ~150 words unless a longer explanation is genuinely needed`;
 
 function HelpChat() {
-  const [open, setOpen] = React.useState(false);
-  const [messages, setMessages] = React.useState([
+  const isMobile = useIsMobile();
+  const [open, setOpen] = useState(false);
+  const [messages, setMessages] = useState([
     { role: "assistant", text: "Hi! I'm the Atlas assistant. Ask me anything about the app or finance — P/E ratios, how the backtester works, what CAGR means, anything." }
   ]);
-  const [input, setInput] = React.useState("");
-  const [loading, setLoading] = React.useState(false);
-  const bottomRef = React.useRef(null);
-  const inputRef = React.useRef(null);
+  const [input, setInput] = useState("");
+  const [loading, setLoading] = useState(false);
+  const bottomRef = useRef(null);
+  const inputRef = useRef(null);
 
-  React.useEffect(() => {
-    if (open) { setTimeout(() => inputRef.current?.focus(), 80); }
-  }, [open]);
-  React.useEffect(() => {
-    bottomRef.current?.scrollIntoView({ behavior: "smooth" });
-  }, [messages, loading]);
+  useEffect(() => { if (open) setTimeout(() => inputRef.current?.focus(), 80); }, [open]);
+  useEffect(() => { bottomRef.current?.scrollIntoView({ behavior: "smooth" }); }, [messages, loading]);
 
   async function send() {
     const q = input.trim(); if (!q || loading) return;
     const next = [...messages, { role: "user", text: q }];
     setMessages(next); setInput(""); setLoading(true);
     try {
-      const history = next.map(m => ({ role: m.role === "assistant" ? "assistant" : "user", content: m.text }));
+      // The canned greeting is UI-only. It must NOT be sent upstream: the Messages API requires
+      // messages[0] to be a user turn, so including the greeting 400s every single request —
+      // which meant this chat never worked at all until the greeting was filtered out.
+      const history = next
+        .filter((m, i) => !(i === 0 && m.role === "assistant"))
+        .map(m => ({ role: m.role === "assistant" ? "assistant" : "user", content: m.text }));
       const resp = await fetch(`${API_BASE}/api/messages`, {
-        method: "POST", headers: { "Content-Type": "application/json" },
-        body: JSON.stringify({
-          model: "claude-sonnet-4-6", max_tokens: 600, system: HELP_SYSTEM,
-          messages: history,
-        }),
+        method: "POST", headers: { "Content-Type": "application/json", ...(await aiAuthHeaders()) },
+        // Thinking disabled on purpose: this is a snappy help chat, not analysis — adaptive
+        // thinking would add seconds of silence before short answers.
+        body: JSON.stringify({ model: AI_MODEL, max_tokens: 800, system: HELP_SYSTEM, messages: history, thinking: { type: "disabled" } }),
       });
       const data = await resp.json();
       if (data.error) throw new Error(data.error.message);
@@ -1053,153 +1388,140 @@ function HelpChat() {
       setMessages(m => [...m, { role: "assistant", text: "Something went wrong. Try again." }]);
     } finally { setLoading(false); }
   }
-
   const SUGGESTIONS = ["What is a P/E ratio?", "How does the backtester work?", "What does CAGR mean?", "How do I add a non-US stock?"];
 
   return (
     <>
-      {/* Floating button */}
-      <button
-        onClick={() => setOpen(o => !o)}
-        style={{ position: "fixed", bottom: 28, right: 28, zIndex: 1000, width: 48, height: 48, borderRadius: "50%", background: open ? P.dim : P.accent, border: `2px solid ${open ? P.faint : P.accent}`, cursor: "pointer", display: "flex", alignItems: "center", justifyContent: "center", boxShadow: `0 4px 24px ${P.accent}44`, transition: "all .2s" }}
-        title="Atlas Help"
-      >
-        {open
-          ? <span style={{ color: P.slate, fontSize: 18, lineHeight: 1 }}>✕</span>
-          : <svg width="22" height="22" viewBox="0 0 22 22" fill="none"><circle cx="11" cy="11" r="10" stroke="#000" strokeWidth="1.5"/><path d="M8.5 8.5C8.5 7.12 9.62 6 11 6s2.5 1.12 2.5 2.5c0 1.5-1.5 2-1.5 3.5" stroke="#000" strokeWidth="1.8" strokeLinecap="round"/><circle cx="11" cy="16" r="1" fill="#000"/></svg>}
-      </button>
-
-      {/* Chat panel */}
-      {open && (
-        <div style={{ position: "fixed", bottom: 86, right: 28, zIndex: 999, width: 360, maxHeight: 520, display: "flex", flexDirection: "column", background: P.card, border: `1px solid ${P.cardBorder}`, borderRadius: 12, boxShadow: "0 12px 48px #000c", overflow: "hidden" }}>
-          {/* Header */}
-          <div style={{ padding: "14px 18px", borderBottom: `1px solid ${P.cardBorder}`, display: "flex", alignItems: "center", gap: 10, background: P.wash }}>
-            <div style={{ width: 28, height: 28, borderRadius: "50%", background: P.accent, display: "flex", alignItems: "center", justifyContent: "center", flexShrink: 0 }}>
-              <svg width="14" height="14" viewBox="0 0 22 22" fill="none"><circle cx="11" cy="11" r="10" stroke="#000" strokeWidth="1.5"/><path d="M8.5 8.5C8.5 7.12 9.62 6 11 6s2.5 1.12 2.5 2.5c0 1.5-1.5 2-1.5 3.5" stroke="#000" strokeWidth="1.8" strokeLinecap="round"/><circle cx="11" cy="16" r="1" fill="#000"/></svg>
+      {/* On mobile the FAB must clear the bottom nav (62px + safe area) — parked at bottom:24 it
+          sat directly on top of the "Backtest" tab and intercepted its taps. */}
+      <motion.button onClick={() => setOpen(o => !o)} whileTap={{ scale: 0.94 }} aria-label="Atlas help"
+        style={{ position: "fixed", bottom: isMobile ? "calc(76px + env(safe-area-inset-bottom))" : 24, right: isMobile ? 14 : 24, zIndex: 800, width: 52, height: 52, borderRadius: "50%",
+          background: open ? c.surface3 : c.accent, border: `1px solid ${open ? c.border : c.accent}`, cursor: "pointer",
+          display: "flex", alignItems: "center", justifyContent: "center", boxShadow: open ? shadow.e2 : shadow.glow, color: open ? c.text2 : "#fff" }}>
+        {open ? <CloseIcon /> : <HelpIcon />}
+      </motion.button>
+      <AnimatePresence>
+        {open && (
+          <motion.div initial={{ opacity: 0, y: 12, scale: 0.98 }} animate={{ opacity: 1, y: 0, scale: 1 }} exit={{ opacity: 0, y: 12, scale: 0.98 }} transition={{ duration: 0.2 }}
+            style={{ position: "fixed", bottom: isMobile ? "calc(140px + env(safe-area-inset-bottom))" : 90, right: isMobile ? 14 : 24, zIndex: 800, width: 370, maxWidth: "calc(100vw - 28px)", maxHeight: isMobile ? "min(480px, calc(100dvh - 220px))" : 540, display: "flex", flexDirection: "column",
+              background: c.surface1, border: `1px solid ${c.border}`, borderRadius: radius.lg, boxShadow: shadow.e3, overflow: "hidden" }}>
+            <div style={{ padding: "14px 18px", borderBottom: `1px solid ${c.hairline}`, display: "flex", alignItems: "center", gap: 10, background: c.surface2 }}>
+              <div style={{ width: 30, height: 30, borderRadius: "50%", background: c.accent, display: "flex", alignItems: "center", justifyContent: "center", flexShrink: 0, color: "#fff" }}><HelpIcon size={15} /></div>
+              <div>
+                <div style={{ ...type.bodyStrong, color: c.text }}>Atlas Assistant</div>
+                <div style={{ ...type.caption, color: c.text3 }}>Ask anything about the app or finance</div>
+              </div>
             </div>
-            <div>
-              <div style={{ fontFamily: F.sans, fontWeight: 700, fontSize: 13, color: P.ink }}>Atlas Assistant</div>
-              <div style={{ fontFamily: F.sans, fontSize: 11, color: P.faint }}>Ask anything about the app or finance</div>
+            <div style={{ flex: 1, overflowY: "auto", padding: "14px 14px 0", display: "flex", flexDirection: "column", gap: 10, minHeight: 0 }}>
+              {messages.map((m, i) => (
+                <div key={i} style={{ display: "flex", justifyContent: m.role === "user" ? "flex-end" : "flex-start" }}>
+                  <div style={{ maxWidth: "85%", padding: "9px 13px", borderRadius: m.role === "user" ? "12px 12px 2px 12px" : "12px 12px 12px 2px",
+                    background: m.role === "user" ? c.accent : c.surface2, border: m.role === "user" ? "none" : `1px solid ${c.hairline}` }}>
+                    <span style={{ ...type.small, lineHeight: 1.55, color: m.role === "user" ? "#fff" : c.text, whiteSpace: "pre-wrap" }}>{m.text}</span>
+                  </div>
+                </div>
+              ))}
+              {loading && <div style={{ display: "flex", justifyContent: "flex-start" }}><div style={{ padding: "11px 14px", borderRadius: 12, background: c.surface2, border: `1px solid ${c.hairline}` }}><Spinner size={14} /></div></div>}
+              {messages.length === 1 && !loading && (
+                <div style={{ display: "flex", flexWrap: "wrap", gap: 6, paddingBottom: 4 }}>
+                  {SUGGESTIONS.map(s => (
+                    <button key={s} onClick={() => { setInput(s); setTimeout(() => inputRef.current?.focus(), 50); }} className="atlas-btn"
+                      style={{ ...type.caption, color: c.text2, background: "transparent", border: `1px solid ${c.border}`, borderRadius: radius.full, padding: "5px 12px", cursor: "pointer" }}>{s}</button>
+                  ))}
+                </div>
+              )}
+              <div ref={bottomRef} />
             </div>
-          </div>
-
-          {/* Messages */}
-          <div style={{ flex: 1, overflowY: "auto", padding: "14px 14px 0", display: "flex", flexDirection: "column", gap: 10, minHeight: 0 }}>
-            {messages.map((m, i) => (
-              <div key={i} style={{ display: "flex", justifyContent: m.role === "user" ? "flex-end" : "flex-start" }}>
-                <div style={{ maxWidth: "85%", padding: "9px 13px", borderRadius: m.role === "user" ? "12px 12px 2px 12px" : "12px 12px 12px 2px", background: m.role === "user" ? P.accent : P.wash, border: m.role === "user" ? "none" : `1px solid ${P.dim}` }}>
-                  <span style={{ fontFamily: F.sans, fontSize: 13, lineHeight: 1.55, color: m.role === "user" ? "#000" : P.ink, whiteSpace: "pre-wrap" }}>{m.text}</span>
-                </div>
-              </div>
-            ))}
-            {loading && (
-              <div style={{ display: "flex", justifyContent: "flex-start" }}>
-                <div style={{ padding: "9px 13px", borderRadius: "12px 12px 12px 2px", background: P.wash, border: `1px solid ${P.dim}` }}>
-                  <span style={{ fontFamily: F.mono, fontSize: 12, color: P.faint, letterSpacing: 2 }}>···</span>
-                </div>
-              </div>
-            )}
-            {/* Quick suggestions — show only at start */}
-            {messages.length === 1 && !loading && (
-              <div style={{ display: "flex", flexWrap: "wrap", gap: 6, paddingBottom: 4 }}>
-                {SUGGESTIONS.map(s => (
-                  <button key={s} onClick={() => { setInput(s); setTimeout(() => inputRef.current?.focus(), 50); }}
-                    style={{ fontFamily: F.sans, fontSize: 11, color: P.slate, background: "none", border: `1px solid ${P.dim}`, borderRadius: 20, padding: "4px 12px", cursor: "pointer", transition: "border-color .15s" }}
-                    onMouseEnter={e => e.currentTarget.style.borderColor = P.accent}
-                    onMouseLeave={e => e.currentTarget.style.borderColor = P.dim}>
-                    {s}
-                  </button>
-                ))}
-              </div>
-            )}
-            <div ref={bottomRef} />
-          </div>
-
-          {/* Input */}
-          <div style={{ padding: "10px 12px", borderTop: `1px solid ${P.cardBorder}`, display: "flex", gap: 8, background: P.wash }}>
-            <input
-              ref={inputRef}
-              value={input}
-              onChange={e => setInput(e.target.value)}
-              onKeyDown={e => e.key === "Enter" && !e.shiftKey && send()}
-              placeholder="Ask a question…"
-              style={{ flex: 1, fontFamily: F.sans, fontSize: 13, color: P.ink, background: P.card, border: `1.5px solid ${P.dim}`, borderRadius: 8, padding: "9px 12px", outline: "none" }}
-            />
-            <button onClick={send} disabled={!input.trim() || loading}
-              style={{ fontFamily: F.sans, fontWeight: 700, fontSize: 13, color: "#000", background: (!input.trim() || loading) ? P.dim : P.accent, border: "none", borderRadius: 8, padding: "9px 16px", cursor: (!input.trim() || loading) ? "default" : "pointer", transition: "background .15s", flexShrink: 0 }}>
-              Send
-            </button>
-          </div>
-        </div>
-      )}
+            <div style={{ padding: "10px 12px", borderTop: `1px solid ${c.hairline}`, display: "flex", gap: 8, background: c.surface2 }}>
+              <Input ref={inputRef} value={input} onChange={e => setInput(e.target.value)} onKeyDown={e => e.key === "Enter" && !e.shiftKey && send()} placeholder="Ask a question…" style={{ background: c.surface1 }} />
+              <Button size="md" onClick={send} disabled={!input.trim() || loading}>Send</Button>
+            </div>
+          </motion.div>
+        )}
+      </AnimatePresence>
     </>
   );
 }
 
-// ---------- sidebar ----------
-function Sidebar({ nav, setNav, profile, onEdit, holdingsCount, onSignOut }) {
-  const items = [
-    ["discover", "Discover"],
-    ["portfolio", `Portfolio${holdingsCount ? ` (${holdingsCount})` : ""}`],
-    ["research", "Research"],
-    ["backtest", "Backtest"],
-  ];
-  const icons = { discover: "🎯", portfolio: "💼", research: "🔍", backtest: "📊" };
+// ============================================================
+//  NAV — rail (desktop) + bottom (mobile) + topbar
+// ============================================================
+const NAV_ITEMS = [
+  ["home", "Today", (p) => <HomeIcon active={p} />],
+  ["discover", "Discover", (p) => <CompassIcon active={p} />],
+  ["portfolio", "Portfolio", (p) => <WalletIcon active={p} />],
+  ["research", "Research", (p) => <SearchIcon active={p} />],
+  ["backtest", "Backtest", (p) => <ChartIcon active={p} />],
+];
 
+function NavRail({ nav, setNav, profile, onEdit, onSignOut, holdingsCount }) {
   return (
-    <div style={{ position: "fixed", left: 0, top: 0, bottom: 0, width: 240, background: P.header, borderRight: `1px solid ${P.cardBorder}`, display: "flex", flexDirection: "column", zIndex: 100 }}>
-      {/* Logo — click goes home */}
-      <button onClick={() => setNav("home")} style={{ display: "flex", alignItems: "center", gap: 10, padding: "22px 20px 20px", background: "none", border: "none", borderBottom: `1px solid ${P.cardBorder}`, cursor: "pointer", width: "100%" }}>
-        <svg width="30" height="30" viewBox="0 0 30 30" fill="none" xmlns="http://www.w3.org/2000/svg" style={{ flexShrink: 0 }}>
-          <rect width="30" height="30" rx="8" fill={P.accent}/>
-          <path d="M15 7L22 22H17.5L15.8 18H14.2L12.5 22H8L15 7Z" fill="#000" opacity="0.9"/>
-          <line x1="11.5" y1="16" x2="18.5" y2="16" stroke="#000" strokeWidth="1.8" strokeLinecap="round" opacity="0.9"/>
-        </svg>
-        <span style={{ fontFamily: F.sans, fontSize: 17, fontWeight: 700, letterSpacing: 0.2, color: P.ink }}>Atlas</span>
-      </button>
-
-      {/* Nav items */}
-      <nav style={{ flex: 1, padding: "16px 12px", display: "flex", flexDirection: "column", gap: 4 }}>
-        {items.map(([k, label]) => {
+    <div style={{ position: "fixed", left: 0, top: 0, bottom: 0, width: 76, background: c.sunken, borderRight: `1px solid ${c.hairline}`, display: "flex", flexDirection: "column", alignItems: "center", padding: "16px 0", zIndex: 100 }}>
+      <button onClick={() => setNav("home")} aria-label="Atlas home" style={{ background: "none", border: "none", cursor: "pointer", marginBottom: 18 }}><AtlasMark size={32} /></button>
+      <nav style={{ flex: 1, display: "flex", flexDirection: "column", gap: 4, width: "100%", alignItems: "center" }}>
+        {NAV_ITEMS.map(([k, label, icon]) => {
           const on = nav === k;
           return (
-            <button key={k} onClick={() => setNav(k)} style={{
-              width: "100%", textAlign: "left", display: "flex", alignItems: "center", gap: 12,
-              padding: "12px 14px", borderRadius: 9,
-              background: on ? `${P.accent}15` : "transparent",
-              border: `1px solid ${on ? P.accent + "44" : "transparent"}`,
-              color: on ? P.accent : P.slate,
-              fontFamily: F.sans, fontSize: 14, fontWeight: on ? 600 : 400,
-              cursor: "pointer", transition: "all .15s",
-            }}
-            onMouseEnter={e => { if (!on) { e.currentTarget.style.background = P.dim; e.currentTarget.style.color = P.ink; } }}
-            onMouseLeave={e => { if (!on) { e.currentTarget.style.background = "transparent"; e.currentTarget.style.color = P.slate; } }}
-            >
-              <span style={{ fontSize: 17, lineHeight: 1 }}>{icons[k]}</span>
-              <span style={{ flex: 1 }}>{label}</span>
-              {on && <div style={{ width: 4, height: 18, background: P.accent, borderRadius: 2, flexShrink: 0 }} />}
+            <button key={k} onClick={() => setNav(k)} title={label} aria-label={label} className="atlas-btn"
+              style={{ position: "relative", width: 60, padding: "9px 0", borderRadius: radius.md, border: "none", cursor: "pointer",
+                background: on ? c.accentSoft : "transparent", color: on ? c.accent : c.text3,
+                display: "flex", flexDirection: "column", alignItems: "center", gap: 5 }}>
+              {on && <motion.div layoutId="rail-ind" transition={{ type: "spring", stiffness: 420, damping: 38 }} style={{ position: "absolute", left: 0, top: 12, bottom: 12, width: 2.5, background: c.accent, borderRadius: 99 }} />}
+              {icon(on)}
+              <span style={{ fontFamily: font.sans, fontSize: 9.5, fontWeight: on ? 600 : 500 }}>{label}{k === "portfolio" && holdingsCount ? ` ·${holdingsCount}` : ""}</span>
             </button>
           );
         })}
       </nav>
-
-      {/* User at bottom */}
-      <div style={{ padding: "12px 10px", borderTop: `1px solid ${P.cardBorder}` }}>
-        <button onClick={onEdit} style={{ width: "100%", display: "flex", alignItems: "center", gap: 10, padding: "10px 12px", borderRadius: 8, background: "none", border: "none", cursor: "pointer", marginBottom: 6 }}
-          onMouseEnter={e => e.currentTarget.style.background = P.dim}
-          onMouseLeave={e => e.currentTarget.style.background = "none"}>
-          <div style={{ width: 30, height: 30, borderRadius: "50%", background: P.accent, display: "flex", alignItems: "center", justifyContent: "center", flexShrink: 0 }}>
-            <span style={{ fontFamily: F.sans, fontSize: 12, fontWeight: 700, color: "#000" }}>{(profile.name || "U")[0].toUpperCase()}</span>
-          </div>
-          <div style={{ textAlign: "left" }}>
-            <div style={{ fontFamily: F.sans, fontSize: 13, fontWeight: 600, color: P.ink, lineHeight: 1.2 }}>{profile.name || "Profile"}</div>
-            <div style={{ fontFamily: F.sans, fontSize: 11, color: P.faint }}>Edit profile</div>
-          </div>
-        </button>
-        {onSignOut && (
-          <button onClick={onSignOut} style={{ width: "100%", fontFamily: F.sans, fontSize: 12, color: P.faint, background: "none", border: `1px solid ${P.dim}`, borderRadius: 7, padding: "8px 12px", cursor: "pointer" }}>Sign out</button>
-        )}
+      <div style={{ display: "flex", flexDirection: "column", gap: 6, alignItems: "center" }}>
+        <IconButton label="Edit profile" onClick={onEdit} size={40}>
+          <div style={{ width: 30, height: 30, borderRadius: "50%", background: c.accent, display: "flex", alignItems: "center", justifyContent: "center", color: "#fff", ...type.bodyStrong }}>{(profile?.name || "U")[0].toUpperCase()}</div>
+        </IconButton>
+        {onSignOut && <IconButton label="Sign out" onClick={onSignOut} size={40}><SignOutIcon /></IconButton>}
       </div>
+    </div>
+  );
+}
+
+function TopBar({ title, onSearch }) {
+  const [q, setQ] = useState("");
+  const searchRef = useRef(null);
+  // The placeholder advertises ⌘K — make it real (Ctrl+K on Windows/Linux).
+  useEffect(() => {
+    const onKey = (e) => {
+      if ((e.metaKey || e.ctrlKey) && e.key.toLowerCase() === "k") { e.preventDefault(); searchRef.current?.focus(); }
+    };
+    window.addEventListener("keydown", onKey);
+    return () => window.removeEventListener("keydown", onKey);
+  }, []);
+  return (
+    <div style={{ position: "sticky", top: 0, zIndex: 20, background: c.canvas, borderBottom: `1px solid ${c.hairline}`,
+      display: "flex", alignItems: "center", gap: 16, padding: "0 28px", height: 52, margin: "0 -36px 0", }}>
+      <h1 style={{ ...type.bodyStrong, fontSize: 15, color: c.text, margin: 0, flexShrink: 0 }}>{title}</h1>
+      <form onSubmit={(e) => { e.preventDefault(); if (q.trim()) { onSearch(q.trim()); setQ(""); } }}
+        style={{ marginLeft: "auto", position: "relative", width: "min(320px, 38vw)" }}>
+        <span style={{ position: "absolute", left: 11, top: "50%", transform: "translateY(-50%)", color: c.text3, pointerEvents: "none" }}><SearchIcon size={14} /></span>
+        <Input ref={searchRef} value={q} onChange={e => setQ(e.target.value)} placeholder="Research any ticker…  ⌘K" style={{ paddingLeft: 33, height: 32, fontSize: 13, background: c.surface1 }} />
+      </form>
+    </div>
+  );
+}
+
+function BottomNav({ nav, setNav, holdingsCount }) {
+  return (
+    // Height grows BY the safe-area inset — padding inside a fixed 62px used to squeeze the
+    // actual tab buttons on notched phones.
+    <div style={{ position: "fixed", bottom: 0, left: 0, right: 0, height: "calc(62px + env(safe-area-inset-bottom))", paddingBottom: "env(safe-area-inset-bottom)", background: c.sunken, borderTop: `1px solid ${c.hairline}`, display: "flex", zIndex: 200 }}>
+      {NAV_ITEMS.map(([k, label, icon]) => {
+        const on = nav === k;
+        return (
+          <button key={k} onClick={() => setNav(k)} style={{ flex: 1, display: "flex", flexDirection: "column", alignItems: "center", justifyContent: "center", gap: 3, background: "none", border: "none", cursor: "pointer", color: on ? c.accent : c.text3, position: "relative" }}>
+            {on && <div style={{ position: "absolute", top: 0, left: "50%", transform: "translateX(-50%)", width: 26, height: 2, background: c.accent, borderRadius: 2 }} />}
+            {icon(on)}
+            <span style={{ fontFamily: font.sans, fontSize: 9, fontWeight: on ? 600 : 500 }}>{label}</span>
+          </button>
+        );
+      })}
     </div>
   );
 }
@@ -1208,11 +1530,12 @@ function Sidebar({ nav, setNav, profile, onEdit, holdingsCount, onSignOut }) {
 //  ROOT
 // ============================================================
 export default function VerdictApp() {
+  const isMobile = useIsMobile();
   const [phase, setPhase] = useState("onboarding");
   const [profile, setProfile] = useState(null);
   const [nav, setNav] = useState("home");
   const [showProfileEditor, setShowProfileEditor] = useState(false);
-  const [firebaseUser, setFirebaseUser] = useState(undefined); // undefined = loading
+  const [firebaseUser, setFirebaseUser] = useState(undefined);
 
   useEffect(() => {
     if (!auth) { setFirebaseUser(null); return; }
@@ -1227,8 +1550,11 @@ export default function VerdictApp() {
   const [query, setQuery] = useState("");
   const [loading, setLoading] = useState(false);
   const [msgIdx, setMsgIdx] = useState(0);
+  const [elapsedSec, setElapsedSec] = useState(0);
   const [error, setError] = useState(null);
   const [result, setResult] = useState(null);
+  const [backtestSnapshot, setBacktestSnapshot] = useState(null);
+  const [researchHistory, setResearchHistory] = useState([]);
   const timerRef = useRef(null);
 
   // discover
@@ -1240,19 +1566,31 @@ export default function VerdictApp() {
   // portfolio
   const [holdings, setHoldings] = useState([]);
   const [spareCash, setSpareCash] = useState("");
-  const [review, setReview] = useState(null); // {asOf, holdings:[...], portfolio:{...}}
+  const [spareCashCurrency, setSpareCashCurrency] = useState("USD");
+  const [review, setReview] = useState(null);
   const [reviewLoading, setReviewLoading] = useState(false);
   const [reviewError, setReviewError] = useState(null);
   const [nt, setNt] = useState(""); const [ns, setNs] = useState(""); const [nc, setNc] = useState(""); const [ncur, setNcur] = useState("USD");
-  const [fxRates, setFxRates] = useState({}); // rates relative to USD: { EUR: 0.92, GBP: 0.79, ... }
-  const [livePrices, setLivePrices] = useState({}); // { AAPL: { price, currency, name } }
+  const [fxRates, setFxRates] = useState({});
+  const [livePrices, setLivePrices] = useState({});
   const [livePricesLoading, setLivePricesLoading] = useState(false);
-  const [importPreview, setImportPreview] = useState(null); // parsed rows from spreadsheet upload
+  const [lastPriceUpdate, setLastPriceUpdate] = useState(null);
+  const [importPreview, setImportPreview] = useState(null);
+  const [importAnalyzing, setImportAnalyzing] = useState(false);
+  const [importError, setImportError] = useState(null);
+  const [confirmClearOpen, setConfirmClearOpen] = useState(false);
+  const [confirmRemoveIdx, setConfirmRemoveIdx] = useState(null);
   const importRef = useRef(null);
   const [portfolioTab, setPortfolioTab] = useState("holdings");
   const [newsItems, setNewsItems] = useState(null);
+  const [newsInsiderActivity, setNewsInsiderActivity] = useState(null);
   const [newsLoading, setNewsLoading] = useState(false);
   const [newsError, setNewsError] = useState(null);
+
+  // market-wide news widget (Today screen) — general market movers, independent of holdings
+  const [marketNews, setMarketNews] = useState(null);
+  const [marketNewsLoading, setMarketNewsLoading] = useState(false);
+  const [marketNewsError, setMarketNewsError] = useState(null);
 
   useEffect(() => {
     (async () => {
@@ -1260,31 +1598,85 @@ export default function VerdictApp() {
         const p = await kvGet("atlas_profile");
         const h = await kvGet("atlas_holdings");
         const cash = await kvGet("atlas_spare_cash");
+        const cashCur = await kvGet("atlas_spare_cash_currency");
+        const rh = await kvGet("atlas_research_history");
         if (Array.isArray(h)) setHoldings(h);
         if (cash != null) setSpareCash(String(cash));
+        if (cashCur) setSpareCashCurrency(cashCur);
+        if (Array.isArray(rh)) setResearchHistory(rh);
         if (p && p.name) { setProfile(p); setPhase("app"); setAutoDiscover(true); }
       } catch {}
     })();
-    // Fetch FX rates once (Frankfurter is free, no key needed)
-    fetch("https://api.frankfurter.app/latest?from=USD&to=EUR,GBP,CAD,AUD,CHF,JPY,HKD,SGD")
-      .then(r => r.json()).then(d => { if (d.rates) setFxRates(d.rates); }).catch(() => {});
   }, []);
 
-  // Convert an amount from a foreign currency to USD
-  function toUSD(amount, currency) {
-    if (!currency || currency === "USD") return amount;
-    const rate = fxRates[currency]; // units of foreign currency per 1 USD
-    return rate ? amount / rate : amount;
-  }
-
-  // Auto-fetch live prices whenever holdings change
+  // FX rates: retry with backoff on failure (a single silent failure used to leave multi-currency
+  // portfolios stuck at "—" for the whole session) and refresh every few hours for long sessions.
   useEffect(() => {
-    if (!holdings.length) { setLivePrices({}); return; }
-    setLivePricesLoading(true);
-    const key = holdings.map(h => h.ticker).join(",");
-    Promise.all(holdings.map(async h => {
+    let cancelled = false, timer;
+    const loadFx = async (attempt = 0) => {
       try {
-        const r = await fetch(`/api/history?ticker=${encodeURIComponent(h.ticker)}&range=5d&interval=1d`);
+        const r = await fetch(`${API_BASE}/api/fx`);
+        const d = await r.json();
+        if (!cancelled && d.rates) { setFxRates(d.rates); return; }
+        throw new Error("no rates");
+      } catch {
+        if (!cancelled && attempt < 5) timer = setTimeout(() => loadFx(attempt + 1), Math.min(60000, 4000 * 2 ** attempt));
+      }
+    };
+    loadFx();
+    const refresh = setInterval(() => loadFx(), 6 * 3600 * 1000);
+    return () => { cancelled = true; clearTimeout(timer); clearInterval(refresh); };
+  }, []);
+
+  // ---- cross-device sync ----
+  // On sign-in, the cloud copy is the durable one: hydrate from it when it exists, otherwise
+  // seed it from whatever this device already has (first sign-in after local-only use). Keyed
+  // by uid so switching accounts re-hydrates instead of showing the previous user's data.
+  const syncedUid = useRef(null);
+  const cloudSaveTimer = useRef(null);
+  function cloudSave(partial, debounceMs = 0) {
+    const uid = auth?.currentUser?.uid;
+    if (!uid) return;
+    if (!debounceMs) { saveUserData(uid, partial); return; }
+    clearTimeout(cloudSaveTimer.current);
+    cloudSaveTimer.current = setTimeout(() => saveUserData(uid, partial), debounceMs);
+  }
+  useEffect(() => {
+    if (!firebaseUser || syncedUid.current === firebaseUser.uid) return;
+    syncedUid.current = firebaseUser.uid;
+    (async () => {
+      const hadLocalProfile = !!(await kvGet("atlas_profile"))?.name;
+      const cloud = await loadUserData(firebaseUser.uid);
+      if (cloud?.profile?.name) {
+        setProfile(cloud.profile); kvSet("atlas_profile", cloud.profile);
+        if (Array.isArray(cloud.holdings)) { setHoldings(cloud.holdings); kvSet("atlas_holdings", cloud.holdings); }
+        if (cloud.spareCash != null) { setSpareCash(String(cloud.spareCash)); kvSet("atlas_spare_cash", String(cloud.spareCash)); }
+        if (cloud.spareCashCurrency) { setSpareCashCurrency(cloud.spareCashCurrency); kvSet("atlas_spare_cash_currency", cloud.spareCashCurrency); }
+        setPhase("app");
+        if (!hadLocalProfile) setAutoDiscover(true); // fresh device — kick off the first scan
+      } else {
+        // Nothing in the cloud yet — push this device's data up so the account is seeded.
+        const p = await kvGet("atlas_profile");
+        const h = await kvGet("atlas_holdings");
+        const cash = await kvGet("atlas_spare_cash");
+        const cur = await kvGet("atlas_spare_cash_currency");
+        const seed = {};
+        if (p?.name) seed.profile = p;
+        if (Array.isArray(h)) seed.holdings = h;
+        if (cash != null) seed.spareCash = String(cash);
+        if (cur) seed.spareCashCurrency = cur;
+        if (Object.keys(seed).length) saveUserData(firebaseUser.uid, seed);
+      }
+    })();
+  }, [firebaseUser]);
+
+  const tickersKey = holdings.map(h => h.ticker).join(",");
+  const fetchLivePrices = useCallback(async (background) => {
+    if (!holdings.length) { setLivePrices({}); return; }
+    if (!background) setLivePricesLoading(true);
+    const results = await Promise.all(holdings.map(async h => {
+      try {
+        const r = await fetch(apiUrl(`/api/history?ticker=${encodeURIComponent(h.ticker)}&range=5d&interval=1d`));
         const d = await r.json();
         if (d.prices?.length) {
           const latest = d.prices[d.prices.length - 1];
@@ -1292,32 +1684,100 @@ export default function VerdictApp() {
         }
       } catch (_) {}
       return [h.ticker, null];
-    })).then(results => {
+    }));
+    // Merge instead of replace: a transient failure for one ticker keeps its last known price
+    // on screen rather than blanking it to "—" while the "Live · updated just now" label claims
+    // everything is fresh. Tickers no longer held are dropped.
+    const held = new Set(holdings.map(h => h.ticker));
+    setLivePrices(prev => {
       const map = {};
-      for (const [t, v] of results) if (v) map[t] = v;
-      setLivePrices(map);
-      setLivePricesLoading(false);
+      for (const [t, v] of results) {
+        const kept = v || prev[t];
+        if (kept) map[t] = kept;
+      }
+      for (const t of Object.keys(prev)) if (held.has(t) && !(t in map)) map[t] = prev[t];
+      return map;
     });
-  }, [holdings.map(h => h.ticker).join(",")]);
+    setLivePricesLoading(false);
+    if (results.some(([, v]) => v)) setLastPriceUpdate(Date.now());
+  }, [tickersKey]);
+
+  // Fetch immediately whenever the holding list changes...
+  useEffect(() => { fetchLivePrices(false); }, [fetchLivePrices]);
+
+  // ...then keep refreshing quietly in the background while the portfolio is actually on screen,
+  // so prices don't go stale the moment you stop touching the holdings list.
+  useEffect(() => {
+    if (!holdings.length || (nav !== "home" && nav !== "portfolio")) return;
+    const id = setInterval(() => fetchLivePrices(true), 45000);
+    return () => clearInterval(id);
+  }, [fetchLivePrices, nav, holdings.length]);
 
   const [autoDiscover, setAutoDiscover] = useState(false);
-  useEffect(() => {
-    if (autoDiscover && profile) { setAutoDiscover(false); discover(); }
-  }, [autoDiscover, profile]);
+  useEffect(() => { if (autoDiscover && profile) { setAutoDiscover(false); discover(); } }, [autoDiscover, profile]);
+  // Each tab is a different page, not a scroll position within one — carrying a deep scroll
+  // offset from Research into Portfolio just dumps the user mid-table.
+  useEffect(() => { window.scrollTo({ top: 0 }); }, [nav]);
+  // Backtester mounts on first visit and then stays mounted (hidden) so its state survives tab switches.
+  const [backtestMounted, setBacktestMounted] = useState(false);
+  useEffect(() => { if (nav === "backtest") setBacktestMounted(true); }, [nav]);
+  // Market news widget loads once per session the first time the Today screen is visited —
+  // independent of holdings, so it's useful even before the user has added any positions.
+  useEffect(() => { if (nav === "home" && profile && !marketNews && !marketNewsLoading) fetchMarketNews(); }, [nav, profile]);
 
-  function finishOnboarding(p) { setProfile(p); kvSet("atlas_profile", p); setPhase("app"); setAutoDiscover(true); }
-  function saveProfile(p) { setProfile(p); kvSet("atlas_profile", p); setShowProfileEditor(false); setRecs(null); setReview(null); }
-  function updateSpareCash(v) { setSpareCash(v); kvSet("atlas_spare_cash", v); }
-  function cycleMessages() { let k = 0; setMsgIdx(0); timerRef.current = setInterval(() => { k = (k + 1) % LOADING_MSGS.length; setMsgIdx(k); }, 2400); }
-  function persistHoldings(h) { setHoldings(h); kvSet("atlas_holdings", h); }
+  function finishOnboarding(p) { setProfile(p); kvSet("atlas_profile", p); cloudSave({ profile: p }); setPhase("app"); setNav("home"); setAutoDiscover(true); }
+  function saveProfile(p) { setProfile(p); kvSet("atlas_profile", p); cloudSave({ profile: p }); setShowProfileEditor(false); setRecs(null); setReview(null); }
+  function updateSpareCash(v, currency) {
+    setSpareCash(v); kvSet("atlas_spare_cash", v);
+    // Tag the amount with whatever currency it's actually in — same pattern as a holding's own currency —
+    // so it can always be converted to match Portfolio Value's currency at display time, never hardcoded to USD.
+    if (currency) { setSpareCashCurrency(currency); kvSet("atlas_spare_cash_currency", currency); }
+    // Debounced: this fires per keystroke while typing an amount — one Firestore write at the end is enough.
+    cloudSave({ spareCash: v, ...(currency ? { spareCashCurrency: currency } : {}) }, 900);
+  }
+  function cycleMessages() {
+    let k = 0; setMsgIdx(0); setElapsedSec(0);
+    const start = Date.now();
+    timerRef.current = setInterval(() => {
+      k = (k + 1) % LOADING_MSGS.length; setMsgIdx(k);
+      setElapsedSec(Math.round((Date.now() - start) / 1000));
+    }, 2400);
+  }
+  function persistHoldings(h) { setHoldings(h); kvSet("atlas_holdings", h); cloudSave({ holdings: h }); }
 
   // ---- deep dossier ----
   async function evaluate(symbolArg) {
     const name = ((typeof symbolArg === "string" && symbolArg) ? symbolArg : query).trim();
     if (!name || loading) return;
-    setNav("research"); setLoading(true); setError(null); setResult(null); cycleMessages();
-    const sys = `You are a brutally honest, no-nonsense senior equity research analyst. Your job is to produce a complete, institutional-grade stock dossier using REAL, CURRENT data from live web searches. You have NO opinion of your own until the data speaks — if a stock is bad, say it is bad. Do not sugarcoat. Do not be a cheerleader. Scores below 40 are common when warranted.
+    setNav("research"); setLoading(true); setError(null); setResult(null); setBacktestSnapshot(null); cycleMessages();
+    // Ground-truth technicals/performance computed directly from real price history via Atlas's own
+    // backtest engine (src/lib/marketStats.js) — not searched for or estimated by the model. Only
+    // resolves when the query is already a ticker; falls back silently to search-based technicals
+    // (unchanged prior behavior) when it's a company name the model has to resolve itself first.
+    const histStats = looksLikeTicker(name) ? await fetchHistoricalStats(name.toUpperCase()) : null;
+    // Purely client-computed, independent of the AI call — "would a simple 50/200-day SMA crossover
+    // have beaten just buying and holding this stock" is a real backtest result, not something the
+    // model should guess at, so it's rendered straight from marketStats.js rather than routed
+    // through the dossier prompt/schema at all. Tagged with its ticker so it can never be rendered
+    // against a different company's dossier (e.g. after opening a saved entry for another stock).
+    if (histStats?.prices) {
+      const snap = backtestSmaCrossover(histStats.prices);
+      setBacktestSnapshot(snap ? { ...snap, ticker: (histStats.ticker || name).toUpperCase() } : null);
+    }
+    const histBlock = histStats ? `
+═══════════════════════════════════════
+REAL COMPUTED PRICE HISTORY — GROUND TRUTH (from Atlas's own backtest engine, computed directly from actual price data, not a search result or a guess):
+${historicalStatsText(histStats)}
+Use these exact numbers for the corresponding technicals/price-history metrics below — do not re-estimate, round differently, or contradict them with a search-derived guess. This is what makes your technicals/risk read objective and independent of any outside source.
+IMPORTANT: this block describes ticker ${histStats.ticker}${histStats.name ? ` (${histStats.name})` : ""}. The user's query ("${name}") was interpreted as that ticker — if the company you are actually evaluating is a DIFFERENT one (e.g. the query was a company name that coincidentally matches an unrelated ticker), IGNORE this entire block and rely on your own searches instead.
+═══════════════════════════════════════` : "";
+    const sys = `You are a brutally honest, no-nonsense senior equity research analyst — effectively your own independent investment bank. Your job is to produce a complete, institutional-grade stock dossier using REAL data — your own computed price history plus live web searches for financials/news — and to form YOUR OWN judgment from that evidence. You have NO opinion of your own until the data speaks — if a stock is bad, say it is bad. Do not sugarcoat. Do not be a cheerleader. Scores below 40 are common when warranted.
 
+INDEPENDENT JUDGMENT — non-negotiable:
+- Every pillar score, the overall score, and the action are YOUR conclusions, derived only from hard evidence: the actual financials, your own computed price-history statistics (CAGR, max drawdown, volatility, moving averages, RSI — from Atlas's backtest engine, see below), and actual factual news events (earnings beats/misses, guidance changes, litigation, contracts, management changes, downgrades of the BUSINESS not the stock). Reason from first principles like your own desk's analyst, not by adopting someone else's take.
+- Wall Street analyst ratings/price targets and aggregate market/news sentiment are reported ONLY as separate reference context for the user (sections 6 and 9 below) — they must NEVER be used as an input to any pillar score, the overall score, or the action. Do not average toward consensus, and do not let a stock's hype or crowd mood inflate a score the fundamentals/technicals/risk don't support — or let a beaten-down mood deflate one they do support.
+- If your own fact-based read disagrees with the analyst consensus or the prevailing sentiment, that's fine and expected — say so plainly in the thesis rather than softening your call to match theirs.
+${histBlock}
 SEARCH STRATEGY — maximum 4 searches, make each one count:
 1. "[TICKER] stock financials price PE ratio revenue margins balance sheet 2025 2026" — Yahoo Finance or Stockanalysis — get price, valuation, fundamentals, technicals in one go
 2. "[TICKER] stock news analyst rating price target 2025 2026" — get recent news AND analyst consensus together
@@ -1331,7 +1791,7 @@ ${profileText(profile)}
 
 CURRENT PORTFOLIO — assess overlap, concentration, correlation:
 ${holdingsText(holdings)}
-SPARE CASH AVAILABLE TO DEPLOY: ${spareCash ? `$${spareCash}` : "not specified"}
+SPARE CASH AVAILABLE TO DEPLOY: ${spareCash && parseNum(spareCash) > 0 ? `${spareCashCurrency} ${spareCash}` : "not specified"}
 ═══════════════════════════════════════
 
 BRUTAL HONESTY RULES — non-negotiable:
@@ -1391,13 +1851,17 @@ REQUIRED OUTPUT — all sections mandatory, all data from live searches:
    - overallSentiment: "Very Bullish" / "Bullish" / "Neutral" / "Bearish" / "Very Bearish"
    - sentimentScore: -100 to +100 (negative = bad news dominating)
    - summary: 2 sentences on what the news flow says about this stock RIGHT NOW
+   - insiderActivity: ALWAYS search for recent insider buying/selling (SEC Form 4 filings, last 90 days — try openinsider.com/screener?s=TICKER or SEC EDGAR full-text search first) before writing this section — one of the most objective, actionable signals there is (an insider spending their own money to buy is a strong tell; heavy concentrated selling can be a red flag). Give: {"summary":"one sentence on what insiders have done recently, or \"No notable insider activity in the last 90 days\" if genuinely none found","transactions":[{"insider":"name/title e.g. CEO Jane Doe","type":"Buy or Sell","shares":"12,000","value":"$1.8M","date":"Jun 2026"}]} — transactions can be an empty array if none found, but the search must actually happen.
+     Each transaction is exactly ONE discrete, dated filing: "insider" names one specific individual (never a group like "multiple insiders"); "shares" is a bare number only, no descriptions or parentheticals tacked on (wrong: "99,000 (Intent to Sell filing)", right: "99,000"); "value" is a single bare dollar amount, never "undisclosed"/"aggregate"; "date" is one specific date/month, never "multiple dates" or a range. If an insider made several separate filings in the window, add up to 2-3 separate transaction objects (one per actual filing) rather than collapsing them into one vague row — and if you can only confirm a pattern or total but no single filing's specifics, leave it out of "transactions" and mention it only in the "summary" prose instead.
    - items: 5–8 recent news items, each with:
      * headline: actual headline text (not paraphrased)
      * url: direct link to the article (full https URL — required, search for the real URL)
      * source: publication name (Reuters, Bloomberg, WSJ, Yahoo Finance, etc.)
      * date: approximate date (e.g. "Jun 2026", "May 2026")
      * sentiment: "Positive" / "Negative" / "Neutral"
+     * category: one of "Insider Trading", "Earnings", "Management Change", "M&A", "Regulatory/Legal", "Product/Business", "Macro/Sector"
      * impact: one sentence on why this matters for the stock
+   Include any insider-trading items found here too (category "Insider Trading"), in addition to the dedicated insiderActivity summary above.
 
 7. FIT FOR ${profile.name}:
    - score: 0–100 (how well this stock fits THIS investor's profile AND portfolio)
@@ -1424,22 +1888,73 @@ FORMAT RULES:
 - action field in overall must be one of: "Strong Buy", "Buy", "Hold", "Trim", "Sell", "Avoid"
 
 FULL JSON SCHEMA:
-{"company":"","ticker":"","asOf":"","pillars":{"fundamentals":0,"valuation":0,"technicals":0,"risk":0},"overall":{"score":0,"action":"","thesis":""},"fundamentals":{"groups":[{"title":"","items":[{"label":"","value":""}]}],"conclusion":""},"technicals":{"groups":[{"title":"","items":[{"label":"","value":""}]}],"conclusion":""},"risk":{"groups":[{"title":"","items":[{"label":"","value":""}]}],"conclusion":""},"news":{"overallSentiment":"","sentimentScore":0,"summary":"","items":[{"headline":"","url":"","source":"","date":"","sentiment":"","impact":""}]},"fit":{"score":0,"summary":"","action":"","positionSizing":"","watchouts":[""]},"catalysts":[{"label":"","description":"","timeframe":"","direction":""}],"analystConsensus":{"rating":"","targetPrice":"","upside":"","numAnalysts":0,"highTarget":"","lowTarget":"","recentRevisions":""},"dataSources":[""],"flags":[""]}`;
+{"company":"","ticker":"","asOf":"","pillars":{"fundamentals":0,"valuation":0,"technicals":0,"risk":0},"overall":{"score":0,"action":"","thesis":""},"fundamentals":{"groups":[{"title":"","items":[{"label":"","value":""}]}],"conclusion":""},"technicals":{"groups":[{"title":"","items":[{"label":"","value":""}]}],"conclusion":""},"risk":{"groups":[{"title":"","items":[{"label":"","value":""}]}],"conclusion":""},"news":{"overallSentiment":"","sentimentScore":0,"summary":"","insiderActivity":{"summary":"","transactions":[{"insider":"","type":"","shares":"","value":"","date":""}]},"items":[{"headline":"","url":"","source":"","date":"","sentiment":"","category":"","impact":""}]},"fit":{"score":0,"summary":"","action":"","positionSizing":"","watchouts":[""]},"catalysts":[{"label":"","description":"","timeframe":"","direction":""}],"analystConsensus":{"rating":"","targetPrice":"","upside":"","numAnalysts":0,"highTarget":"","lowTarget":"","recentRevisions":""},"dataSources":[""],"flags":[""]}`;
     try {
-      const parsed = await callClaude(sys, `Evaluate: ${name}`, { maxTokens: 10000, maxSearches: 4 });
+      // Sized for the full dossier plus insider-activity section, with headroom for the
+      // Sonnet 5 tokenizer (~30% more tokens for the same text than 4.6) and its adaptive
+      // thinking, which shares the max_tokens budget with the answer itself.
+      const parsed = await callClaude(sys, `Evaluate: ${name}`, { maxTokens: 14000, maxSearches: 4 });
       if (parsed.error === "not_found") throw new Error(`Couldn't find a public company matching "${name}". Try a ticker or exact name.`);
       if (!parsed.pillars && !parsed.fundamentals) throw new Error("The dossier came back incomplete. Tap Retry.");
+      if (parsed.news?.insiderActivity) parsed.news.insiderActivity = cleanInsiderActivity(parsed.news.insiderActivity);
+      // If the model resolved the query to a different company than the price-history guess
+      // (e.g. "FORD" the query vs Forward Industries the ticker), drop the mismatched snapshot.
+      setBacktestSnapshot(s => s && parsed.ticker && s.ticker !== String(parsed.ticker).toUpperCase() ? null : s);
       setResult(parsed);
+      saveResearchHistory(parsed);
     } catch (err) { setError(err.message || "Something went wrong."); }
     finally { setLoading(false); if (timerRef.current) clearInterval(timerRef.current); }
   }
   function openTicker(t) { setQuery(t); evaluate(t); }
 
+  // Keeps a running log of completed dossiers so re-opening one (or re-running it later) doesn't
+  // mean losing everything looked at so far — a fresh research replaces `result` on screen, but the
+  // history list is the durable record. Upserts by ticker: re-researching a name updates its entry
+  // and bumps it to the top rather than creating a duplicate.
+  function saveResearchHistory(parsed) {
+    const ticker = (parsed.ticker || query || "").toUpperCase().trim();
+    if (!ticker) return;
+    setResearchHistory((prev) => {
+      const entry = { ticker, company: parsed.company || ticker, asOf: parsed.asOf || "", savedAt: new Date().toISOString(), result: parsed };
+      const next = [entry, ...prev.filter((e) => e.ticker !== ticker)].slice(0, 25);
+      kvSet("atlas_research_history", next);
+      return next;
+    });
+  }
+  function openResearchHistory(entry) {
+    setQuery(entry.ticker);
+    // _savedAt lets the dossier flag itself as a saved copy (prices/news are as of that time).
+    setResult({ ...entry.result, _savedAt: entry.savedAt });
+    setError(null);
+    // The snapshot on screen belongs to whatever was researched last — recompute it for THIS
+    // ticker (cheap: one price-history fetch) instead of leaking another stock's numbers.
+    setBacktestSnapshot(null);
+    fetchHistoricalStats(entry.ticker).then((hs) => {
+      if (!hs?.prices) return;
+      const snap = backtestSmaCrossover(hs.prices);
+      if (snap) setBacktestSnapshot({ ...snap, ticker: entry.ticker });
+    });
+  }
+  function updateResearchHistory(ticker) { setQuery(ticker); evaluate(ticker); }
+  function removeResearchHistory(ticker) {
+    setResearchHistory((prev) => { const next = prev.filter((e) => e.ticker !== ticker); kvSet("atlas_research_history", next); return next; });
+  }
+
   // ---- discovery ----
-  async function discover() {
+  // Each option maps to a hard constraint injected into the scan prompt — the segmented
+  // control genuinely changes which markets get considered, not just the label on screen.
+  const UNIVERSE_RULES = {
+    "Global all-markets": "Consider every publicly listed equity worldwide.",
+    "US markets": "HARD FILTER: only stocks listed on US exchanges (NYSE, NASDAQ, AMEX) — plain US tickers with no exchange suffix. A US-listed ADR of a foreign company is acceptable; a foreign home-market listing is not.",
+    "Europe": "HARD FILTER: only stocks whose primary listing is on a European exchange (LSE, Euronext, XETRA, Borsa Italiana, SIX, Nordic exchanges, etc.). Every ticker MUST carry its Yahoo exchange suffix (e.g. \"SHEL.L\", \"SAP.DE\", \"ASML.AS\").",
+    "Asia-Pacific": "HARD FILTER: only stocks whose primary listing is in the Asia-Pacific region (Tokyo, Hong Kong, mainland China, Korea, Taiwan, Singapore, India, Australia, New Zealand). Every ticker MUST carry its Yahoo exchange suffix (e.g. \"9988.HK\", \"7203.T\", \"005930.KS\").",
+    "My interest sectors": "HARD FILTER: only stocks in the investor's stated sectors of interest from the profile above (if none are listed, treat as all sectors). Any market worldwide is fine.",
+  };
+  async function discover(universeArg) {
     if (recsLoading) return;
+    const uni = typeof universeArg === "string" ? universeArg : universe;
     setRecsLoading(true); setRecsError(null); setRecs(null);
-    const sys = `You are a brutally honest equity research analyst. Your only job is to find the BEST stocks for this specific investor RIGHT NOW. Use web_search to get current prices, valuations, and recent news. Return ONE JSON object only — no prose, no fences.
+    const sys = `You are a brutally honest equity research analyst — your own independent investment bank, not a mouthpiece for Wall Street consensus. Your only job is to find the BEST stocks for this specific investor RIGHT NOW, based on YOUR OWN read of the hard evidence (fundamentals, valuation, technicals, real factual news events) — not on analyst ratings, price-target chasing, or crowd sentiment. If a name is popular/hyped but the numbers don't back it, leave it out; if a name is out of favor but the numbers are genuinely strong, include it anyway. Use web_search to get current prices, valuations, and recent news. Return ONE JSON object only — no prose, no fences.
 
 INVESTOR PROFILE:
 ${profileText(profile)}
@@ -1447,12 +1962,13 @@ ${profileText(profile)}
 CURRENT HOLDINGS:
 ${holdingsText(holdings)}
 
-SPARE CASH TO DEPLOY: ${spareCash ? `$${spareCash}` : "not specified"}
+SPARE CASH TO DEPLOY: ${spareCash && parseNum(spareCash) > 0 ? `${spareCashCurrency} ${spareCash}` : "not specified"}
 
 ═══ TASK ═══
 Find the 6 best stock opportunities for this investor right now. Be decisive — use your training knowledge plus 1–2 targeted searches to verify current prices or recent catalysts.
 
-Consider every publicly listed equity worldwide. Skip tickers they already own. Non-US tickers must include exchange prefix (e.g. "SHEL.L", "9988.HK", "SAP.DE"). No OTC/pink sheets.
+MARKET UNIVERSE — the investor chose "${uni}": ${UNIVERSE_RULES[uni] || UNIVERSE_RULES["Global all-markets"]}
+Skip tickers they already own. Non-US tickers must include exchange suffix (e.g. "SHEL.L", "9988.HK", "SAP.DE"). No OTC/pink sheets.
 
 Score each pick 0–100 (fitScore) honestly:
 - Loss-making, no path to profit: MAX 40
@@ -1469,7 +1985,7 @@ For each pick give:
 Schema:
 {"asOf":"","marketContext":"one sentence on current market conditions","picks":[{"ticker":"","company":"","sector":"","fitScore":0,"reason":"","concern":"","tags":[""],"snapshot":[{"label":"","value":""}]}]}`;
     try {
-      const parsed = await callClaude(sys, "Find the best stocks for me right now.", { maxTokens: 2000, maxSearches: 2 });
+      const parsed = await callClaude(sys, "Find the best stocks for me right now.", { maxTokens: 2800, maxSearches: 2 });
       if (!Array.isArray(parsed.picks)) throw new Error("Couldn't build the shortlist. Tap Scan again.");
       parsed.picks.sort((a, b) => (b.fitScore || 0) - (a.fitScore || 0));
       setRecs(parsed);
@@ -1483,33 +1999,83 @@ Schema:
     setNewsLoading(true); setNewsError(null);
     const tickers = holdings.map(h => h.ticker).join(", ");
     const sys = `You are a financial news analyst. The user holds these stocks: ${tickers}.
-Search for the latest news (last 7 days) relevant to these holdings. Include:
-- Company-specific news for each holding (earnings, product launches, management changes, analyst upgrades/downgrades, lawsuits, partnerships)
+Search for the latest news relevant to these holdings — go beyond generic headlines and prioritize the news types that actually move a decision to buy/hold/sell:
+- Insider buying/selling (SEC Form 4 filings) in the last 90 days, per holding — this is one of the most objective, actionable signals available (insiders committing their own money is meaningfully different from a headline opinion). For EVERY holding, check a real primary source for exact figures — openinsider.com/screener?s=TICKER (best single source, gives insider name, transaction type, share count, price, and total value directly), or SEC EDGAR full-text search (efts.sec.gov), or secform4.com. Do not rely on a secondary article that merely mentions "an executive sold shares" without the actual filing numbers.
+- Earnings results, guidance changes, product launches, management changes, lawsuits/regulatory action, M&A, partnerships (last 7 days)
 - Broader macro/sector news that materially affects these holdings
 
-Return a JSON array. Each item:
-{
-  "ticker": "AAPL",          // which holding it's most relevant to, or "MACRO" for market-wide news
-  "headline": "...",
-  "source": "Reuters",       // publication name
-  "date": "2026-06-26",      // approximate date, YYYY-MM-DD
-  "summary": "...",          // 1-2 sentence plain English summary
-  "url": "https://...",      // article URL if found, else ""
-  "sentiment": "bullish"     // "bullish", "bearish", or "neutral" for the holding
-}
+insiderActivity: a dedicated portfolio-wide summary, separate from the news list — {"summary":"2-3 sentences on the overall pattern across the portfolio (e.g. \"insider buying at X while heavy selling at Y\"), or \"No notable insider activity across your holdings in the last 90 days\" if genuinely none found","transactions":[{"ticker":"AAPL","insider":"name/title","type":"Buy or Sell","shares":"12,000","value":"$1.8M","date":"Jun 2026"}]}
+QUALITY BAR — non-negotiable: each object in "transactions" is exactly ONE discrete, dated filing:
+- "insider" = one named individual + role (e.g. "Anthony Noto, CEO") — never "Multiple Insiders", "various", "unspecified", or a group.
+- "shares" = a bare number only (e.g. "5,000") — never a description, parenthetical, or qualifier tacked on (wrong: "99,000 (Intent to Sell filing)"; right: "99,000").
+- "value" = a single bare dollar amount (e.g. "$1.2M" or "$526,000") — never "undisclosed", "aggregate", or a range.
+- "date" = one specific date or month (e.g. "May 2026") — never "multiple dates" or a range.
+If an insider made SEVERAL separate purchases/sales in the window (e.g. a CEO buying on 3 different dates), do NOT collapse them into one vague summary row — instead add up to 2-3 separate transaction objects, one per actual filing, each with its own clean specific date/shares/value; if you can only verify totals but not any single filing's specifics, leave it out of "transactions" entirely and describe the pattern only in "summary" prose (e.g. "CEO has made repeated open-market purchases throughout 2026"). Same rule for unverifiable aggregates (e.g. non-US companies without per-person filing detail) — omit from "transactions", mention only in "summary", clearly caveated as unconfirmed/aggregate. A shorter, fully-clean list beats a longer one with any vague or placeholder field.
 
-Return ONLY a JSON object with a single "news" key containing the array, nothing else:
-{"news": [...]}
-Aim for 2-3 items per holding plus 2-3 macro items, max 20 total.`;
+Return a JSON array for the regular news feed. Each item:
+{
+  "ticker": "AAPL",
+  "headline": "...",
+  "source": "Reuters",
+  "date": "2026-06-26",
+  "summary": "...",
+  "url": "https://...",
+  "sentiment": "bullish",
+  "category": "Insider Trading"
+}
+category must be one of: "Insider Trading", "Earnings", "Management Change", "M&A", "Regulatory/Legal", "Product/Business", "Macro/Sector"
+Also include any insider-trading items in this list too (category "Insider Trading"), in addition to the dedicated insiderActivity summary above.
+
+Return ONLY this JSON, nothing else:
+{"insiderActivity":{"summary":"","transactions":[{"ticker":"","insider":"","type":"","shares":"","value":"","date":""}]},"news":[...]}
+Aim for 2-3 items per holding plus 2-3 macro items, max 20 total in "news". Insider trading items don't count against that per-holding cap — include them whenever found.`;
     try {
-      const parsed = await callClaude(sys, `Find latest news for portfolio: ${tickers}`, { maxTokens: 3000, maxSearches: 4 });
-      // callClaude returns parsed JSON — but news is an array not an object
+      // Same reasoning as the portfolio review — up to 20 news items across every holding needs more
+      // room for a large portfolio than a small one; scale it instead of risking mid-JSON truncation.
+      const newsMaxTokens = Math.max(4200, holdings.length * 280 + 1600);
+      // Fixed at 4 searches regardless of portfolio size meant a 16-holding portfolio had barely a
+      // quarter-search per name — nowhere near enough to both scan general news AND pull real Form 4
+      // numbers per holding. Scale with holding count so each name actually gets a shot at a real,
+      // specific insider-activity source instead of returning vague "signal noticed but unconfirmed" rows.
+      const newsMaxSearches = Math.min(30, Math.max(6, holdings.length + 4));
+      const parsed = await callClaude(sys, `Find latest news for portfolio: ${tickers}`, { maxTokens: newsMaxTokens, maxSearches: newsMaxSearches });
       setNewsItems(parsed?.news || []);
+      setNewsInsiderActivity(cleanInsiderActivity(parsed?.insiderActivity));
     } catch (e) {
       setNewsError(e.message || "Could not fetch news.");
-    } finally {
-      setNewsLoading(false);
-    }
+    } finally { setNewsLoading(false); }
+  }
+
+  // ---- market-wide news (Today screen widget) ----
+  async function fetchMarketNews() {
+    if (marketNewsLoading) return;
+    setMarketNewsLoading(true); setMarketNewsError(null);
+    const sys = `You are a markets desk analyst. Find the most important general stock-market-moving news from the last 24-48 hours — this is NOT about any specific user's holdings, it's the general "what's moving markets" briefing any investor would want.
+
+Cover things like: Fed/central bank decisions and rate expectations, major macro data (inflation, jobs, GDP), big market-wide moves and why, geopolitical events affecting markets, and single-company news large enough to move the broader market (mega-cap earnings, major M&A). Use web_search to get real, current items — no invented headlines.
+
+For each item give:
+- headline: actual headline text
+- source: publication name
+- date: approximate (e.g. "Jun 30, 2026")
+- url: real https URL to the article
+- category: one of "Fed & Rates", "Macro Data", "Geopolitical", "Earnings", "M&A", "Sector Move", "Other"
+- summary: 2 sentences on what happened
+- impact: one sentence — YOUR OWN read on what this means going forward, not just a restatement of the news
+- relatedTicker: if this centers on one specific public company, its ticker (e.g. "AAPL"), else null
+
+Also give:
+- marketPulse: one sentence capturing the overall market mood right now and why (bullish/cautious/bearish)
+
+Return ONLY this JSON, nothing else:
+{"marketPulse":"","items":[{"headline":"","source":"","date":"","url":"","category":"","summary":"","impact":"","relatedTicker":null}]}
+Aim for 6-8 items, most important first.`;
+    try {
+      const parsed = await callClaude(sys, "What's moving markets right now?", { maxTokens: 3800, maxSearches: 4 });
+      setMarketNews(parsed);
+    } catch (e) {
+      setMarketNewsError(e.message || "Could not fetch market news.");
+    } finally { setMarketNewsLoading(false); }
   }
 
   // ---- portfolio review ----
@@ -1517,36 +2083,39 @@ Aim for 2-3 items per holding plus 2-3 macro items, max 20 total.`;
     if (reviewLoading || !holdings.length) return;
     setReviewLoading(true); setReviewError(null);
     try {
-      // Fetch live prices from Yahoo Finance for every holding in parallel
+      // Fetch a full year of real price history per holding (not just the latest quote) so the
+      // review can score each position against its OWN computed performance — same buy-and-hold
+      // CAGR/drawdown/volatility math as the Backtest engine — instead of the model having to
+      // search for or guess at how a holding has actually behaved.
       const priceResults = await Promise.all(
         holdings.map(async (h) => {
           try {
-            const r = await fetch(`/api/history?ticker=${encodeURIComponent(h.ticker)}&range=5d&interval=1d`);
+            const r = await fetch(apiUrl(`/api/history?ticker=${encodeURIComponent(h.ticker)}&range=1y&interval=1d`));
             const d = await r.json();
             const prices = d.prices;
             if (prices && prices.length) {
               const latest = prices[prices.length - 1];
-              return { ticker: h.ticker, price: latest.close, currency: d.currency, name: d.name };
+              const stats = prices.length >= 30 ? calcStats(runBuyAndHold(prices, 10000)) : null;
+              return { ticker: h.ticker, price: latest.close, currency: d.currency, name: d.name, stats };
             }
           } catch (_) {}
           return { ticker: h.ticker, price: null };
         })
       );
-
       const priceMap = {};
       for (const p of priceResults) priceMap[p.ticker] = p;
-
       const holdingsWithPrices = holdings.map((h) => {
         const p = priceMap[h.ticker];
         const cur = h.currency && h.currency !== "USD" ? h.currency : "USD";
         const costLabel = `${h.cost}${cur !== "USD" ? ` ${cur}` : ""}`;
         if (p?.price != null) {
-          return `${h.ticker} (${p.name || h.ticker}): ${h.shares} shares @ ${costLabel} avg cost · current price ${p.currency || "USD"} ${p.price.toFixed(2)}`;
+          const statsLabel = p.stats ? ` · trailing 1y (Atlas backtest engine, real computed): CAGR ${p.stats.cagr}%, max drawdown ${p.stats.maxDrawdown}%, volatility ${p.stats.volatility}%` : "";
+          return `${h.ticker} (${p.name || h.ticker}): ${h.shares} shares @ ${costLabel} avg cost · current price ${p.currency || "USD"} ${p.price.toFixed(2)}${statsLabel}`;
         }
         return `${h.ticker}: ${h.shares} shares @ ${costLabel} avg cost · current price unavailable`;
       }).join("\n");
 
-      const sys = `You are a portfolio analyst giving brutally honest, hands-on advice. Current prices are already provided below — do NOT search for prices, they are live and accurate. Return ONE JSON object only.
+      const sys = `You are a portfolio analyst giving brutally honest, hands-on advice — your own independent call on each position, not a summary of what other analysts or the market mood currently think. Base every action and score strictly on the hard facts: this investor's cost basis, the live price, each holding's own real computed trailing performance (CAGR/drawdown/volatility, from Atlas's backtest engine — provided below), the underlying business's real fundamentals/trajectory, and factual recent news — never on analyst ratings or crowd sentiment. Current prices and performance stats are already provided below — do NOT search for prices, they are live and accurate. Return ONE JSON object only.
 
 INVESTOR PROFILE:
 ${profileText(profile)}
@@ -1554,19 +2123,22 @@ ${profileText(profile)}
 CURRENT HOLDINGS with live prices:
 ${holdingsWithPrices}
 
-SPARE CASH AVAILABLE TO DEPLOY: ${spareCash ? `$${spareCash}` : "not specified"}
+SPARE CASH AVAILABLE TO DEPLOY: ${spareCash && parseNum(spareCash) > 0 ? `${spareCashCurrency} ${spareCash}` : "not specified"}
 
-For EACH holding decide ONE action: "Buy more","Add","Hold","Trim","Sell". Use the exact currentPrice provided. Give scoreForYou 0–100 and one-sentence rationale referencing their cost basis and profile.
+For EACH holding decide ONE action: "Buy More","Hold","Trim","Sell" — exactly these four, nothing else (no "Add", no synonyms; "Buy More" already means increase this position). Use the exact currentPrice provided. Give scoreForYou 0–100 and one-sentence rationale referencing their cost basis and profile.
 
 For the portfolio summary, if spare cash is specified give SPECIFIC deployment advice. Be concrete, not vague.
 
 Schema:
 {"asOf":"","holdings":[{"ticker":"","company":"","currentPrice":"","action":"","rationale":"","scoreForYou":0}],"portfolio":{"summary":"","concentration":"","cashAdvice":"","suggestions":[""]}}`;
 
-      const parsed = await callClaude(sys, "Review my portfolio.", { maxTokens: 2500, maxSearches: 2 });
+      // Scale the budget to the actual portfolio size — a fixed 2500 was plenty for a handful of
+      // holdings but silently truncated once someone had a dozen-plus positions, each needing its own
+      // ticker/action/rationale/score line plus the portfolio-level summary. Same prompt, same search
+      // depth — just enough room to finish writing the answer instead of getting cut off mid-JSON.
+      const reviewMaxTokens = Math.max(3200, holdings.length * 280 + 1200);
+      const parsed = await callClaude(sys, "Review my portfolio.", { maxTokens: reviewMaxTokens, maxSearches: 2 });
       if (!parsed.holdings) throw new Error("Couldn't analyze the portfolio. Try again.");
-
-      // Override Claude's currentPrice with the real fetched price (belt-and-suspenders)
       const enriched = { ...parsed, holdings: parsed.holdings.map((h) => {
         const p = priceMap[(h.ticker || "").toUpperCase()];
         if (p?.price != null) return { ...h, currentPrice: String(p.price.toFixed(2)) };
@@ -1578,445 +2150,779 @@ Schema:
   }
   const reviewFor = (t) => (review?.holdings || []).find((x) => (x.ticker || "").toUpperCase() === t.toUpperCase());
 
-  function handleImportFile(e) {
+  async function handleImportFile(e) {
     const file = e.target.files?.[0];
     if (importRef.current) importRef.current.value = "";
     if (!file) return;
-    const reader = new FileReader();
-    reader.onload = (evt) => {
-      try {
-        const wb = XLSX.read(evt.target.result, { type: "array" });
-        const ws = wb.Sheets[wb.SheetNames[0]];
-        const rows = XLSX.utils.sheet_to_json(ws, { defval: "" });
-        if (!rows.length) { alert("No data found in the file."); return; }
-        const norm = (s) => String(s).toLowerCase().replace(/[^a-z]/g, "");
-        const TICKER_KEYS   = ["ticker","symbol","stock","asset","security","name","company"];
-        const SHARES_KEYS   = ["shares","quantity","qty","units","amount","position","numshares","numberofshares"];
-        const COST_KEYS     = ["avgcost","averagecost","costbasis","avgprice","averageprice","purchaseprice","buyprice","cost","price","entryprice"];
-        const CURRENCY_KEYS = ["currency","cur","ccy","curr"];
-        const headers = Object.keys(rows[0]);
-        const find = (keys) => headers.find(h => keys.includes(norm(h))) ?? null;
-        const tickerCol   = find(TICKER_KEYS);
-        const sharesCol   = find(SHARES_KEYS);
-        const costCol     = find(COST_KEYS);
-        const currencyCol = find(CURRENCY_KEYS);
-        const VALID_CURRENCIES = ["USD","EUR","GBP","CAD","AUD","CHF","JPY","HKD","SGD"];
-        const parsed = rows.map((row) => {
-          const ticker   = tickerCol   ? String(row[tickerCol]).trim().toUpperCase()  : "";
-          const shares   = sharesCol   ? parseFloat(row[sharesCol])  : NaN;
-          const cost     = costCol     ? parseFloat(row[costCol])    : NaN;
-          const rawCur   = currencyCol ? String(row[currencyCol]).trim().toUpperCase() : "USD";
-          const currency = VALID_CURRENCIES.includes(rawCur) ? rawCur : "USD";
-          const valid    = ticker.length > 0 && !isNaN(shares) && shares > 0 && !isNaN(cost) && cost > 0;
-          return { ticker, shares: isNaN(shares) ? "" : String(shares), cost: isNaN(cost) ? "" : String(cost), currency, valid };
-        }).filter(r => r.ticker || r.shares || r.cost);
-        setImportPreview({ rows: parsed, tickerCol, sharesCol, costCol });
-      } catch { alert("Could not read that file. Make sure it's a valid .xlsx, .xls or .csv file."); }
-    };
-    reader.readAsArrayBuffer(file);
+    setImportAnalyzing(true); setImportError(null);
+    try {
+      // xlsx is deliberately not in the entry bundle — it only downloads the first time a
+      // spreadsheet is actually imported.
+      const XLSX = await import("xlsx");
+      const buf = await file.arrayBuffer();
+      const wb = XLSX.read(buf, { type: "array" });
+      const ws = wb.Sheets[wb.SheetNames[0]];
+      const rawRows = XLSX.utils.sheet_to_json(ws, { defval: "" });
+      if (!rawRows.length) { setImportError("No rows were found in that file — is the first sheet empty?"); return; }
+      const headers = Object.keys(rawRows[0]);
+      const det = detectImportMapping(headers, rawRows);
+      // A currency symbol/code embedded in the cost header itself (e.g. "Avg Cost (€)") tells us the unit
+      // of the numbers we're about to read — trust it over a USD default even when there's no Currency column.
+      const headerCurrency = detectHeaderCurrency([det.costColumn, det.totalCostColumn].filter(Boolean));
+      let mapping = { tickerColumn: det.tickerColumn, nameColumn: det.nameColumn, sharesColumn: det.sharesColumn, costColumn: det.costColumn, totalCostColumn: det.totalCostColumn, currencyColumn: det.currencyColumn, exchangeColumn: det.exchangeColumn, typeColumn: det.typeColumn, valueColumn: det.valueColumn, sheetCurrency: headerCurrency };
+      let nameMap = {};
+      // Rows like "CASH" / "Free cash (GBP)" aren't a security — pull them out into a cash total up front
+      // so they don't get lost as an "unresolved" row; the user can add it straight to Spare Cash below.
+      // Kept in its own native currency (no forced conversion) — Spare Cash is displayed converted to
+      // match Portfolio Value's currency, exactly like a holding, so nothing gets silently rebased.
+      const cashDetected = detectCashAmount(rawRows, mapping);
+
+      // A ticker that LOOKS well-formatted isn't necessarily the RIGHT one — bare "TSCO" is a real ticker,
+      // just for "Tractor Supply Co." (US/NASDAQ), not "Tesco PLC" (UK/LSE, real symbol "TSCO.L"). Format
+      // validity can't catch that; only currency/exchange context (or the model) can. So: any time this
+      // sheet shows evidence of a non-USD holding anywhere — a currency column value, a header symbol like
+      // "(€)", or a non-US exchange name — every ticker gets verified by the model, not just obviously
+      // broken ones. Only a sheet that's unambiguously all-USD skips the AI call.
+      let hasNonUSDSignal = !!(headerCurrency && headerCurrency !== "USD");
+      if (!hasNonUSDSignal && det.currencyColumn) {
+        hasNonUSDSignal = rawRows.some(r => { const cur = normalizeCurrencyCode(r[det.currencyColumn]); return cur && cur !== "USD"; });
+      }
+      if (!hasNonUSDSignal && det.exchangeColumn) {
+        hasNonUSDSignal = rawRows.some(r => { const info = resolveExchangeInfo(r[det.exchangeColumn]); return info && info.currency !== "USD"; });
+      }
+      const needsAI = !det.confident || hasNonUSDSignal;
+
+      if (needsAI) {
+        try {
+          const sample = rawRows.slice(0, 8);
+          // Always use the real ticker/name column as the identifier source when one exists — even if it
+          // "looks valid" — so the model can re-verify it against currency/exchange/ISIN context instead of
+          // only being asked to resolve company names.
+          const identifierCol = det.tickerColumn;
+          const isinCol = det.isinColumn;
+          const curCol = det.currencyColumn;
+          const exchCol = det.exchangeColumn;
+          const seen = new Set();
+          const uniqueIdentifiers = [];
+          if (identifierCol) {
+            for (const r of rawRows) {
+              const val = String(r[identifierCol] ?? "").trim();
+              if (!val || seen.has(val)) continue;
+              seen.add(val);
+              const entry = { value: val };
+              if (isinCol) { const isin = String(r[isinCol] ?? "").trim(); if (isin) entry.isin = isin; }
+              if (curCol) { const cur = normalizeCurrencyCode(r[curCol]); if (cur) entry.currency = cur; }
+              if (exchCol) { const exch = String(r[exchCol] ?? "").trim(); if (exch) entry.exchange = exch; }
+              uniqueIdentifiers.push(entry);
+              if (uniqueIdentifiers.length >= 80) break;
+            }
+          }
+          const userMsg = `HEADERS:\n${JSON.stringify(headers)}\n\nSAMPLE ROWS:\n${JSON.stringify(sample)}${uniqueIdentifiers.length ? `\n\nRESOLVE/VERIFY THE REAL TICKER FOR EACH OF THESE IDENTIFIERS (from column "${identifierCol}"):\n${JSON.stringify(uniqueIdentifiers)}` : ""}`;
+          const ai = await callClaude(IMPORT_MAPPING_SYSTEM_PROMPT, userMsg, { maxTokens: 4400, maxSearches: 3 });
+          // Spread the deterministic mapping first — the AI response only refines the columns it
+          // was asked about. Rebuilding from scratch here used to drop nameColumn/typeColumn/
+          // valueColumn, which silently broke cash-row detection in the preview.
+          mapping = {
+            ...mapping,
+            tickerColumn: ai.tickerColumn || mapping.tickerColumn,
+            sharesColumn: ai.sharesColumn || mapping.sharesColumn,
+            costColumn: ai.costColumn || mapping.costColumn,
+            totalCostColumn: ai.totalCostColumn || mapping.totalCostColumn,
+            currencyColumn: ai.currencyColumn || mapping.currencyColumn,
+            exchangeColumn: ai.exchangeColumn || mapping.exchangeColumn,
+          };
+          if (Array.isArray(ai.nameMappings)) {
+            for (const m of ai.nameMappings) if (m?.input) nameMap[m.input] = { ticker: m.ticker || null, currency: m.currency || null };
+          }
+        } catch (_) {
+          // AI verification failed — fall back to whatever was deterministically found; the user can remap by hand below.
+        }
+      }
+
+      const rows = computeImportRows(headers, rawRows, mapping, nameMap);
+      setImportPreview({ headers, rawRows, mapping, nameMap, rows, aiAssisted: needsAI, cashDetected, includeCash: true });
+    } catch (err) {
+      setImportError("Could not read that file. Make sure it's a valid .xlsx, .xls or .csv file.");
+    } finally {
+      setImportAnalyzing(false);
+    }
   }
 
+  // Lets the user override a detected column by hand — recomputes instantly, no extra AI call.
+  function remapImport(field, value) {
+    setImportPreview(prev => {
+      if (!prev) return prev;
+      const mapping = { ...prev.mapping, [field]: value || null };
+      const rows = computeImportRows(prev.headers, prev.rawRows, mapping, prev.nameMap);
+      return { ...prev, mapping, rows };
+    });
+  }
   function confirmImport() {
     const valid = importPreview.rows.filter(r => r.valid);
     persistHoldings([...holdings, ...valid.map(r => ({ ticker: r.ticker, shares: r.shares, cost: r.cost, currency: r.currency }))]);
+    // Set (not add to) Spare Cash — the imported figure is the investor's CURRENT total uninvested cash,
+    // not a top-up on whatever placeholder value happened to be sitting in the field already. Stored in
+    // its OWN native currency (exactly what the preview showed, no forced conversion) — display always
+    // converts it to match Portfolio Value's currency, so the two can never show mismatched currencies.
+    if (importPreview.cashDetected && importPreview.includeCash) {
+      updateSpareCash(String(importPreview.cashDetected.amount), importPreview.cashDetected.currency);
+    }
     setImportPreview(null);
   }
-
   function addHolding() {
-    const t = nt.trim().toUpperCase(); const s = parseNum(ns); const c = parseNum(nc);
-    if (!t || s == null || c == null) return;
-    persistHoldings([...holdings, { ticker: t, shares: String(s), cost: String(c), currency: ncur }]);
+    const t = nt.trim().toUpperCase(); const s = parseNum(ns); const cst = parseNum(nc);
+    if (!t || s == null || cst == null) return;
+    persistHoldings([...holdings, { ticker: t, shares: String(s), cost: String(cst), currency: ncur }]);
     setNt(""); setNs(""); setNc(""); setNcur("USD"); setReview(null);
   }
   function removeHolding(idx) { persistHoldings(holdings.filter((_, i) => i !== idx)); setReview(null); }
+  function clearAllHoldings() { persistHoldings([]); setReview(null); setConfirmClearOpen(false); }
 
-  const totals = (() => {
-    let cost = 0, value = 0, haveVal = false;
-    for (const h of holdings) {
-      const sh = parseNum(h.shares), cb = parseNum(h.cost); if (sh == null || cb == null) continue;
-      const cbUSD = toUSD(cb, h.currency);
-      cost += sh * cbUSD;
-      const rv = reviewFor(h.ticker); const cur = rv ? parseNum(rv.currentPrice) : null;
-      if (cur != null) { value += sh * cur; haveVal = true; } else value += sh * cbUSD;
-    }
-    return { cost, value, haveVal, pl: haveVal ? value - cost : null, plPct: haveVal && cost ? ((value - cost) / cost) * 100 : null };
-  })();
+  // Signing out wipes this device's copy — the durable copy lives in Firestore, so the same
+  // account restores on next sign-in, and a different account never sees the previous user's
+  // portfolio on a shared device.
+  function handleSignOut() {
+    signOut(auth).then(() => {
+      syncedUid.current = null;
+      setFirebaseUser(null);
+      setProfile(null); setHoldings([]); setSpareCash(""); setSpareCashCurrency("USD");
+      setResearchHistory([]); setRecs(null); setReview(null); setResult(null); setError(null); setQuery("");
+      setNewsItems(null); setNewsInsiderActivity(null); setMarketNews(null); setLivePrices({});
+      setPhase("onboarding"); setNav("home");
+      ["atlas_profile", "atlas_holdings", "atlas_spare_cash", "atlas_spare_cash_currency", "atlas_research_history"].forEach(kvDel);
+    }).catch(() => {});
+  }
 
-  const styles = (
-    <style>{`
-      @import url('https://fonts.googleapis.com/css2?family=Inter:wght@400;500;600;700;800&family=IBM+Plex+Mono:wght@400;500;600&display=swap');
-      * { box-sizing: border-box; }
-      .vd-eval { transition: all .15s ease; }
-      .vd-eval:hover { filter: brightness(1.12); box-shadow: 0 0 16px ${P.accent}55; }
-      .home-card { transition: border-color .18s, transform .18s, box-shadow .18s; }
-      .home-card:hover { border-color: ${P.accent}55 !important; transform: translateY(-2px); box-shadow: 0 8px 32px #000a; }
-      .vd-opt:hover { border-color: ${P.accent} !important; }
-      .vd-input:focus { outline: none; border-color: ${P.accent} !important; box-shadow: 0 0 0 2px ${P.accent}22; }
-      .vd-reveal { animation: vdUp .35s cubic-bezier(.2,.7,.2,1) both; }
-      @keyframes vdUp { from { opacity:0; transform: translateY(8px);} to {opacity:1; transform:none;} }
+  // ---- firebase gates ----
+  if (firebaseUser === undefined) return (
+    <AtlasMotionProvider><AtlasStyles /><div style={{ background: c.canvas, minHeight: "100vh", display: "flex", alignItems: "center", justifyContent: "center", gap: 12 }}><Spinner size={20} /><span style={{ ...type.overline, color: c.text3 }}>Loading</span></div></AtlasMotionProvider>
+  );
+  const firebaseConfigured = !!import.meta.env.VITE_FIREBASE_API_KEY;
+  if (firebaseConfigured && !firebaseUser) return <AtlasMotionProvider><AtlasStyles /><AuthScreen onAuth={(u) => setFirebaseUser(u)} /></AtlasMotionProvider>;
 
-      @media (prefers-reduced-motion: reduce){ .vd-reveal{animation:none;} }
-      *::-webkit-scrollbar { width: 4px; height: 4px; }
-      *::-webkit-scrollbar-track { background: ${P.paper}; }
-      *::-webkit-scrollbar-thumb { background: ${P.dim}; border-radius: 2px; }
-      .vd-tag { font-family: ${F.mono}; font-size: 10px; font-weight:500; color: ${P.accent}; background: ${P.accentDim}; border: 1px solid ${P.accentBorder}; border-radius: 3px; padding: 2px 8px; letter-spacing: 0.3px; text-transform: uppercase; }
-      .vd-metric { font-family: ${F.mono}; font-size: 11px; color: ${P.faint}; }
-      .vd-metric b { color: ${P.ink}; font-weight: 600; }
-      .vd-row:hover { background: ${P.rowHover} !important; }
-      ::selection { background: ${P.accent}33; }
-      .vd-pill-buy { background: ${P.accent}18; border: 1px solid ${P.accent}55; color: ${P.accent}; }
-      .vd-pill-sell { background: ${P.red}18; border: 1px solid ${P.red}55; color: ${P.red}; }
-      .vd-pill-hold { background: ${P.dim}; border: 1px solid #2a4a2a; color: ${P.faint}; }
-      .vd-pill-trim { background: ${P.amber}18; border: 1px solid ${P.amber}55; color: ${P.amber}; }
-    `}</style>
+  if (phase === "onboarding") return (
+    <AtlasMotionProvider><AtlasStyles /><Onboarding initial={profile} onDone={finishOnboarding} onExit={profile?.name ? () => setPhase("app") : null} /></AtlasMotionProvider>
   );
 
-  // Firebase loading
-  if (firebaseUser === undefined) return <div style={{ background: P.paper, minHeight: "100vh", display: "flex", alignItems: "center", justifyContent: "center" }}><span style={{ fontFamily: F.mono, fontSize: 11, letterSpacing: 2, color: P.faint }}>LOADING…</span></div>;
+  // ---- portfolio derived figures ----
+  // Each position is valued in its OWN recorded currency first (no mixing live-quote currency with
+  // cost currency). The portfolio's display currency is that same currency when every holding shares
+  // one — totals stay untouched, zero FX risk — and only becomes USD when holdings are genuinely mixed,
+  // per the user's "keep it in whatever currency the holdings are in" preference.
+  const expPalette = [c.accent, c.seriesAlt, c.positive, c.warning, "#C77DFF", "#5BA8FF", "#FF8A5C", "#3DDC84"];
+  let lHaveVal = false;
+  const positions = [];
+  for (const h of holdings) {
+    const sh = parseNum(h.shares), cb = parseNum(h.cost); if (sh == null || cb == null) continue;
+    const curr = normalizeCurrencyCode(h.currency || "USD");
+    const lp = livePrices[h.ticker];
+    let priceNative = null;
+    if (lp?.price != null) { priceNative = fxConvert(lp.price, lp.currency || curr, curr, fxRates); if (priceNative != null) lHaveVal = true; }
+    else { const rv = reviewFor(h.ticker); const curRev = rv ? parseNum(rv.currentPrice) : null; if (curRev != null) { priceNative = curRev; lHaveVal = true; } }
+    positions.push({ ticker: h.ticker, currency: curr, costNative: sh * cb, valueNative: (priceNative != null ? priceNative : cb) * sh });
+  }
+  const distinctCurrencies = [...new Set(positions.map(p => p.currency))];
+  const portfolioCurrency = distinctCurrencies.length === 1 ? distinctCurrencies[0] : "USD";
+  let lCost = 0, lValue = 0, fxIncomplete = false;
+  const exposure = [];
+  for (const p of positions) {
+    const costConv = fxConvert(p.costNative, p.currency, portfolioCurrency, fxRates);
+    const valConv = fxConvert(p.valueNative, p.currency, portfolioCurrency, fxRates);
+    if (costConv == null || valConv == null) { fxIncomplete = true; continue; }
+    lCost += costConv; lValue += valConv;
+    exposure.push({ ticker: p.ticker, val: valConv });
+  }
+  const lPl = lHaveVal ? lValue - lCost : null;
+  const lPlPct = lHaveVal && lCost ? ((lValue - lCost) / lCost) * 100 : null;
+  const isUp = lPlPct != null && lPlPct >= 0;
+  const totalExp = exposure.reduce((a, b) => a + b.val, 0) || 1;
+  const expSegments = exposure.map((e, i) => ({ ...e, pct: (e.val / totalExp) * 100, color: expPalette[i % expPalette.length] })).sort((a, b) => b.pct - a.pct);
 
-  // Not signed in — show auth screen (skip if Firebase not configured)
-  const firebaseConfigured = !!import.meta.env.VITE_FIREBASE_API_KEY;
-  if (firebaseConfigured && !firebaseUser) return <AuthScreen onAuth={(u) => setFirebaseUser(u)} />;
+  // Spare Cash always DISPLAYS converted into whatever currency Portfolio Value is currently showing —
+  // exactly like a holding's own currency gets converted for the aggregate — so the two can never disagree.
+  const spareCashNum = parseNum(spareCash);
+  const spareCashDisplay = spareCashNum != null && spareCashNum > 0 ? fxConvert(spareCashNum, spareCashCurrency, portfolioCurrency, fxRates) : null;
 
-  if (phase === "onboarding") return <div style={{ background: P.paper, minHeight: "100%", paddingBottom: 56 }}>{styles}<Onboarding initial={profile} onDone={finishOnboarding} onExit={profile?.name ? () => setPhase("app") : null} /></div>;
+  const sectionTitle = { home: "Today", discover: "Discover", portfolio: "Portfolio", research: "Research", backtest: "Backtest" }[nav] || "Atlas";
 
-  return (
-    <div style={{ display: "flex", background: P.paper, minHeight: "100vh" }}>
-      {styles}
-      <Sidebar nav={nav} setNav={setNav} profile={profile} onEdit={() => setShowProfileEditor(true)} holdingsCount={holdings.length} onSignOut={firebaseConfigured ? () => signOut(auth).then(() => setFirebaseUser(null)) : null} />
-      {showProfileEditor && <ProfileEditor profile={profile} onSave={saveProfile} onClose={() => setShowProfileEditor(false)} />}
+  // ============================================================
+  //  SCREENS
+  // ============================================================
+  const HomeScreen = nav !== "home" ? null : renderSafely("Home", () => (
+    <motion.div initial="initial" animate="animate" variants={{ animate: { transition: { staggerChildren: 0.05 } } }} style={{ maxWidth: 980, margin: "0 auto", display: "flex", flexDirection: "column", gap: 16 }}>
+      <motion.div variants={{ initial: { opacity: 0, y: 10 }, animate: { opacity: 1, y: 0 } }}>
+        <Overline color={c.accent} style={{ marginBottom: 8 }}>Good to see you, {profile?.name || "Investor"}</Overline>
+        <h1 style={{ ...type.displayL, color: c.text, margin: 0 }}>Your market, at a glance.</h1>
+      </motion.div>
 
-      <HelpChat />
-      <div style={{ marginLeft: 240, flex: 1, padding: "32px 36px 60px", maxWidth: "calc(100vw - 240px)", boxSizing: "border-box" }}>
-        {/* ===================== HOME ===================== */}
-        {nav === "home" && <HomeScreen profile={profile} setNav={setNav} />}
-
-        {/* ===================== DISCOVER ===================== */}
-        {nav === "discover" && (
-          <>
-            <section style={{ background: P.card, border: `1px solid ${P.cardBorder}`, borderRadius: 8, padding: "18px 20px" }}>
-              <div style={{ display: "flex", justifyContent: "space-between", alignItems: "center", flexWrap: "wrap", gap: 12 }}>
-                <div>
-                  <h2 style={{ fontFamily: F.sans, fontWeight: 700, fontSize: 18, color: P.ink, margin: "0 0 2px" }}>Best buys for you</h2>
-                  <span style={{ fontFamily: F.sans, fontSize: 13, color: P.faint }}>Ranked by fit to your profile · global markets{holdings.length ? ` · ${holdings.length} positions loaded` : ""}</span>
-                </div>
-                <button className="vd-eval" onClick={discover} disabled={recsLoading} style={{ fontFamily: F.sans, fontWeight: 600, fontSize: 13, color: "#000", background: P.accent, border: "none", borderRadius: 6, padding: "9px 20px", cursor: recsLoading ? "default" : "pointer", opacity: recsLoading ? 0.6 : 1, whiteSpace: "nowrap" }}>
-                  {recsLoading ? "Scanning…" : "↺ Refresh picks"}
-                </button>
+      {/* portfolio strip */}
+      <motion.div variants={{ initial: { opacity: 0, y: 10 }, animate: { opacity: 1, y: 0 } }}>
+        <Card interactive onClick={() => setNav("portfolio")} pad={22}>
+          <div style={{ display: "flex", alignItems: "flex-start", justifyContent: "space-between", gap: 16, flexWrap: "wrap" }}>
+            <div>
+              <InfoTip title="Live pricing" body="Valued using real-time market prices and current exchange rates — not whatever prices were saved in a spreadsheet at import time. Totals will move as markets move, and won't match a static export.">
+                <Overline color={c.text3} style={{ marginBottom: 8 }}>Portfolio value{distinctCurrencies.length > 1 ? ` (in ${portfolioCurrency})` : ""}</Overline>
+              </InfoTip>
+              <div style={{ display: "flex", alignItems: "baseline", gap: 12, flexWrap: "wrap" }}>
+                <span style={{ ...type.displayXl, fontSize: 40, color: c.text }}>{holdings.length ? <AnimatedNumber value={lHaveVal ? lValue : lCost} format={(v) => fmtCurrency(v, portfolioCurrency)} /> : "—"}</span>
+                {lPl != null && <span style={{ ...type.data, fontSize: 16, color: isUp ? c.positive : c.negative }}>{isUp ? "+" : ""}{fmtCurrency(lPl, portfolioCurrency)} ({isUp ? "+" : ""}{lPlPct.toFixed(2)}%)</span>}
+                {holdings.length > 0 && <LiveIndicator loading={livePricesLoading} lastUpdate={lastPriceUpdate} />}
               </div>
-              <div style={{ display: "flex", gap: 6, flexWrap: "wrap", marginTop: 14 }}>
-                {["Global all-markets", "US markets", "Europe", "Asia-Pacific", "My interest sectors"].map((u) => {
-                  const on = universe === u;
-                  return <button key={u} onClick={() => setUniverse(u)} className="vd-opt" style={{ cursor: "pointer", padding: "5px 14px", borderRadius: 20, border: `1px solid ${on ? P.accent : P.dim}`, background: on ? P.accentDim : "transparent", fontFamily: F.sans, fontWeight: 500, fontSize: 12.5, color: on ? P.accent : P.slate, transition: "all .15s" }}>{u}</button>;
-                })}
+              <div style={{ display: "flex", gap: 24, marginTop: 12, flexWrap: "wrap" }}>
+                <div><div style={{ ...type.caption, color: c.text3 }}>Invested</div><div style={{ ...type.data, color: c.text2 }}>{fmtCurrency(lCost, portfolioCurrency)}</div></div>
+                <div><div style={{ ...type.caption, color: c.text3 }}>Positions</div><div style={{ ...type.data, color: c.text2 }}>{holdings.length}</div></div>
+                {spareCashDisplay != null && <div><div style={{ ...type.caption, color: c.text3 }}>Cash available</div><div style={{ ...type.data, color: c.accent }}>{fmtCurrency(spareCashDisplay, portfolioCurrency)}</div></div>}
               </div>
-            </section>
-            {recsLoading && <Spinner title="Finding your best picks…" sub="verifying current data · usually 15–20s" />}
-            {recsError && !recsLoading && <ErrorBox msg={recsError} onRetry={discover} label="Scan again" />}
-            {recs?.picks && !recsLoading && (
-              <div className="vd-reveal" style={{ marginTop: 14 }}>
-                {/* Market context banner */}
-                {recs.marketContext && (
-                  <div style={{ display: "flex", gap: 10, alignItems: "flex-start", padding: "11px 16px", marginBottom: 10, background: P.card, border: `1px solid ${P.cardBorder}`, borderLeft: `3px solid ${P.amber}`, borderRadius: 6 }}>
-                    <span style={{ fontFamily: F.mono, fontSize: 11, color: P.amber, flexShrink: 0 }}>◈</span>
-                    <span style={{ fontFamily: F.sans, fontSize: 13, color: P.slate, lineHeight: 1.5 }}><b style={{ color: P.ink }}>Market context:</b> {recs.marketContext}</span>
-                  </div>
-                )}
-                <div style={{ background: P.card, border: `1px solid ${P.cardBorder}`, borderRadius: 8, overflow: "hidden" }}>
-                  {/* Header */}
-                  <div style={{ display: "grid", gridTemplateColumns: "24px 36px 1fr 60px", gap: 14, padding: "9px 20px", background: P.wash, borderBottom: `1px solid ${P.cardBorder}` }}>
-                    <span style={{ fontFamily: F.sans, fontSize: 10, fontWeight: 600, color: P.faint, textTransform: "uppercase", letterSpacing: 0.5 }}>#</span>
-                    <span />
-                    <span style={{ fontFamily: F.sans, fontSize: 10, fontWeight: 600, color: P.faint, textTransform: "uppercase", letterSpacing: 0.5 }}>Company · Why now · Risk</span>
-                    <span style={{ fontFamily: F.sans, fontSize: 10, fontWeight: 600, color: P.faint, textTransform: "uppercase", letterSpacing: 0.5, textAlign: "center" }}>Score</span>
-                  </div>
-                  {recs.picks.map((p, i) => <RecCard key={p.ticker || i} pick={p} rank={i + 1} onOpen={() => openTicker(p.ticker)} />)}
-                  {recs.asOf && <div style={{ padding: "9px 20px", borderTop: `1px solid ${P.cardBorder}`, fontFamily: F.sans, fontSize: 11, color: P.faint }}>Updated {recs.asOf}</div>}
-                </div>
+              {fxIncomplete && <div style={{ ...type.caption, color: c.warning, marginTop: 8 }}>Some positions excluded from the total — exchange rates still loading.</div>}
+            </div>
+            <span style={{ ...type.caption, color: c.accent }}>Open portfolio →</span>
+          </div>
+          {expSegments.length > 0 && <div style={{ marginTop: 18 }}><ExposureBar segments={expSegments} /></div>}
+        </Card>
+      </motion.div>
+
+      {/* market pulse / today's news — kept deliberately compact, this is a glance screen */}
+      <motion.div variants={{ initial: { opacity: 0, y: 10 }, animate: { opacity: 1, y: 0 } }}>
+        <div style={{ display: "flex", alignItems: "center", justifyContent: "space-between", marginBottom: 10 }}>
+          <Overline color={c.text3}>Today's market</Overline>
+          <Button variant="ghost" size="sm" onClick={fetchMarketNews} loading={marketNewsLoading}>{marketNews ? "Refresh" : "Load"}</Button>
+        </div>
+        {marketNewsLoading && <Card pad={14}><LoadingBlock title="Scanning today's market-moving news…" sub="Live search · usually 20–40s" /></Card>}
+        {marketNewsError && !marketNewsLoading && <ErrorBanner msg={marketNewsError} onRetry={fetchMarketNews} label="Try again" />}
+        {marketNews && !marketNewsLoading && (
+          <Card pad={14}>
+            {marketNews.marketPulse && (
+              <div style={{ ...type.caption, color: c.text2, lineHeight: 1.5, paddingBottom: 10, marginBottom: 10, borderBottom: `1px solid ${c.hairline}`, display: "-webkit-box", WebkitLineClamp: 2, WebkitBoxOrient: "vertical", overflow: "hidden" }}>
+                <b style={{ color: c.text }}>Pulse: </b>{marketNews.marketPulse}
               </div>
             )}
-            {!recs && !recsLoading && !recsError && <div style={{ textAlign: "center", padding: "30px 20px 0", fontFamily: F.sans, fontSize: 14, color: P.faint, lineHeight: 1.6 }}>Atlas is scanning global markets for stocks that fit how you invest…</div>}
-          </>
-        )}
-
-        {/* ===================== PORTFOLIO ===================== */}
-        {nav === "portfolio" && (() => {
-          // Compute totals using live prices where available
-          let lCost = 0, lValue = 0, lHaveVal = false;
-          for (const h of holdings) {
-            const sh = parseNum(h.shares), cb = parseNum(h.cost); if (sh == null || cb == null) continue;
-            const cbUSD = toUSD(cb, h.currency);
-            lCost += sh * cbUSD;
-            const lp = livePrices[h.ticker];
-            if (lp?.price != null) { lValue += sh * lp.price; lHaveVal = true; }
-            else { const rv = reviewFor(h.ticker); const cur = rv ? parseNum(rv.currentPrice) : null;
-              if (cur != null) { lValue += sh * cur; lHaveVal = true; } else lValue += sh * cbUSD; }
-          }
-          const lPl = lHaveVal ? lValue - lCost : null;
-          const lPlPct = lHaveVal && lCost ? ((lValue - lCost) / lCost) * 100 : null;
-          const isUp = lPlPct != null && lPlPct >= 0;
-
-          return (
-          <>
-            {/* ── Sub-tab switcher ── */}
-            <div style={{ display: "flex", gap: 4, marginBottom: 14 }}>
-              {[["holdings", "Holdings"], ["news", "Portfolio News"]].map(([id, label]) => (
-                <button key={id} onClick={() => { setPortfolioTab(id); if (id === "news" && !newsItems && !newsLoading) fetchPortfolioNews(); }}
-                  style={{ fontFamily: F.sans, fontSize: 13, fontWeight: 600, padding: "7px 18px", borderRadius: 7, border: "none", cursor: "pointer", background: portfolioTab === id ? P.accent : P.card, color: portfolioTab === id ? "#000" : P.faint, transition: "all .15s" }}>
-                  {label}
-                </button>
-              ))}
-            </div>
-
-            {/* ── Top summary bar ── */}
-            <div style={{ background: P.card, border: `1px solid ${P.cardBorder}`, borderRadius: 10, padding: "22px 28px", marginBottom: 14 }}>
-              <div style={{ display: "flex", alignItems: "flex-start", justifyContent: "space-between", gap: 20, flexWrap: "wrap" }}>
-                <div>
-                  <div style={{ fontFamily: F.mono, fontSize: 10, letterSpacing: 1.5, color: P.faint, textTransform: "uppercase", marginBottom: 6 }}>Portfolio Value</div>
-                  <div style={{ display: "flex", alignItems: "baseline", gap: 14, flexWrap: "wrap" }}>
-                    <span style={{ fontFamily: F.mono, fontSize: 30, fontWeight: 700, color: P.ink, letterSpacing: -1 }}>
-                      {lHaveVal ? money(lValue) : holdings.length ? money(lCost) : "—"}
-                    </span>
-                    {lPl != null && (
-                      <span style={{ fontFamily: F.mono, fontSize: 15, fontWeight: 600, color: isUp ? P.green : P.red }}>
-                        {isUp ? "+" : ""}{money(lPl)} <span style={{ fontSize: 13, opacity: 0.85 }}>({isUp ? "+" : ""}{lPlPct.toFixed(2)}%)</span>
-                      </span>
+            <div style={{ display: "flex", flexDirection: "column", gap: 2 }}>
+              {(marketNews.items || []).slice(0, 4).map((item, i) => {
+                const hasUrl = item.url && item.url.startsWith("http");
+                return (
+                  <div key={i} style={{ display: "flex", alignItems: "center", gap: 8, padding: "8px 4px", borderBottom: i < 3 ? `1px solid ${c.hairline}` : "none" }}>
+                    {item.category && <Badge tone="accent" style={{ flexShrink: 0, fontSize: 10 }}>{item.category}</Badge>}
+                    <div style={{ minWidth: 0, flex: 1, ...type.small, color: c.text, fontWeight: 600, whiteSpace: "nowrap", overflow: "hidden", textOverflow: "ellipsis" }}>
+                      {hasUrl ? <a href={item.url} target="_blank" rel="noopener noreferrer" className="atlas-link">{item.headline}</a> : item.headline}
+                    </div>
+                    {item.relatedTicker && (
+                      <button onClick={() => openTicker(item.relatedTicker)} style={{ flexShrink: 0, background: "none", border: "none", cursor: "pointer", ...type.caption, color: c.accent, fontWeight: 600 }}>
+                        {item.relatedTicker} →
+                      </button>
                     )}
-                    {livePricesLoading && <span style={{ fontFamily: F.mono, fontSize: 10, color: P.faint, letterSpacing: 1 }}>REFRESHING…</span>}
                   </div>
-                  <div style={{ display: "flex", gap: 28, marginTop: 14, flexWrap: "wrap" }}>
-                    <div><div style={{ fontFamily: F.sans, fontSize: 10, color: P.faint, marginBottom: 2 }}>Invested</div><div style={{ fontFamily: F.mono, fontSize: 13, fontWeight: 600, color: P.slate }}>{money(lCost)}</div></div>
-                    <div><div style={{ fontFamily: F.sans, fontSize: 10, color: P.faint, marginBottom: 2 }}>Positions</div><div style={{ fontFamily: F.mono, fontSize: 13, fontWeight: 600, color: P.slate }}>{holdings.length}</div></div>
-                    {spareCash && parseNum(spareCash) > 0 && <div><div style={{ fontFamily: F.sans, fontSize: 10, color: P.faint, marginBottom: 2 }}>Cash available</div><div style={{ fontFamily: F.mono, fontSize: 13, fontWeight: 600, color: P.accent }}>${Number(parseNum(spareCash)).toLocaleString()}</div></div>}
-                  </div>
-                </div>
-                <div style={{ display: "flex", flexDirection: "column", gap: 8, alignItems: "flex-end" }}>
-                  <button className="vd-eval" onClick={analyzePortfolio} disabled={reviewLoading || !holdings.length} style={{ fontFamily: F.sans, fontWeight: 700, fontSize: 13, color: "#000", background: P.accent, border: "none", borderRadius: 7, padding: "11px 24px", cursor: (reviewLoading || !holdings.length) ? "default" : "pointer", opacity: (reviewLoading || !holdings.length) ? 0.6 : 1, whiteSpace: "nowrap" }}>
-                    {reviewLoading ? "Analysing…" : review ? "↺ Re-analyse" : "Run AI Analysis"}
-                  </button>
-                </div>
-              </div>
+                );
+              })}
             </div>
+          </Card>
+        )}
+        {!marketNews && !marketNewsLoading && !marketNewsError && <Card pad={14}><EmptyState title="Today's market news" hint="Load the latest market-moving news and get Atlas's read on what it means." /></Card>}
+      </motion.div>
 
-            {portfolioTab === "holdings" && <>
-            {/* ── Positions table ── */}
-            <div style={{ background: P.card, border: `1px solid ${P.cardBorder}`, borderRadius: 10, overflow: "hidden", marginBottom: 14 }}>
-              {/* Column headers */}
-              <div style={{ display: "grid", gridTemplateColumns: "44px 1fr 95px 80px 90px 105px 120px 90px 36px", gap: 0, padding: "8px 4px", background: P.wash, borderBottom: `1px solid ${P.cardBorder}` }}>
-                <span />
-                <span style={{ fontFamily: F.sans, fontSize: 10, fontWeight: 600, color: P.faint, textTransform: "uppercase", letterSpacing: 0.5, padding: "0 10px" }}>Asset</span>
-                <span style={{ fontFamily: F.sans, fontSize: 10, fontWeight: 600, color: P.faint, textTransform: "uppercase", letterSpacing: 0.5, textAlign: "right", padding: "0 8px" }}>Price</span>
-                <span style={{ fontFamily: F.sans, fontSize: 10, fontWeight: 600, color: P.faint, textTransform: "uppercase", letterSpacing: 0.5, textAlign: "right", padding: "0 8px" }}>Qty</span>
-                <span style={{ fontFamily: F.sans, fontSize: 10, fontWeight: 600, color: P.faint, textTransform: "uppercase", letterSpacing: 0.5, textAlign: "right", padding: "0 8px" }}>Avg Cost</span>
-                <span style={{ fontFamily: F.sans, fontSize: 10, fontWeight: 600, color: P.faint, textTransform: "uppercase", letterSpacing: 0.5, textAlign: "right", padding: "0 8px" }}>Mkt Value</span>
-                <span style={{ fontFamily: F.sans, fontSize: 10, fontWeight: 600, color: P.faint, textTransform: "uppercase", letterSpacing: 0.5, textAlign: "right", padding: "0 8px" }}>P&L</span>
-                <span style={{ fontFamily: F.sans, fontSize: 10, fontWeight: 600, color: P.faint, textTransform: "uppercase", letterSpacing: 0.5, textAlign: "center", padding: "0 8px" }}>Call</span>
-                <span />
-              </div>
-
-              {holdings.length === 0
-                ? <div style={{ padding: "36px 20px", textAlign: "center", fontFamily: F.mono, fontSize: 11, letterSpacing: 1, color: P.faint }}>NO POSITIONS — ADD ONE BELOW</div>
-                : holdings.map((h, i) => (
-                    <HoldingRow key={`${h.ticker}-${i}`} h={h}
-                      costUSD={toUSD(parseNum(h.cost), h.currency)}
-                      livePrice={livePrices[h.ticker]}
-                      review={reviewFor(h.ticker)}
-                      onOpen={() => openTicker(h.ticker)}
-                      onRemove={() => removeHolding(i)} />
-                  ))}
-            </div>
-
-            {reviewLoading && <Spinner title="Fetching live prices and running AI analysis…" sub="live data · tuned to your profile" />}
-            {reviewError && !reviewLoading && <ErrorBox msg={reviewError} onRetry={analyzePortfolio} label="Try again" />}
-
-            {/* ── AI analysis results ── */}
-            {review?.portfolio && !reviewLoading && (
-              <div className="vd-reveal" style={{ marginBottom: 14, display: "flex", flexDirection: "column", gap: 10 }}>
-                {review.portfolio.cashAdvice && spareCash && parseNum(spareCash) > 0 && (
-                  <div style={{ background: P.card, border: `1px solid ${P.accent}33`, borderLeft: `3px solid ${P.accent}`, borderRadius: 8, padding: "16px 20px" }}>
-                    <div style={{ fontFamily: F.mono, fontSize: 9, letterSpacing: 2, color: P.accent, marginBottom: 8, textTransform: "uppercase" }}>Deploy ${Number(spareCash).toLocaleString()} cash</div>
-                    <p style={{ fontFamily: F.sans, fontSize: 13.5, lineHeight: 1.6, color: P.ink, margin: 0 }}>{review.portfolio.cashAdvice}</p>
+      {/* top picks */}
+      <motion.div variants={{ initial: { opacity: 0, y: 10 }, animate: { opacity: 1, y: 0 } }}>
+        <div style={{ display: "flex", alignItems: "center", justifyContent: "space-between", marginBottom: 12 }}>
+          <Overline color={c.text3}>Top picks for you</Overline>
+          <Button variant="ghost" size="sm" onClick={() => setNav("discover")}>See all →</Button>
+        </div>
+        {recsLoading && <Card><LoadingBlock title="Scanning markets for your best fits…" /></Card>}
+        {!recsLoading && recs?.picks && (
+          <div style={{ display: "grid", gridTemplateColumns: isMobile ? "1fr" : "1fr 1fr 1fr", gap: 12 }}>
+            {recs.picks.slice(0, 3).map((p) => (
+              <Card key={p.ticker} interactive onClick={() => openTicker(p.ticker)} pad={16}>
+                <div style={{ display: "flex", alignItems: "center", gap: 10, marginBottom: 12 }}>
+                  <StockLogo ticker={p.ticker} size={34} />
+                  <div style={{ minWidth: 0 }}>
+                    <div style={{ fontFamily: font.mono, fontWeight: 700, fontSize: 12, color: c.accent }}>{p.ticker}</div>
+                    <div style={{ ...type.caption, color: c.text3, whiteSpace: "nowrap", overflow: "hidden", textOverflow: "ellipsis" }}>{p.company}</div>
                   </div>
-                )}
-                <div style={{ background: P.card, border: `1px solid ${P.cardBorder}`, borderRadius: 8, padding: "16px 20px" }}>
-                  <div style={{ fontFamily: F.mono, fontSize: 9, letterSpacing: 2, color: P.faint, marginBottom: 12, textTransform: "uppercase" }}>Portfolio Analysis</div>
-                  {review.portfolio.summary && <p style={{ fontFamily: F.sans, fontSize: 13.5, lineHeight: 1.6, color: P.slate, margin: "0 0 12px" }}>{review.portfolio.summary}</p>}
-                  {review.portfolio.concentration && <p style={{ fontFamily: F.sans, fontSize: 12.5, lineHeight: 1.55, color: P.faint, margin: "0 0 10px" }}>{review.portfolio.concentration}</p>}
-                  {Array.isArray(review.portfolio.suggestions) && review.portfolio.suggestions.map((s, i) => (
-                    <div key={i} style={{ fontFamily: F.sans, fontSize: 13, color: P.slate, padding: "4px 0", display: "flex", gap: 10 }}><span style={{ color: P.accent, fontFamily: F.mono, flexShrink: 0 }}>→</span>{s}</div>
-                  ))}
+                  <div style={{ marginLeft: "auto" }}><ScoreRing score={p.fitScore} size={46} stroke={4} /></div>
                 </div>
-              </div>
-            )}
+                <div style={{ ...type.caption, color: c.text2, lineHeight: 1.5, display: "-webkit-box", WebkitLineClamp: 3, WebkitBoxOrient: "vertical", overflow: "hidden" }}>{p.reason}</div>
+              </Card>
+            ))}
+          </div>
+        )}
+        {!recsLoading && !recs?.picks && (
+          <Card><EmptyState title="No picks yet" hint="Atlas can scan global markets for stocks that fit how you invest." action={<Button onClick={() => { setNav("discover"); if (!recsLoading) discover(); }} glow>Scan markets</Button>} /></Card>
+        )}
+      </motion.div>
 
-            {/* ── Spreadsheet import modal ── */}
-            {importPreview && (
-              <div style={{ position: "fixed", inset: 0, background: "#000a", zIndex: 999, display: "flex", alignItems: "center", justifyContent: "center", padding: 20 }}>
-                <div style={{ background: P.card, border: `1px solid ${P.cardBorder}`, borderRadius: 12, padding: "24px 28px", width: "100%", maxWidth: 560, maxHeight: "80vh", display: "flex", flexDirection: "column", gap: 16 }}>
-                  <div style={{ display: "flex", justifyContent: "space-between", alignItems: "center" }}>
-                    <div>
-                      <div style={{ fontFamily: F.mono, fontSize: 10, letterSpacing: 2, color: P.accent, textTransform: "uppercase", marginBottom: 4 }}>Import Preview</div>
-                      <div style={{ fontFamily: F.sans, fontSize: 13, color: P.slate }}>
-                        {importPreview.rows.filter(r => r.valid).length} of {importPreview.rows.length} rows ready to import
-                        {!importPreview.tickerCol && <span style={{ color: P.amber }}> · Ticker column not found</span>}
-                        {!importPreview.sharesCol && <span style={{ color: P.amber }}> · Shares column not found</span>}
-                        {!importPreview.costCol   && <span style={{ color: P.amber }}> · Cost column not found</span>}
-                      </div>
-                    </div>
-                    <button onClick={() => setImportPreview(null)} style={{ background: "none", border: "none", color: P.faint, fontSize: 20, cursor: "pointer", padding: "0 4px" }}>×</button>
-                  </div>
-                  <div style={{ overflowY: "auto", border: `1px solid ${P.dim}`, borderRadius: 8 }}>
-                    <div style={{ display: "grid", gridTemplateColumns: "1fr 80px 100px 60px", gap: 0, fontFamily: F.mono, fontSize: 10, letterSpacing: 1, color: P.faint, textTransform: "uppercase", padding: "8px 14px", borderBottom: `1px solid ${P.dim}`, background: P.wash }}>
-                      <span>Ticker</span><span>Shares</span><span>Avg Cost</span><span>Cur</span>
-                    </div>
-                    {importPreview.rows.map((r, i) => (
-                      <div key={i} style={{ display: "grid", gridTemplateColumns: "1fr 80px 100px 60px", gap: 0, padding: "9px 14px", borderBottom: i < importPreview.rows.length - 1 ? `1px solid ${P.dim}22` : "none", background: r.valid ? "transparent" : `${P.red}0a`, alignItems: "center" }}>
-                        <span style={{ fontFamily: F.mono, fontSize: 13, fontWeight: 700, color: r.valid ? P.accent : P.red }}>{r.ticker || <em style={{ opacity: 0.4 }}>missing</em>}</span>
-                        <span style={{ fontFamily: F.mono, fontSize: 12, color: r.shares ? P.ink : P.red }}>{r.shares || <em style={{ opacity: 0.4 }}>—</em>}</span>
-                        <span style={{ fontFamily: F.mono, fontSize: 12, color: r.cost ? P.ink : P.red }}>{r.cost ? `${r.currency !== "USD" ? r.currency + " " : "$"}${r.cost}` : <em style={{ opacity: 0.4 }}>—</em>}</span>
-                        <span style={{ fontFamily: F.mono, fontSize: 11, color: P.slate }}>{r.currency}</span>
-                      </div>
+      {/* quick actions */}
+      <motion.div variants={{ initial: { opacity: 0, y: 10 }, animate: { opacity: 1, y: 0 } }}>
+        <div style={{ display: "grid", gridTemplateColumns: isMobile ? "1fr 1fr" : "1fr 1fr 1fr", gap: 12 }}>
+          {[["research", "Research a stock", "Full AI dossier on any ticker"], ["portfolio", "Review portfolio", "Buy / hold / sell on every position"], ["backtest", "Backtest a strategy", "Does it beat buy-and-hold?"]].map(([k, t, d]) => (
+            <Card key={k} interactive onClick={() => setNav(k)} pad={16}>
+              <div style={{ ...type.bodyStrong, color: c.text, marginBottom: 4 }}>{t}</div>
+              <div style={{ ...type.caption, color: c.text3, lineHeight: 1.5 }}>{d}</div>
+              <div style={{ ...type.caption, color: c.accent, marginTop: 10 }}>Open →</div>
+            </Card>
+          ))}
+        </div>
+      </motion.div>
+    </motion.div>
+  ));
+
+  const DiscoverScreen = nav !== "discover" ? null : renderSafely("Discover", () => (
+    <div style={{ maxWidth: 1080, margin: "0 auto" }}>
+      <Card pad={18} style={{ marginBottom: 14 }}>
+        <div style={{ display: "flex", justifyContent: "space-between", alignItems: "center", flexWrap: "wrap", gap: 12 }}>
+          <div>
+            <h2 style={{ ...type.heading, color: c.text, margin: "0 0 2px" }}>Best buys for you</h2>
+            <span style={{ ...type.small, color: c.text3 }}>Ranked by fit to your profile · global markets{holdings.length ? ` · ${holdings.length} positions loaded` : ""}</span>
+          </div>
+          <Button onClick={discover} loading={recsLoading} glow>{recsLoading ? "Scanning…" : "Refresh picks"}</Button>
+        </div>
+        <div style={{ marginTop: 14, overflowX: "auto" }}>
+          {/* Picking a universe re-runs the scan immediately (only once a first scan exists —
+              otherwise it just sets the filter for the upcoming one). */}
+          <SegmentedControl value={universe} onChange={(v) => { setUniverse(v); if (recs || recsError) discover(v); }} options={["Global all-markets", "US markets", "Europe", "Asia-Pacific", "My interest sectors"]} size="sm" />
+        </div>
+      </Card>
+      {recsLoading && <Card><LoadingBlock title="Finding your best picks…" sub="verifying current data · usually 15–20s" /></Card>}
+      {recsError && !recsLoading && <ErrorBanner msg={recsError} onRetry={discover} label="Scan again" />}
+      {recs?.picks && !recsLoading && (
+        <div>
+          {recs.marketContext && (
+            <Card accentEdge pad={14} style={{ borderLeftColor: c.warning, marginBottom: 12 }}>
+              <span style={{ ...type.small, color: c.text2, lineHeight: 1.5 }}><b style={{ color: c.text }}>Market context:</b> {recs.marketContext}</span>
+            </Card>
+          )}
+          <motion.div initial="initial" animate="animate" variants={{ animate: { transition: { staggerChildren: 0.04 } } }}
+            style={{ display: "grid", gridTemplateColumns: isMobile ? "1fr" : "1fr 1fr", gap: 12 }}>
+            {recs.picks.map((p, i) => (
+              <motion.div key={p.ticker || i} variants={{ initial: { opacity: 0, y: 10 }, animate: { opacity: 1, y: 0 } }} style={i === 0 ? { gridColumn: isMobile ? "auto" : "1 / -1" } : {}}>
+                <OpportunityCard pick={p} rank={i + 1} hero={i === 0 && !isMobile} onOpen={() => openTicker(p.ticker)} />
+              </motion.div>
+            ))}
+          </motion.div>
+          {recs.asOf && <div style={{ ...type.caption, color: c.text3, marginTop: 12, textAlign: "center" }}>Updated {recs.asOf}</div>}
+        </div>
+      )}
+      {/* Honest idle state — the old copy claimed "Scanning…" while nothing was running. */}
+      {!recs && !recsLoading && !recsError && <Card><EmptyState title="No scan yet" hint="Atlas scans global markets and ranks stocks by fit to your profile and portfolio." action={<Button glow onClick={() => discover()}>Scan markets</Button>} /></Card>}
+    </div>
+  ));
+
+  const PortfolioScreen = nav !== "portfolio" ? null : renderSafely("Portfolio", () => (
+    <div style={{ maxWidth: 1080, margin: "0 auto" }}>
+      <div style={{ marginBottom: 14 }}><SegmentedControl value={portfolioTab} onChange={(v) => { setPortfolioTab(v); if (v === "news" && !newsItems && !newsLoading) fetchPortfolioNews(); }} options={[{ value: "holdings", label: "Holdings" }, { value: "news", label: "Portfolio News" }]} /></div>
+
+      <Card pad={isMobile ? 18 : 24} style={{ marginBottom: 14 }}>
+        <div style={{ display: "flex", alignItems: "flex-start", justifyContent: "space-between", gap: 16, flexWrap: "wrap" }}>
+          <div style={{ flex: 1, minWidth: 0 }}>
+            <InfoTip title="Live pricing" body="Valued using real-time market prices and current exchange rates — not whatever prices were saved in a spreadsheet at import time. Totals will move as markets move, and won't match a static export.">
+              <Overline color={c.text3} style={{ marginBottom: 8 }}>Portfolio value{distinctCurrencies.length > 1 ? ` (in ${portfolioCurrency})` : ""}</Overline>
+            </InfoTip>
+            <div style={{ display: "flex", alignItems: "baseline", gap: 12, flexWrap: "wrap" }}>
+              <span style={{ ...type.displayXl, fontSize: isMobile ? 28 : 40, color: c.text }}>{lHaveVal ? <AnimatedNumber value={lValue} format={(v) => fmtCurrency(v, portfolioCurrency)} /> : holdings.length ? fmtCurrency(lCost, portfolioCurrency) : "—"}</span>
+              {lPl != null && <span style={{ ...type.data, fontSize: isMobile ? 13 : 16, color: isUp ? c.positive : c.negative }}>{isUp ? "+" : ""}{fmtCurrency(lPl, portfolioCurrency)} ({isUp ? "+" : ""}{lPlPct.toFixed(2)}%)</span>}
+              <LiveIndicator loading={livePricesLoading} lastUpdate={lastPriceUpdate} />
+            </div>
+            <div style={{ display: "flex", gap: isMobile ? 16 : 28, marginTop: 12, flexWrap: "wrap" }}>
+              <div><div style={{ ...type.caption, color: c.text3 }}>Invested</div><div style={{ ...type.data, color: c.text2 }}>{fmtCurrency(lCost, portfolioCurrency)}</div></div>
+              <div><div style={{ ...type.caption, color: c.text3 }}>Positions</div><div style={{ ...type.data, color: c.text2 }}>{holdings.length}</div></div>
+              {spareCashDisplay != null && <div><div style={{ ...type.caption, color: c.text3 }}>Cash available</div><div style={{ ...type.data, color: c.accent }}>{fmtCurrency(spareCashDisplay, portfolioCurrency)}</div></div>}
+            </div>
+            {fxIncomplete && <div style={{ ...type.caption, color: c.warning, marginTop: 8 }}>Some positions excluded from the total — exchange rates still loading.</div>}
+          </div>
+          <Button onClick={analyzePortfolio} loading={reviewLoading} disabled={!holdings.length} glow>{review ? "Re-analyse" : "Run AI Analysis"}</Button>
+        </div>
+        {expSegments.length > 0 && <div style={{ marginTop: 18 }}><ExposureBar segments={expSegments} /></div>}
+      </Card>
+
+      {portfolioTab === "holdings" && (
+        <>
+          {holdings.length > 0 && (
+            <div style={{ display: "flex", justifyContent: "flex-end", marginBottom: 8 }}>
+              <Button variant="ghost" size="sm" onClick={() => setConfirmClearOpen(true)} style={{ color: c.text3 }}>Clear all holdings</Button>
+            </div>
+          )}
+          <Card pad={0} style={{ marginBottom: 14, overflow: "hidden" }}>
+            {/* The desktop grid needs ~860px — on narrow desktop windows (768–900px) it scrolls
+                horizontally instead of clipping the P&L/Call columns out of reach. */}
+            <div style={{ overflowX: "auto" }}>
+              <div style={{ minWidth: !isMobile && holdings.length > 0 ? 860 : 0 }}>
+                {!isMobile && holdings.length > 0 && (
+                  <div style={{ display: "grid", gridTemplateColumns: "44px 1fr 95px 80px 95px 110px 120px 92px 60px", padding: "10px 4px", background: c.surface2, borderBottom: `1px solid ${c.hairline}` }}>
+                    <span />
+                    {[["Asset","left"],["Price","right"],["Qty","right"],["Avg Cost","right"],["Mkt Value","right"],["P&L","right"],["Call","center"],["",""]].map(([h, al], i) => (
+                      <span key={i} style={{ ...type.overline, color: c.text3, textAlign: al, padding: "0 8px" }}>{h}</span>
                     ))}
                   </div>
-                  {importPreview.rows.filter(r => !r.valid).length > 0 && (
-                    <div style={{ fontFamily: F.sans, fontSize: 12, color: P.amber }}>Rows highlighted in red are missing required fields and will be skipped.</div>
-                  )}
-                  <div style={{ display: "flex", gap: 10, justifyContent: "flex-end" }}>
-                    <button onClick={() => setImportPreview(null)} style={{ fontFamily: F.sans, fontSize: 13, fontWeight: 600, color: P.slate, background: P.wash, border: `1px solid ${P.dim}`, borderRadius: 6, padding: "9px 18px", cursor: "pointer" }}>Cancel</button>
-                    <button onClick={confirmImport} disabled={!importPreview.rows.some(r => r.valid)} style={{ fontFamily: F.sans, fontSize: 13, fontWeight: 700, color: "#000", background: P.accent, border: "none", borderRadius: 6, padding: "9px 22px", cursor: "pointer", opacity: importPreview.rows.some(r => r.valid) ? 1 : 0.4 }}>
-                      Import {importPreview.rows.filter(r => r.valid).length} Holdings
-                    </button>
-                  </div>
-                </div>
-              </div>
-            )}
-
-            {/* ── Add position + spare cash ── */}
-            <div style={{ background: P.card, border: `1px solid ${P.cardBorder}`, borderRadius: 10, padding: "16px 20px", marginBottom: 14 }}>
-              <div style={{ display: "flex", alignItems: "center", justifyContent: "space-between", marginBottom: 12 }}>
-                <div style={{ fontFamily: F.mono, fontSize: 9, letterSpacing: 2, color: P.faint, textTransform: "uppercase" }}>Add Position</div>
-                <button onClick={() => importRef.current?.click()} style={{ fontFamily: F.sans, fontSize: 11, fontWeight: 600, color: P.slate, background: P.wash, border: `1px solid ${P.dim}`, borderRadius: 5, padding: "5px 12px", cursor: "pointer", display: "flex", alignItems: "center", gap: 6 }}>
-                  <span style={{ fontSize: 13 }}>⬆</span> Import from spreadsheet
-                </button>
-                <input ref={importRef} type="file" accept=".xlsx,.xls,.csv" style={{ display: "none" }} onChange={handleImportFile} />
-              </div>
-              <div style={{ display: "flex", gap: 8, alignItems: "flex-end", flexWrap: "wrap" }}>
-                <div style={{ flex: "0 0 110px" }}>
-                  <div style={{ fontFamily: F.sans, fontSize: 10, fontWeight: 600, color: P.faint, marginBottom: 5, textTransform: "uppercase", letterSpacing: 0.3 }}>Ticker</div>
-                  <input className="vd-input" value={nt} onChange={e => setNt(e.target.value)} placeholder="AAPL" onKeyDown={e => e.key === "Enter" && addHolding()}
-                    style={{ width: "100%", boxSizing: "border-box", fontFamily: F.mono, fontSize: 14, fontWeight: 700, color: P.accent, background: P.wash, border: `1.5px solid ${P.dim}`, borderRadius: 6, padding: "9px 10px", textTransform: "uppercase" }} />
-                  <div style={{ fontFamily: F.sans, fontSize: 10, color: P.faint, marginTop: 5, lineHeight: 1.4 }}>Non-US stocks need an exchange suffix — e.g. <span style={{ fontFamily: F.mono, color: P.slate }}>SAF.PA</span> (Paris), <span style={{ fontFamily: F.mono, color: P.slate }}>SHEL.L</span> (London), <span style={{ fontFamily: F.mono, color: P.slate }}>9988.HK</span> (HK)</div>
-                </div>
-                <div style={{ flex: "0 0 80px" }}>
-                  <div style={{ fontFamily: F.sans, fontSize: 10, fontWeight: 600, color: P.faint, marginBottom: 5, textTransform: "uppercase", letterSpacing: 0.3 }}>Shares</div>
-                  <input className="vd-input" value={ns} onChange={e => setNs(e.target.value)} placeholder="10" inputMode="decimal" onKeyDown={e => e.key === "Enter" && addHolding()}
-                    style={{ width: "100%", boxSizing: "border-box", fontFamily: F.mono, fontSize: 14, color: P.ink, background: P.wash, border: `1.5px solid ${P.dim}`, borderRadius: 6, padding: "9px 10px" }} />
-                </div>
-                <div style={{ flex: "1 1 160px", minWidth: 140 }}>
-                  <div style={{ fontFamily: F.sans, fontSize: 10, fontWeight: 600, color: P.faint, marginBottom: 5, textTransform: "uppercase", letterSpacing: 0.3 }}>Avg buy price</div>
-                  <div style={{ display: "flex", gap: 5 }}>
-                    <select value={ncur} onChange={e => setNcur(e.target.value)}
-                      style={{ fontFamily: F.mono, fontSize: 11, fontWeight: 600, color: P.slate, background: P.wash, border: `1.5px solid ${P.dim}`, borderRadius: 6, padding: "9px 6px", cursor: "pointer", flexShrink: 0 }}>
-                      {["USD","EUR","GBP","CAD","AUD","CHF","JPY","HKD","SGD"].map(c => <option key={c} value={c}>{c}</option>)}
-                    </select>
-                    <input className="vd-input" value={nc} onChange={e => setNc(e.target.value)} placeholder="182.50" inputMode="decimal" onKeyDown={e => e.key === "Enter" && addHolding()}
-                      style={{ flex: 1, minWidth: 0, boxSizing: "border-box", fontFamily: F.mono, fontSize: 14, color: P.ink, background: P.wash, border: `1.5px solid ${P.dim}`, borderRadius: 6, padding: "9px 10px" }} />
-                  </div>
-                </div>
-                <button className="vd-eval" onClick={addHolding} style={{ fontFamily: F.sans, fontWeight: 700, fontSize: 13, color: "#000", background: P.accent, border: "none", borderRadius: 6, padding: "9px 20px", cursor: "pointer", whiteSpace: "nowrap", flexShrink: 0, height: 38 }}>+ Add</button>
-              </div>
-
-              {/* Spare cash inline */}
-              <div style={{ borderTop: `1px solid ${P.dim}`, marginTop: 14, paddingTop: 14, display: "flex", alignItems: "center", gap: 12, flexWrap: "wrap" }}>
-                <div style={{ fontFamily: F.sans, fontSize: 10, fontWeight: 600, color: P.faint, textTransform: "uppercase", letterSpacing: 0.3, flexShrink: 0 }}>Spare cash</div>
-                <div style={{ position: "relative", flexShrink: 0 }}>
-                  <span style={{ position: "absolute", left: 10, top: "50%", transform: "translateY(-50%)", fontFamily: F.mono, fontSize: 13, color: P.faint, pointerEvents: "none" }}>$</span>
-                  <input className="vd-input" value={spareCash} onChange={e => updateSpareCash(e.target.value.replace(/[^0-9.]/g, ""))} placeholder="0.00" inputMode="decimal"
-                    style={{ width: 140, boxSizing: "border-box", fontFamily: F.mono, fontSize: 13, fontWeight: 600, color: P.accent, background: P.wash, border: `1.5px solid ${P.dim}`, borderRadius: 6, padding: "8px 10px 8px 24px" }} />
-                </div>
-                {spareCash && parseNum(spareCash) > 0
-                  ? <span style={{ fontFamily: F.sans, fontSize: 12, color: P.slate }}>Atlas will advise how to deploy <b style={{ color: P.accent }}>${Number(parseNum(spareCash)).toLocaleString()}</b> when you run an analysis.</span>
-                  : <span style={{ fontFamily: F.sans, fontSize: 12, color: P.faint }}>Enter cash to get specific deployment advice.</span>}
+                )}
+                {holdings.length === 0
+                  ? <EmptyState title="No positions yet" hint="Add a holding below, or import from a spreadsheet, to track live P&L and run AI analysis." />
+                  : holdings.map((h, i) => (
+                      <HoldingRow key={`${h.ticker}-${i}`} h={h} fxRates={fxRates} livePrice={livePrices[h.ticker]} review={reviewFor(h.ticker)} onOpen={() => openTicker(h.ticker)} onRemove={() => setConfirmRemoveIdx(i)} />
+                    ))}
               </div>
             </div>
-            </>}
+          </Card>
 
-            {/* ── Portfolio News ── */}
-            {portfolioTab === "news" && (
-              <div>
-                <div style={{ display: "flex", alignItems: "center", justifyContent: "space-between", marginBottom: 14 }}>
-                  <div style={{ fontFamily: F.sans, fontSize: 13, color: P.faint }}>
-                    Latest news for your {holdings.length} holding{holdings.length !== 1 ? "s" : ""}, sourced live.
-                  </div>
-                  <button onClick={fetchPortfolioNews} disabled={newsLoading || !holdings.length}
-                    style={{ fontFamily: F.sans, fontSize: 12, fontWeight: 600, color: newsLoading ? P.faint : P.accent, background: "none", border: `1px solid ${newsLoading ? P.dim : P.accent}44`, borderRadius: 6, padding: "6px 14px", cursor: newsLoading ? "default" : "pointer" }}>
-                    {newsLoading ? "Fetching…" : newsItems ? "↺ Refresh" : "Fetch news"}
-                  </button>
+          {reviewLoading && <Card><LoadingBlock title="Fetching live prices and running AI analysis…" sub="live data · tuned to your profile" /></Card>}
+          {reviewError && !reviewLoading && <ErrorBanner msg={reviewError} onRetry={analyzePortfolio} label="Try again" />}
+
+          {review?.portfolio && !reviewLoading && (
+            <motion.div initial={{ opacity: 0, y: 8 }} animate={{ opacity: 1, y: 0 }} style={{ marginBottom: 14, display: "flex", flexDirection: "column", gap: 10 }}>
+              {review.portfolio.cashAdvice && spareCashDisplay != null && (
+                <Card accentEdge pad={18} style={{ background: c.accentSoft, borderColor: c.accentBorder }}>
+                  <Overline color={c.accent} style={{ marginBottom: 8 }}>Deploy {fmtCurrency(spareCashDisplay, portfolioCurrency)} cash</Overline>
+                  <p style={{ ...type.small, lineHeight: 1.6, color: c.text, margin: 0 }}>{review.portfolio.cashAdvice}</p>
+                </Card>
+              )}
+              <Card pad={18}>
+                <Overline color={c.text3} style={{ marginBottom: 12 }}>Advisor · portfolio analysis</Overline>
+                {review.portfolio.summary && <p style={{ ...type.small, lineHeight: 1.6, color: c.text2, margin: "0 0 12px" }}>{review.portfolio.summary}</p>}
+                {review.portfolio.concentration && <p style={{ ...type.caption, lineHeight: 1.55, color: c.text3, margin: "0 0 10px" }}>{review.portfolio.concentration}</p>}
+                {Array.isArray(review.portfolio.suggestions) && review.portfolio.suggestions.map((s, i) => (
+                  <div key={i} style={{ ...type.small, color: c.text2, padding: "4px 0", display: "flex", gap: 10 }}><span style={{ color: c.accent, flexShrink: 0 }}>→</span>{s}</div>
+                ))}
+              </Card>
+            </motion.div>
+          )}
+
+          {/* Add position composer */}
+          <Card pad={18} style={{ marginBottom: 14 }}>
+            <div style={{ display: "flex", alignItems: "center", justifyContent: "space-between", marginBottom: 14 }}>
+              <Overline color={c.text3}>Add position</Overline>
+              <Button variant="secondary" size="sm" onClick={() => importRef.current?.click()} icon={<UploadIcon />} loading={importAnalyzing} disabled={importAnalyzing}>{importAnalyzing ? "Analyzing spreadsheet…" : "Import spreadsheet"}</Button>
+              <input ref={importRef} type="file" accept=".xlsx,.xls,.csv" style={{ display: "none" }} onChange={handleImportFile} />
+            </div>
+            {importError && <ErrorBanner msg={importError} onRetry={() => { setImportError(null); importRef.current?.click(); }} label="Pick another file" />}
+            <div style={{ display: "flex", gap: 10, alignItems: "flex-end", flexWrap: "wrap" }}>
+              <Field label="Ticker" style={{ flex: "0 0 120px" }}>
+                <Input mono value={nt} onChange={e => setNt(e.target.value)} placeholder="AAPL" onKeyDown={e => e.key === "Enter" && addHolding()} style={{ color: c.accent, fontWeight: 700, textTransform: "uppercase" }} />
+              </Field>
+              <Field label="Shares" style={{ flex: "0 0 90px" }}>
+                <Input mono value={ns} onChange={e => setNs(e.target.value)} placeholder="10" inputMode="decimal" onKeyDown={e => e.key === "Enter" && addHolding()} />
+              </Field>
+              <Field label="Avg buy price" style={{ flex: "1 1 180px", minWidth: 160 }}>
+                <div style={{ display: "flex", gap: 6 }}>
+                  <Select value={ncur} onChange={e => setNcur(e.target.value)} options={CURRENCIES} style={{ flex: "0 0 86px" }} />
+                  <Input mono value={nc} onChange={e => setNc(e.target.value)} placeholder="182.50" inputMode="decimal" onKeyDown={e => e.key === "Enter" && addHolding()} style={{ flex: 1 }} />
                 </div>
-                {!holdings.length && (
-                  <div style={{ fontFamily: F.sans, fontSize: 13, color: P.faint, padding: "40px 0", textAlign: "center" }}>Add some holdings first to see portfolio news.</div>
-                )}
-                {newsLoading && <Spinner title="Searching for latest news on your holdings…" sub="Live search · usually 15–25s" />}
-                {newsError && !newsLoading && <ErrorBox msg={newsError} onRetry={fetchPortfolioNews} label="Try again" />}
-                {newsItems && !newsLoading && (
-                  <div style={{ display: "flex", flexDirection: "column", gap: 10 }}>
-                    {newsItems.length === 0 && <div style={{ fontFamily: F.sans, fontSize: 13, color: P.faint, textAlign: "center", padding: "30px 0" }}>No news found.</div>}
-                    {newsItems.map((item, i) => {
-                      const sentColor = item.sentiment === "bullish" ? P.accent : item.sentiment === "bearish" ? P.red : P.amber;
-                      const isMacro = item.ticker === "MACRO";
-                      const hasUrl = item.url && item.url.startsWith("http");
-                      return (
-                        <div key={i} className="vd-reveal" style={{ background: P.card, border: `1px solid ${P.cardBorder}`, borderRadius: 10, padding: "16px 20px", borderLeft: `3px solid ${sentColor}` }}>
-                          <div style={{ display: "flex", alignItems: "center", gap: 8, marginBottom: 8, flexWrap: "wrap" }}>
-                            <span style={{ fontFamily: F.mono, fontSize: 10, fontWeight: 700, padding: "2px 8px", borderRadius: 4, background: isMacro ? `${P.amber}22` : `${P.accent}18`, color: isMacro ? P.amber : P.accent }}>
-                              {isMacro ? "MACRO" : item.ticker}
-                            </span>
-                            {item.source && <span style={{ fontFamily: F.sans, fontSize: 11, color: P.faint }}>{item.source}</span>}
-                            {item.date && <span style={{ fontFamily: F.sans, fontSize: 11, color: P.faint }}>{item.date}</span>}
-                            <span style={{ fontFamily: F.mono, fontSize: 9, fontWeight: 700, letterSpacing: 1, color: sentColor, marginLeft: "auto", textTransform: "uppercase" }}>{item.sentiment}</span>
-                          </div>
-                          <div style={{ fontFamily: F.sans, fontSize: 14, fontWeight: 600, color: P.ink, marginBottom: 6, lineHeight: 1.4 }}>
-                            {hasUrl
-                              ? <a href={item.url} target="_blank" rel="noopener noreferrer" style={{ color: P.ink, textDecoration: "none" }} onMouseOver={e => e.currentTarget.style.color = P.accent} onMouseOut={e => e.currentTarget.style.color = P.ink}>{item.headline} ↗</a>
-                              : item.headline}
-                          </div>
-                          {item.summary && <div style={{ fontFamily: F.sans, fontSize: 13, color: P.slate, lineHeight: 1.6 }}>{item.summary}</div>}
-                        </div>
-                      );
-                    })}
+              </Field>
+              <Button onClick={addHolding} icon={<PlusIcon />}>Add</Button>
+            </div>
+            <div style={{ ...type.caption, color: c.text3, marginTop: 8, lineHeight: 1.5 }}>Non-US stocks need an exchange suffix — e.g. <span style={{ fontFamily: font.mono, color: c.text2 }}>SAF.PA</span> (Paris), <span style={{ fontFamily: font.mono, color: c.text2 }}>SHEL.L</span> (London), <span style={{ fontFamily: font.mono, color: c.text2 }}>9988.HK</span> (HK)</div>
+            <Divider style={{ margin: "14px 0" }} />
+            <div style={{ display: "flex", alignItems: "center", gap: 12, flexWrap: "wrap" }}>
+              <Overline color={c.text3}>Spare cash</Overline>
+              {/* The field edits the amount in ITS OWN currency (e.g. GBP cash from an import) —
+                  labeling it with the portfolio's display currency silently re-tagged the number
+                  as a different currency without converting it. A new amount starts in the
+                  portfolio's currency. */}
+              {(() => {
+                const cashCur = spareCash ? normalizeCurrencyCode(spareCashCurrency || "USD") : portfolioCurrency;
+                return (
+                  <div style={{ position: "relative" }}>
+                    <span style={{ position: "absolute", left: 10, top: "50%", transform: "translateY(-50%)", fontFamily: font.mono, fontSize: 11, fontWeight: 600, color: c.text3, pointerEvents: "none" }}>{cashCur}</span>
+                    <Input mono value={spareCash} onChange={e => updateSpareCash(e.target.value.replace(/[^0-9.]/g, ""), cashCur)} placeholder="0.00" inputMode="decimal" style={{ width: 160, paddingLeft: 46, color: c.accent, fontWeight: 600 }} />
                   </div>
-                )}
-              </div>
-            )}
-          </>
-          );
-        })()}
+                );
+              })()}
+              {spareCashDisplay != null
+                ? <span style={{ ...type.caption, color: c.text3 }}>Atlas will advise how to deploy <b style={{ color: c.accent }}>{fmtCurrency(spareCashDisplay, portfolioCurrency)}</b> on analysis.</span>
+                : <span style={{ ...type.caption, color: c.text3 }}>Enter cash to get specific deployment advice.</span>}
+            </div>
+          </Card>
+        </>
+      )}
 
-        {/* ===================== RESEARCH ===================== */}
-        {nav === "research" && (
-          <>
-            <section style={{ background: P.card, border: `1px solid ${P.cardBorder}`, borderRadius: 8, padding: "18px 20px" }}>
-              <h2 style={{ fontFamily: F.sans, fontWeight: 700, fontSize: 18, color: P.ink, margin: "0 0 4px" }}>Equity Research</h2>
-              <p style={{ fontFamily: F.sans, fontSize: 13, color: P.faint, margin: "0 0 14px" }}>Full AI-powered dossier on any stock — scored to your profile and portfolio</p>
-              <div style={{ display: "flex", gap: 8, flexWrap: "wrap" }}>
-                <input className="vd-input" value={query} onChange={(e) => setQuery(e.target.value)} onKeyDown={(e) => e.key === "Enter" && evaluate()} placeholder="Enter ticker or company name (e.g. NVDA, Apple, TSMC)…" style={{ flex: "1 1 240px", fontFamily: F.sans, fontSize: 15, color: P.ink, background: P.wash, border: `1px solid ${P.dim}`, borderRadius: 6, padding: "11px 16px" }} />
-                <button className="vd-eval" onClick={() => evaluate()} disabled={loading} style={{ fontFamily: F.sans, fontWeight: 600, fontSize: 13, color: "#000", background: P.accent, border: "none", borderRadius: 6, padding: "0 24px", minHeight: 44, cursor: loading ? "default" : "pointer", opacity: loading ? 0.6 : 1 }}>{loading ? "Analysing…" : "Run analysis"}</button>
+      {portfolioTab === "news" && (
+        <div>
+          <div style={{ display: "flex", alignItems: "center", justifyContent: "space-between", marginBottom: 14, flexWrap: "wrap", gap: 10 }}>
+            <span style={{ ...type.small, color: c.text3 }}>Latest news for your {holdings.length} holding{holdings.length !== 1 ? "s" : ""}, sourced live.</span>
+            <Button variant="outline" size="sm" onClick={fetchPortfolioNews} loading={newsLoading} disabled={!holdings.length}>{newsItems ? "Refresh" : "Fetch news"}</Button>
+          </div>
+          {!holdings.length && <Card><EmptyState title="No holdings yet" hint="Add some holdings first to see portfolio news." /></Card>}
+          {newsLoading && <Card><LoadingBlock title="Searching for latest news on your holdings…" sub="Live search · usually 15–25s" /></Card>}
+          {newsError && !newsLoading && <ErrorBanner msg={newsError} onRetry={fetchPortfolioNews} label="Try again" />}
+          {newsInsiderActivity && !newsLoading && (
+            <Card pad={16} style={{ marginBottom: 14 }}>
+              <Overline color={c.accent} style={{ marginBottom: 8 }}>Insider activity across your portfolio</Overline>
+              <div style={{ ...type.small, color: c.text2, lineHeight: 1.55, marginBottom: (newsInsiderActivity.transactions || []).length ? 10 : 0 }}>{newsInsiderActivity.summary}</div>
+              {(newsInsiderActivity.transactions || []).length > 0 && (
+                <div style={{ display: "flex", flexDirection: "column", gap: 6 }}>
+                  {newsInsiderActivity.transactions.map((t, i) => (
+                    <div key={i} style={{ display: "flex", alignItems: "center", gap: 8, flexWrap: "wrap", ...type.caption, color: c.text3 }}>
+                      <Badge tone="accent">{t.ticker}</Badge>
+                      <span style={{ fontWeight: 600, color: t.type === "Buy" ? c.positive : t.type === "Sell" ? c.negative : c.text2 }}>{t.type}</span>
+                      <span>{t.insider}</span>
+                      {t.shares && <span>· {t.shares} sh</span>}
+                      {t.value && <span>· {t.value}</span>}
+                      {t.date && <span>· {t.date}</span>}
+                    </div>
+                  ))}
+                </div>
+              )}
+            </Card>
+          )}
+          {newsItems && !newsLoading && (
+            <div style={{ display: "flex", flexDirection: "column", gap: 10 }}>
+              {newsItems.length === 0 && <Card><EmptyState title="No news found" /></Card>}
+              {newsItems.map((item, i) => {
+                const sentColor = item.sentiment === "bullish" ? c.positive : item.sentiment === "bearish" ? c.negative : c.warning;
+                const isMacro = item.ticker === "MACRO";
+                const hasUrl = item.url && item.url.startsWith("http");
+                return (
+                  <Card key={i} pad={16} accentEdge style={{ borderLeftColor: sentColor }}>
+                    <div style={{ display: "flex", alignItems: "center", gap: 8, marginBottom: 8, flexWrap: "wrap" }}>
+                      <Badge tone={isMacro ? "warning" : "accent"}>{isMacro ? "MACRO" : item.ticker}</Badge>
+                      {item.category && <Badge tone={item.category === "Insider Trading" ? "positive" : "neutral"}>{item.category}</Badge>}
+                      {item.source && <span style={{ ...type.caption, color: c.text3 }}>{item.source}</span>}
+                      {item.date && <span style={{ ...type.caption, color: c.text3 }}>{item.date}</span>}
+                      <span style={{ ...type.overline, color: sentColor, marginLeft: "auto" }}>{item.sentiment}</span>
+                    </div>
+                    <div style={{ ...type.bodyStrong, color: c.text, marginBottom: 6, lineHeight: 1.4 }}>
+                      {hasUrl ? <a href={item.url} target="_blank" rel="noopener noreferrer" className="atlas-link">{item.headline} ↗</a> : item.headline}
+                    </div>
+                    {item.summary && <div style={{ ...type.small, color: c.text2, lineHeight: 1.6 }}>{item.summary}</div>}
+                  </Card>
+                );
+              })}
+            </div>
+          )}
+        </div>
+      )}
+    </div>
+  ));
+
+  const ResearchScreen = nav !== "research" ? null : renderSafely("Research", () => (
+    <div style={{ maxWidth: 1080, margin: "0 auto" }}>
+      <Card pad={18} style={{ marginBottom: 14 }}>
+        <h2 style={{ ...type.heading, color: c.text, margin: "0 0 4px" }}>Equity Research</h2>
+        <p style={{ ...type.small, color: c.text3, margin: "0 0 14px" }}>Full AI-powered dossier on any stock — scored to your profile and portfolio</p>
+        <div style={{ display: "flex", gap: 10, flexWrap: "wrap" }}>
+          <Input value={query} onChange={(e) => setQuery(e.target.value)} onKeyDown={(e) => e.key === "Enter" && evaluate()} placeholder="Enter ticker or company name (e.g. NVDA, Apple, TSMC)…" style={{ flex: "1 1 240px", fontSize: 15, height: 46 }} />
+          <Button size="lg" glow onClick={() => evaluate()} loading={loading}>Run analysis</Button>
+        </div>
+      </Card>
+      {researchHistory.length > 0 && (
+        <Card pad={16} style={{ marginBottom: 14 }}>
+          <Overline color={c.text3} style={{ marginBottom: 10 }}>Past research ({researchHistory.length})</Overline>
+          <div style={{ display: "flex", flexDirection: "column", gap: 8 }}>
+            {researchHistory.map((h) => (
+              <div key={h.ticker} style={{ display: "flex", alignItems: "center", gap: 12, padding: "8px 10px", borderRadius: radius.sm, background: c.surface1 }}>
+                <div style={{ flex: 1, minWidth: 0, cursor: "pointer" }} onClick={() => openResearchHistory(h)}>
+                  <div style={{ display: "flex", alignItems: "baseline", gap: 8, flexWrap: "wrap" }}>
+                    <span style={{ ...type.bodyStrong, color: c.accent }}>{h.ticker}</span>
+                    <span style={{ ...type.small, color: c.text2, overflow: "hidden", textOverflow: "ellipsis", whiteSpace: "nowrap" }}>{h.company}</span>
+                  </div>
+                  <div style={{ ...type.caption, color: c.text3, marginTop: 2 }}>{fmtHistoryDate(h.savedAt)}</div>
+                </div>
+                <Button size="sm" variant="secondary" onClick={() => updateResearchHistory(h.ticker)} loading={loading && query === h.ticker}>Update</Button>
+                <IconButton label="Remove from history" size={28} onClick={() => removeResearchHistory(h.ticker)} style={{ color: c.text3 }}>×</IconButton>
               </div>
-            </section>
-            {loading && <Spinner title={LOADING_MSGS[msgIdx]} sub="Searching live sources · est. 20–40s" />}
-            {error && !loading && <ErrorBox msg={error} onRetry={() => evaluate()} />}
-            {result && !loading && <Results result={result} profile={profile} />}
-            {!result && !loading && !error && <div style={{ textAlign: "center", padding: "40px 20px 0", fontFamily: F.sans, fontSize: 14, color: P.faint, lineHeight: 1.7 }}>Enter any ticker or company name above to generate a full research dossier scored to your profile and portfolio.</div>}
-          </>
+            ))}
+          </div>
+        </Card>
+      )}
+      {loading && (
+        <Card>
+          <LoadingBlock
+            title={LOADING_MSGS[msgIdx]}
+            sub={elapsedSec < 45
+              ? "Searching live sources · usually 30–90s"
+              : `Still working — ${elapsedSec}s so far. Full dossiers with live search can take a few minutes, especially for less common tickers.`}
+          />
+        </Card>
+      )}
+      {error && !loading && <ErrorBanner msg={error} onRetry={() => evaluate()} />}
+      {result && !loading && <Results result={result} profile={profile} backtestSnapshot={backtestSnapshot && (!result.ticker || backtestSnapshot.ticker === String(result.ticker).toUpperCase()) ? backtestSnapshot : null} onOpenBacktest={() => setNav("backtest")} />}
+      {!result && !loading && !error && <Card><EmptyState title="Research any stock" hint="Enter a ticker or company name above to generate a full dossier scored to your profile and portfolio." /></Card>}
+    </div>
+  ));
+
+  const screens = { home: HomeScreen, discover: DiscoverScreen, portfolio: PortfolioScreen, research: ResearchScreen, backtest: null };
+
+  return (
+    <AtlasMotionProvider>
+      <AtlasStyles />
+      <div style={{ display: "flex", background: c.canvas, minHeight: "100vh" }}>
+        {!isMobile && <NavRail nav={nav} setNav={setNav} profile={profile} holdingsCount={holdings.length} onEdit={() => setShowProfileEditor(true)} onSignOut={firebaseConfigured ? handleSignOut : null} />}
+        {isMobile && <BottomNav nav={nav} setNav={setNav} holdingsCount={holdings.length} />}
+        {isMobile && (
+          <div style={{ position: "fixed", top: 0, left: 0, right: 0, height: 52, background: c.sunken, borderBottom: `1px solid ${c.hairline}`, display: "flex", alignItems: "center", justifyContent: "space-between", padding: "0 16px", zIndex: 200 }}>
+            <div style={{ display: "flex", alignItems: "center", gap: 9 }}><AtlasMark size={26} /><span style={{ ...type.heading, color: c.text }}>Atlas</span></div>
+            <IconButton label="Profile" onClick={() => setShowProfileEditor(true)}>
+              <div style={{ width: 28, height: 28, borderRadius: "50%", background: c.accent, display: "flex", alignItems: "center", justifyContent: "center", color: "#fff", ...type.caption, fontWeight: 700 }}>{(profile?.name || "U")[0].toUpperCase()}</div>
+            </IconButton>
+          </div>
         )}
 
-        {/* ===================== BACKTEST ===================== */}
-        {nav === "backtest" && <Backtester />}
+        <SlideOver open={showProfileEditor} onClose={() => setShowProfileEditor(false)}>
+          {/* onSignOut here is also the ONLY sign-out path on mobile (no NavRail there). */}
+          <ProfileEditor profile={profile} onSave={saveProfile} onClose={() => setShowProfileEditor(false)}
+            onSignOut={firebaseConfigured && firebaseUser ? () => { setShowProfileEditor(false); handleSignOut(); } : null} />
+        </SlideOver>
 
-        <footer style={{ marginTop: 44, paddingTop: 16, borderTop: `1px solid ${P.cardBorder}` }}>
-          <p style={{ fontFamily: F.mono, fontSize: 10, lineHeight: 1.6, color: P.faint, margin: 0, letterSpacing: 0.3 }}>Atlas surfaces research ideas for educational purposes only — not investment advice. All scores, calls and picks are AI-generated from public data and may be incomplete or outdated. Always conduct independent due diligence before any transaction.</p>
-        </footer>
+        <Modal open={!!importPreview} onClose={() => setImportPreview(null)} width={660}>
+          {importPreview && (
+            <div style={{ display: "flex", flexDirection: "column", gap: 16 }}>
+              <div style={{ display: "flex", justifyContent: "space-between", alignItems: "flex-start" }}>
+                <div>
+                  <Overline color={c.accent} style={{ marginBottom: 4 }}>Import preview</Overline>
+                  <div style={{ ...type.small, color: c.text2 }}>
+                    {importPreview.rows.filter(r => r.valid).length} of {importPreview.rows.length} rows ready
+                    {importPreview.aiAssisted && <span style={{ color: c.accent }}> · columns auto-detected with AI</span>}
+                  </div>
+                </div>
+                <IconButton label="Close" onClick={() => setImportPreview(null)}><CloseIcon /></IconButton>
+              </div>
+
+              <div>
+                <Overline color={c.text3} style={{ marginBottom: 8 }}>Column mapping</Overline>
+                <div style={{ display: "grid", gridTemplateColumns: "repeat(auto-fit, minmax(140px, 1fr))", gap: 10 }}>
+                  <Field label="Ticker / name">
+                    <Select value={importPreview.mapping.tickerColumn || ""} onChange={e => remapImport("tickerColumn", e.target.value)}
+                      options={[{ value: "", label: "— none —" }, ...importPreview.headers.map(h => ({ value: h, label: h }))]} />
+                  </Field>
+                  <Field label="Shares">
+                    <Select value={importPreview.mapping.sharesColumn || ""} onChange={e => remapImport("sharesColumn", e.target.value)}
+                      options={[{ value: "", label: "— none —" }, ...importPreview.headers.map(h => ({ value: h, label: h }))]} />
+                  </Field>
+                  <Field label="Avg cost / share">
+                    <Select value={importPreview.mapping.costColumn || ""} onChange={e => remapImport("costColumn", e.target.value)}
+                      options={[{ value: "", label: "— none —" }, ...importPreview.headers.map(h => ({ value: h, label: h }))]} />
+                  </Field>
+                  <Field label="Currency column">
+                    <Select value={importPreview.mapping.currencyColumn || ""} onChange={e => remapImport("currencyColumn", e.target.value)}
+                      options={[{ value: "", label: "— none —" }, ...importPreview.headers.map(h => ({ value: h, label: h }))]} />
+                  </Field>
+                  <Field label="Exchange column">
+                    <Select value={importPreview.mapping.exchangeColumn || ""} onChange={e => remapImport("exchangeColumn", e.target.value)}
+                      options={[{ value: "", label: "— none —" }, ...importPreview.headers.map(h => ({ value: h, label: h }))]} />
+                  </Field>
+                  <Field label="Sheet currency">
+                    <Select value={importPreview.mapping.sheetCurrency || ""} onChange={e => remapImport("sheetCurrency", e.target.value)}
+                      options={[{ value: "", label: "auto-detect" }, ...CURRENCIES.map(cur => ({ value: cur, label: cur }))]} />
+                  </Field>
+                </div>
+                <div style={{ ...type.caption, color: c.text3, marginTop: 8, lineHeight: 1.5 }}>
+                  Didn't get it right? Adjust any column above — it re-maps instantly. <b style={{ color: c.text2 }}>Sheet currency</b> applies to every row without its own currency column (auto-detected from symbols like "(€)" in your headers, or set it yourself). <b style={{ color: c.text2 }}>Exchange column</b> lets Atlas append the right suffix to international tickers (e.g. "SAF" + "Euronext Paris" → "SAF.PA") so prices resolve correctly.
+                </div>
+              </div>
+
+              {importPreview.cashDetected && (
+                <div style={{ display: "flex", alignItems: "center", justifyContent: "space-between", gap: 12, background: c.accentSoft, border: `1px solid ${c.accentBorder}`, borderRadius: radius.sm, padding: "12px 14px", flexWrap: "wrap" }}>
+                  <span style={{ ...type.small, color: c.text2 }}>
+                    Found <b style={{ color: c.accent }}>{fmtCurrency(importPreview.cashDetected.amount, importPreview.cashDetected.currency)}</b> of uninvested cash — not a security, so it's kept separate and set as your Spare Cash (replacing any current value).
+                  </span>
+                  <label style={{ display: "flex", alignItems: "center", gap: 7, ...type.caption, color: c.text3, cursor: "pointer", flexShrink: 0 }}>
+                    <input type="checkbox" checked={importPreview.includeCash} onChange={e => setImportPreview(prev => ({ ...prev, includeCash: e.target.checked }))} />
+                    Include it
+                  </label>
+                </div>
+              )}
+
+              <div style={{ overflowY: "auto", maxHeight: "42vh", border: `1px solid ${c.hairline}`, borderRadius: radius.sm }}>
+                <div style={{ display: "grid", gridTemplateColumns: "1fr 80px 100px 60px", ...type.overline, color: c.text3, padding: "8px 14px", borderBottom: `1px solid ${c.hairline}`, background: c.surface2 }}>
+                  <span>Ticker</span><span>Shares</span><span>Avg Cost</span><span>Cur</span>
+                </div>
+                {importPreview.rows.map((r, i) => (
+                  <div key={i} style={{ display: "grid", gridTemplateColumns: "1fr 80px 100px 60px", padding: "9px 14px", borderBottom: `1px solid ${c.hairline}`, background: r.valid ? "transparent" : c.negativeSoft, alignItems: "center" }}>
+                    <div style={{ minWidth: 0 }}>
+                      <div style={{ fontFamily: font.mono, fontSize: 13, fontWeight: 700, color: r.valid ? c.accent : c.negative }}>{r.ticker || <em style={{ opacity: 0.4 }}>unresolved</em>}</div>
+                      {r.sourceLabel && <div style={{ ...type.caption, color: c.text3, whiteSpace: "nowrap", overflow: "hidden", textOverflow: "ellipsis" }}>from "{r.sourceLabel}"</div>}
+                    </div>
+                    <span style={{ fontFamily: font.mono, fontSize: 12, color: r.shares ? c.text : c.negative }}>{r.shares || "—"}</span>
+                    <span style={{ fontFamily: font.mono, fontSize: 12, color: r.cost ? c.text : c.negative }}>{r.cost ? `${r.currency !== "USD" ? r.currency + " " : "$"}${r.cost}` : "—"}</span>
+                    <span style={{ fontFamily: font.mono, fontSize: 11, color: c.text2 }}>{r.currency}</span>
+                  </div>
+                ))}
+              </div>
+              {importPreview.rows.filter(r => !r.valid).length > 0 && <div style={{ ...type.caption, color: c.warning }}>Rows highlighted in red are missing required fields and will be skipped.</div>}
+              <div style={{ display: "flex", gap: 10, justifyContent: "flex-end" }}>
+                <Button variant="secondary" onClick={() => setImportPreview(null)}>Cancel</Button>
+                {/* A cash-only sheet is importable too — the detected cash goes to Spare Cash even
+                    when there isn't a single valid security row. */}
+                {(() => {
+                  const validCount = importPreview.rows.filter(r => r.valid).length;
+                  const cashOnly = validCount === 0 && importPreview.cashDetected && importPreview.includeCash;
+                  return (
+                    <Button onClick={confirmImport} disabled={validCount === 0 && !cashOnly}>
+                      {cashOnly ? "Import cash only" : `Import ${validCount} holding${validCount === 1 ? "" : "s"}`}
+                    </Button>
+                  );
+                })()}
+              </div>
+            </div>
+          )}
+        </Modal>
+
+        <Modal open={confirmRemoveIdx != null} onClose={() => setConfirmRemoveIdx(null)} width={400}>
+          <Overline color={c.negative} style={{ marginBottom: 8 }}>Remove position</Overline>
+          <p style={{ ...type.body, color: c.text2, margin: "0 0 20px", lineHeight: 1.6 }}>
+            Remove <b style={{ color: c.text, fontFamily: font.mono }}>{holdings[confirmRemoveIdx]?.ticker}</b> ({fmtShares(holdings[confirmRemoveIdx]?.shares)} shares) from your portfolio? This can't be undone.
+          </p>
+          <div style={{ display: "flex", gap: 10, justifyContent: "flex-end" }}>
+            <Button variant="secondary" onClick={() => setConfirmRemoveIdx(null)}>Cancel</Button>
+            <Button variant="danger" onClick={() => { removeHolding(confirmRemoveIdx); setConfirmRemoveIdx(null); }}>Remove</Button>
+          </div>
+        </Modal>
+
+        <Modal open={confirmClearOpen} onClose={() => setConfirmClearOpen(false)} width={420}>
+          <Overline color={c.negative} style={{ marginBottom: 8 }}>Clear all holdings</Overline>
+          <p style={{ ...type.body, color: c.text2, margin: "0 0 20px", lineHeight: 1.6 }}>
+            Remove all {holdings.length} position{holdings.length !== 1 ? "s" : ""} from your portfolio? Your spare cash amount stays as-is, but the AI portfolio review will be cleared since it's tied to these positions. This can't be undone.
+          </p>
+          <div style={{ display: "flex", gap: 10, justifyContent: "flex-end" }}>
+            <Button variant="secondary" onClick={() => setConfirmClearOpen(false)}>Cancel</Button>
+            <Button variant="danger" onClick={clearAllHoldings}>Clear {holdings.length} holdings</Button>
+          </div>
+        </Modal>
+
+        <HelpChat />
+
+        <div style={{ marginLeft: isMobile ? 0 : 76, flex: 1, padding: isMobile ? "64px 14px calc(84px + env(safe-area-inset-bottom))" : "0 36px 60px", maxWidth: isMobile ? "100vw" : "calc(100vw - 76px)", boxSizing: "border-box", overflowX: "hidden" }}>
+          {!isMobile && <TopBar title={sectionTitle} onSearch={openTicker} />}
+          {/* No AnimatePresence/exit animation here on purpose: with mode="wait" the next screen
+              only mounts once the previous one's exit transition reports done, and a heavy tree
+              (e.g. a full research dossier with many animated children) can leave that exit
+              tracking stuck — the result is a permanently blank content pane with working nav.
+              A plain keyed enter-only transition can't get stuck this way: the old screen is
+              simply gone and the new one mounts immediately, whether or not anything animates. */}
+          <motion.div key={nav} initial={{ opacity: 0, y: 8 }} animate={{ opacity: 1, y: 0 }} transition={{ duration: 0.22, ease: [0.16,1,0.3,1] }} style={{ paddingTop: isMobile ? 0 : 28 }}>
+            <ScreenErrorBoundary key={nav}>
+              {screens[nav]}
+            </ScreenErrorBoundary>
+          </motion.div>
+          {/* The backtester lives OUTSIDE the keyed transition wrapper and is hidden rather than
+              unmounted — otherwise every tab switch threw away its results, params and stress
+              tests. Mounted lazily on first visit so its chunk still stays out of the first load. */}
+          {backtestMounted && (
+            <div style={{ display: nav === "backtest" ? undefined : "none", paddingTop: isMobile ? 0 : 28 }}>
+              <ScreenErrorBoundary>
+                <Suspense fallback={<Card><LoadingBlock title="Loading backtester…" /></Card>}>
+                  <Backtester initialTicker={result?.ticker || query} />
+                </Suspense>
+              </ScreenErrorBoundary>
+            </div>
+          )}
+
+          <footer style={{ marginTop: 44, paddingTop: 16, borderTop: `1px solid ${c.hairline}` }}>
+            <p style={{ ...type.caption, lineHeight: 1.6, color: c.text3, margin: 0 }}>Atlas surfaces research ideas for educational purposes only — not investment advice. All scores, calls and picks are AI-generated from public data and may be incomplete or outdated. Always conduct independent due diligence before any transaction.</p>
+          </footer>
+        </div>
       </div>
-    </div>
+    </AtlasMotionProvider>
   );
 }
+
+// ============================================================
+//  ICONS (consistent 1.7 stroke, currentColor)
+// ============================================================
+const sIcon = { fill: "none", stroke: "currentColor", strokeWidth: 1.7, strokeLinecap: "round", strokeLinejoin: "round" };
+function HomeIcon({ active }) { return <svg width="20" height="20" viewBox="0 0 24 24" {...sIcon} fill={active ? "currentColor" : "none"} fillOpacity={active ? 0.12 : 0}><path d="M3 10.5 12 3l9 7.5"/><path d="M5 9.5V21h14V9.5"/></svg>; }
+function CompassIcon({ active }) { return <svg width="20" height="20" viewBox="0 0 24 24" {...sIcon}><circle cx="12" cy="12" r="9" fill={active ? "currentColor" : "none"} fillOpacity={active ? 0.12 : 0}/><path d="m15.5 8.5-2 5-5 2 2-5 5-2Z"/></svg>; }
+function WalletIcon({ active }) { return <svg width="20" height="20" viewBox="0 0 24 24" {...sIcon}><rect x="3" y="6" width="18" height="13" rx="2" fill={active ? "currentColor" : "none"} fillOpacity={active ? 0.12 : 0}/><path d="M3 10h18M16 14h2"/></svg>; }
+function SearchIcon({ active, size = 20 }) { return <svg width={size} height={size} viewBox="0 0 24 24" {...sIcon}><circle cx="11" cy="11" r="7" fill={active ? "currentColor" : "none"} fillOpacity={active ? 0.12 : 0}/><path d="m20 20-3.2-3.2"/></svg>; }
+function ChartIcon({ active }) { return <svg width="20" height="20" viewBox="0 0 24 24" {...sIcon}><path d="M4 19V5M4 19h16"/><path d="m7 14 3-4 3 3 4-6"/></svg>; }
+function HelpIcon({ size = 20 }) { return <svg width={size} height={size} viewBox="0 0 24 24" {...sIcon}><circle cx="12" cy="12" r="9.5"/><path d="M9.2 9.2A2.8 2.8 0 0 1 12 6.5c1.5 0 2.8 1.1 2.8 2.6 0 1.7-1.7 2.2-1.7 3.9"/><circle cx="12" cy="17" r="0.9" fill="currentColor" stroke="none"/></svg>; }
+function CloseIcon() { return <svg width="18" height="18" viewBox="0 0 24 24" {...sIcon}><path d="M6 6l12 12M18 6 6 18"/></svg>; }
+function SignOutIcon() { return <svg width="18" height="18" viewBox="0 0 24 24" {...sIcon}><path d="M9 21H5a2 2 0 0 1-2-2V5a2 2 0 0 1 2-2h4"/><path d="m16 17 5-5-5-5M21 12H9"/></svg>; }
+function UploadIcon() { return <svg width="14" height="14" viewBox="0 0 24 24" {...sIcon}><path d="M12 16V4m0 0L7 9m5-5 5 5M4 20h16"/></svg>; }
+function PlusIcon() { return <svg width="14" height="14" viewBox="0 0 24 24" {...sIcon}><path d="M12 5v14M5 12h14"/></svg>; }
+function ChevronIcon({ open }) { return <svg width="14" height="14" viewBox="0 0 24 24" {...sIcon} style={{ transform: open ? "rotate(180deg)" : "none", transition: "transform .2s" }}><path d="m6 9 6 6 6-6"/></svg>; }

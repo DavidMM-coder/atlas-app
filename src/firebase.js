@@ -5,7 +5,7 @@ import {
   signInWithPhoneNumber, RecaptchaVerifier, signOut, onAuthStateChanged,
   sendPasswordResetEmail,
 } from "firebase/auth";
-import { getFirestore, doc, setDoc, serverTimestamp } from "firebase/firestore";
+import { getFirestore, doc, setDoc, getDoc, serverTimestamp } from "firebase/firestore";
 
 const configured = !!(
   import.meta.env.VITE_FIREBASE_API_KEY &&
@@ -41,6 +41,31 @@ export async function saveUserToFirestore(user) {
     phoneNumber: user.phoneNumber || null,
     lastSeen: serverTimestamp(),
   }, { merge: true });
+}
+
+// Cloud copy of what makes an account portable — profile, holdings, spare cash — stored on
+// the same users/{uid} doc the auth flow already writes identity fields to (so the existing
+// security rules that allow that write cover these fields too). This is what actually
+// delivers the sign-in screen's "remember your profile and holdings across devices" promise;
+// localStorage stays as the local cache / signed-out fallback.
+export async function loadUserData(uid) {
+  if (!db || !uid) return null;
+  try {
+    const snap = await getDoc(doc(db, "users", uid));
+    return snap.exists() ? snap.data() : null;
+  } catch (e) {
+    console.error("Failed to load cloud data:", e);
+    return null;
+  }
+}
+
+export async function saveUserData(uid, partial) {
+  if (!db || !uid || !partial) return;
+  try {
+    await setDoc(doc(db, "users", uid), { ...partial, dataUpdatedAt: serverTimestamp() }, { merge: true });
+  } catch (e) {
+    console.error("Failed to save cloud data:", e);
+  }
 }
 
 export {

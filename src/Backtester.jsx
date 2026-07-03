@@ -1,11 +1,11 @@
-import React, { useState } from "react";
-
-const P = {
-  paper: "#060a06", card: "#0b110b", ink: "#e8f5e9", slate: "#a5d6a7",
-  faint: "#4a7a4a", line: "#163016", accent: "#00e676", red: "#ff5252",
-  amber: "#ffab40", wash: "#080d08", cardBorder: "#1a301a", dim: "#1e3a1e",
-};
-const F = { sans: "Inter, sans-serif", mono: "'IBM Plex Mono', monospace" };
+import React, { useState, useEffect } from "react";
+import { color as c, font, type, radius, shadow } from "./ui/tokens.js";
+import {
+  Card, Button, Input, Field, Overline, SegmentedControl, Tabs, Badge,
+  InfoTip, ErrorBanner, LoadingBlock, EmptyState, motion,
+} from "./ui/primitives.jsx";
+import { sma, rsiCalc, calcStats, runBuyAndHold, runDCA, calcDCAStats } from "./lib/marketStats.js";
+import { apiUrl } from "./lib/api.js";
 
 const GLOSSARY = {
   "CAGR": "Compound Annual Growth Rate. The smoothed yearly return if your investment grew at a steady pace. $10,000 becoming $16,000 in 5 years = 9.9% CAGR.",
@@ -14,69 +14,29 @@ const GLOSSARY = {
   "Sharpe Ratio": "Return per unit of risk. Above 1.0 is decent, above 2.0 is excellent. A high Sharpe means you're getting good returns without wild swings.",
   "Volatility": "How wildly the portfolio value swings day to day. High = bigger ups and downs. Low = steadier ride. Annualised as a percentage.",
 };
-
-function BtTooltip({ term, children }) {
-  const [visible, setVisible] = useState(false);
+function BtTip({ term }) {
   const def = GLOSSARY[term];
-  if (!def) return <>{children || term}</>;
-  return (
-    <span style={{ position: "relative", display: "inline-flex", alignItems: "center", gap: 3 }}>
-      {children || term}
-      <span
-        onMouseEnter={() => setVisible(true)}
-        onMouseLeave={() => setVisible(false)}
-        style={{ display: "inline-flex", alignItems: "center", justifyContent: "center", width: 14, height: 14, borderRadius: "50%", border: `1px solid ${P.faint}`, fontFamily: F.sans, fontSize: 8, fontWeight: 700, color: P.faint, cursor: "default", flexShrink: 0 }}
-      >?</span>
-      {visible && (
-        <span style={{ position: "absolute", bottom: "calc(100% + 8px)", left: "50%", transform: "translateX(-50%)", width: 240, background: P.card, border: `1px solid ${P.accent}55`, borderRadius: 8, padding: "10px 12px", zIndex: 999, boxShadow: "0 4px 20px #000a", pointerEvents: "none" }}>
-          <span style={{ display: "block", fontFamily: F.sans, fontSize: 11, fontWeight: 700, color: P.accent, marginBottom: 4 }}>{term}</span>
-          <span style={{ display: "block", fontFamily: F.sans, fontSize: 11, color: P.slate, lineHeight: 1.5 }}>{def}</span>
-        </span>
-      )}
-    </span>
-  );
+  if (!def) return <>{term}</>;
+  return <InfoTip title={term} body={def}><span>{term}</span></InfoTip>;
 }
 
 // ── Helpers ───────────────────────────────────────────────────────────────────
-
 function daysBetween(dateA, dateB) {
   return Math.round((new Date(dateB) - new Date(dateA)) / 86400000);
 }
-
-function sma(prices, window) {
-  return prices.map((_, i) => {
-    if (i < window - 1) return null;
-    const slice = prices.slice(i - window + 1, i + 1);
-    return slice.reduce((a, b) => a + b, 0) / window;
-  });
+function addDays(dateStr, days) {
+  const d = new Date(dateStr);
+  d.setDate(d.getDate() + days);
+  return d.toISOString().slice(0, 10);
 }
-
-function rsiCalc(prices, period = 14) {
-  const result = Array(prices.length).fill(null);
-  if (prices.length < period + 1) return result;
-  let gains = 0, losses = 0;
-  for (let i = 1; i <= period; i++) {
-    const d = prices[i] - prices[i - 1];
-    if (d > 0) gains += d; else losses -= d;
-  }
-  let ag = gains / period, al = losses / period;
-  result[period] = 100 - 100 / (1 + ag / (al || 0.0001));
-  for (let i = period + 1; i < prices.length; i++) {
-    const d = prices[i] - prices[i - 1];
-    ag = (ag * (period - 1) + Math.max(d, 0)) / period;
-    al = (al * (period - 1) + Math.max(-d, 0)) / period;
-    result[i] = 100 - 100 / (1 + ag / (al || 0.0001));
-  }
-  return result;
-}
-
+// The date a quarter's numbers were actually PUBLIC — the SEC filing date when we have it,
+// else period end + a conservative lag. Trading on the fiscal period-END date is look-ahead
+// bias: a quarter ending Mar 31 typically isn't filed until ~May, so a backtest that "bought"
+// on Apr 2 used information nobody had, systematically inflating every fundamental strategy.
+const FILING_LAG_DAYS = 45;   // 10-Q statutory deadline ballpark for unknown filing dates
+const EARNINGS_LAG_DAYS = 40; // typical announce lag after quarter end (Yahoo gives no report date)
+function quarterKnownDate(q) { return q.filed || addDays(q.date, FILING_LAG_DAYS); }
 // ── Backtesting engines ───────────────────────────────────────────────────────
-
-function runBuyAndHold(prices, cash = 10000) {
-  const shares = cash / prices[0].close;
-  return prices.map(p => ({ date: p.date, value: shares * p.close }));
-}
-
 function runTechnicalStrategy(prices, strategy, params, cash, costPct) {
   const closes = prices.map(p => p.close);
   const equity = [{ date: prices[0].date, value: cash }];
@@ -100,10 +60,15 @@ function runTechnicalStrategy(prices, strategy, params, cash, costPct) {
       if (rsiVals[i] > params.overbought && rsiVals[i - 1] <= params.overbought) signals[i] = -1;
     }
   } else if (strategy === "momentum") {
+    // Signals must track their own position state — `position` isn't updated until the
+    // execution loop below runs (after this whole loop finishes), so checking it here would
+    // always see 0 and the sell branch could never fire (verified: strategy bought once and
+    // then held forever, since ret < -0.05 && position > 0 was always false).
+    let inPos = false;
     for (let i = params.lookback; i < closes.length; i++) {
       const ret = (closes[i] - closes[i - params.lookback]) / closes[i - params.lookback];
-      if (ret > 0.05 && position === 0) signals[i] = 1;
-      if (ret < -0.05 && position > 0) signals[i] = -1;
+      if (ret > 0.05 && !inPos) { signals[i] = 1; inPos = true; }
+      if (ret < -0.05 && inPos) { signals[i] = -1; inPos = false; }
     }
   }
 
@@ -122,7 +87,6 @@ function runTechnicalStrategy(prices, strategy, params, cash, costPct) {
   }
   return { equity, trades };
 }
-
 function runFundamentalStrategy(prices, strategy, params, cash, costPct, fundamentals) {
   const equity = [{ date: prices[0].date, value: cash }];
   let position = 0, cashHeld = cash;
@@ -130,52 +94,47 @@ function runFundamentalStrategy(prices, strategy, params, cash, costPct, fundame
 
   if (strategy === "earnings_momentum") {
     const { surpriseThreshold, holdDays } = params;
-    const earningsDates = (fundamentals.earnings || []).filter(e => e.surprisePct != null);
+    // e.date is Yahoo's fiscal quarter END — the surprise wasn't knowable until the earnings
+    // call weeks later. Model the announcement at quarter end + EARNINGS_LAG_DAYS so the buy
+    // window opens when the market could actually have reacted, not before.
+    const earningsDates = (fundamentals.earnings || [])
+      .filter(e => e.surprisePct != null)
+      .map(e => ({ ...e, announced: addDays(e.date, EARNINGS_LAG_DAYS) }));
     let holdUntil = -1;
-
     for (let i = 1; i < prices.length; i++) {
       const priceDate = prices[i].date;
-
       if (position === 0 && cashHeld > 0) {
         const hit = earningsDates.find(e => {
-          const d = daysBetween(e.date, priceDate);
+          const d = daysBetween(e.announced, priceDate);
           return d >= 0 && d <= 5 && e.surprisePct >= surpriseThreshold;
         });
         if (hit) {
           const shares = (cashHeld * (1 - costPct)) / prices[i].close;
-          position = shares;
-          cashHeld = 0;
-          holdUntil = i + holdDays;
+          position = shares; cashHeld = 0; holdUntil = i + holdDays;
           trades.push({ date: priceDate, type: "BUY", price: prices[i].close, shares, note: `${hit.surprisePct.toFixed(1)}% surprise` });
         }
       }
-
       if (position > 0 && i >= holdUntil && holdUntil > 0) {
         cashHeld = position * prices[i].close * (1 - costPct);
         trades.push({ date: priceDate, type: "SELL", price: prices[i].close, shares: position });
-        position = 0;
-        holdUntil = -1;
+        position = 0; holdUntil = -1;
       }
-
       equity.push({ date: priceDate, value: cashHeld + position * prices[i].close });
     }
-
   } else if (strategy === "pe_threshold") {
     const { buyPE, sellPE } = params;
     const qf = (fundamentals.quarterlyFinancials || []).filter(q => q.eps != null);
-
     for (let i = 1; i < prices.length; i++) {
       const priceDate = prices[i].date;
-      const knownQ = qf.filter(q => q.date <= priceDate);
-
+      // Only quarters whose filing was public by this date — not merely ended by it.
+      const knownQ = qf.filter(q => quarterKnownDate(q) <= priceDate);
       if (knownQ.length >= 4) {
         const trailingEPS = knownQ.slice(-4).reduce((s, q) => s + q.eps, 0);
         if (trailingEPS > 0) {
           const pe = prices[i].close / trailingEPS;
           if (pe < buyPE && position === 0 && cashHeld > 0) {
             const shares = (cashHeld * (1 - costPct)) / prices[i].close;
-            position = shares;
-            cashHeld = 0;
+            position = shares; cashHeld = 0;
             trades.push({ date: priceDate, type: "BUY", price: prices[i].close, shares, note: `P/E ${pe.toFixed(1)}` });
           } else if (pe > sellPE && position > 0) {
             cashHeld = position * prices[i].close * (1 - costPct);
@@ -184,38 +143,31 @@ function runFundamentalStrategy(prices, strategy, params, cash, costPct, fundame
           }
         }
       }
-
       equity.push({ date: priceDate, value: cashHeld + position * prices[i].close });
     }
-
   } else if (strategy === "revenue_acceleration") {
     const { minGrowth } = params;
     const qf = (fundamentals.quarterlyFinancials || []).filter(q => q.totalRevenue != null);
     const growthRates = [];
     for (let i = 4; i < qf.length; i++) {
       const curr = qf[i].totalRevenue, yearAgo = qf[i - 4]?.totalRevenue;
-      if (curr && yearAgo && yearAgo > 0) {
-        growthRates.push({ date: qf[i].date, yoy: (curr - yearAgo) / yearAgo * 100 });
-      }
+      // The YoY figure becomes computable only once the CURRENT quarter is filed.
+      if (curr && yearAgo && yearAgo > 0) growthRates.push({ date: qf[i].date, known: quarterKnownDate(qf[i]), yoy: (curr - yearAgo) / yearAgo * 100 });
     }
-
     let lastSignalDate = null;
     for (let i = 1; i < prices.length; i++) {
       const priceDate = prices[i].date;
-      const knownRates = growthRates.filter(r => r.date <= priceDate);
-
+      const knownRates = growthRates.filter(r => r.known <= priceDate);
       if (knownRates.length >= 2) {
         const latest = knownRates[knownRates.length - 1];
         const prev = knownRates[knownRates.length - 2];
         const accelerating = latest.yoy > prev.yoy && latest.yoy >= minGrowth;
-        const daysFromReport = daysBetween(latest.date, priceDate);
-
-        if (daysFromReport >= 0 && daysFromReport <= 10 && latest.date !== lastSignalDate) {
-          lastSignalDate = latest.date;
+        const daysFromReport = daysBetween(latest.known, priceDate);
+        if (daysFromReport >= 0 && daysFromReport <= 10 && latest.known !== lastSignalDate) {
+          lastSignalDate = latest.known;
           if (accelerating && position === 0 && cashHeld > 0) {
             const shares = (cashHeld * (1 - costPct)) / prices[i].close;
-            position = shares;
-            cashHeld = 0;
+            position = shares; cashHeld = 0;
             trades.push({ date: priceDate, type: "BUY", price: prices[i].close, shares, note: `Rev +${latest.yoy.toFixed(1)}% YoY↑` });
           } else if (!accelerating && position > 0) {
             cashHeld = position * prices[i].close * (1 - costPct);
@@ -224,37 +176,28 @@ function runFundamentalStrategy(prices, strategy, params, cash, costPct, fundame
           }
         }
       }
-
       equity.push({ date: priceDate, value: cashHeld + position * prices[i].close });
     }
-
   } else if (strategy === "dividend_reversion") {
     const { yieldPremium } = params;
     const divs = fundamentals.dividends || [];
     const yieldHistory = [];
-
     for (let i = 1; i < prices.length; i++) {
       const priceDate = prices[i].date;
-      const yearAgo = new Date(priceDate);
-      yearAgo.setFullYear(yearAgo.getFullYear() - 1);
+      const yearAgo = new Date(priceDate); yearAgo.setFullYear(yearAgo.getFullYear() - 1);
       const yearAgoStr = yearAgo.toISOString().slice(0, 10);
-
       const trailing = divs.filter(d => d.date > yearAgoStr && d.date <= priceDate);
       const annualDiv = trailing.reduce((s, d) => s + d.amount, 0);
-
       if (annualDiv > 0 && prices[i].close > 0) {
         const yld = annualDiv / prices[i].close;
         yieldHistory.push(yld);
-
         if (yieldHistory.length >= 60) {
           const window = yieldHistory.slice(-252);
           const avgYield = window.reduce((a, b) => a + b, 0) / window.length;
           const threshold = avgYield * (1 + yieldPremium / 100);
-
           if (yld >= threshold && position === 0 && cashHeld > 0) {
             const shares = (cashHeld * (1 - costPct)) / prices[i].close;
-            position = shares;
-            cashHeld = 0;
+            position = shares; cashHeld = 0;
             trades.push({ date: priceDate, type: "BUY", price: prices[i].close, shares, note: `Yield ${(yld * 100).toFixed(2)}%` });
           } else if (yld <= avgYield && position > 0) {
             cashHeld = position * prices[i].close * (1 - costPct);
@@ -263,53 +206,19 @@ function runFundamentalStrategy(prices, strategy, params, cash, costPct, fundame
           }
         }
       }
-
       equity.push({ date: priceDate, value: cashHeld + position * prices[i].close });
     }
   }
-
   return { equity, trades };
 }
-
 function runStrategy(prices, strategy, params, cash = 10000, costPct = 0.001, fundamentals = null) {
   const FUNDAMENTAL_IDS = ["earnings_momentum", "pe_threshold", "revenue_acceleration", "dividend_reversion"];
-  if (FUNDAMENTAL_IDS.includes(strategy)) {
-    return runFundamentalStrategy(prices, strategy, params, cash, costPct, fundamentals || {});
-  }
+  if (FUNDAMENTAL_IDS.includes(strategy)) return runFundamentalStrategy(prices, strategy, params, cash, costPct, fundamentals || {});
   return runTechnicalStrategy(prices, strategy, params, cash, costPct);
 }
-
-function calcStats(equityCurve, riskFreeRate = 0.05) {
-  const values = equityCurve.map(e => e.value);
-  const n = values.length;
-  if (n < 2) return {};
-  const start = values[0], end = values[n - 1];
-  const years = n / 252;
-  const cagr = (Math.pow(end / start, 1 / years) - 1) * 100;
-  const totalReturn = ((end - start) / start) * 100;
-  let peak = values[0], maxDD = 0;
-  for (const v of values) {
-    if (v > peak) peak = v;
-    const dd = (peak - v) / peak;
-    if (dd > maxDD) maxDD = dd;
-  }
-  const dailyRets = [];
-  for (let i = 1; i < values.length; i++) dailyRets.push((values[i] - values[i - 1]) / values[i - 1]);
-  const avgRet = dailyRets.reduce((a, b) => a + b, 0) / dailyRets.length;
-  const variance = dailyRets.reduce((a, b) => a + Math.pow(b - avgRet, 2), 0) / dailyRets.length;
-  const stdDev = Math.sqrt(variance) * Math.sqrt(252);
-  const sharpe = stdDev > 0 ? ((avgRet * 252) - riskFreeRate) / stdDev : 0;
-  return {
-    cagr: cagr.toFixed(2), totalReturn: totalReturn.toFixed(2),
-    maxDrawdown: (maxDD * 100).toFixed(2), sharpe: sharpe.toFixed(2),
-    volatility: (stdDev * 100).toFixed(2), finalValue: end.toFixed(2),
-  };
-}
-
 // ── SVG Chart ─────────────────────────────────────────────────────────────────
-
-function EquityChart({ strategy, buyhold, trades = [], width = 700, height = 320 }) {
-  const pad = { top: 20, right: 20, bottom: 40, left: 70 };
+function EquityChart({ strategy, buyhold, trades = [], width = 760, height = 340 }) {
+  const pad = { top: 20, right: 20, bottom: 40, left: 64 };
   const W = width - pad.left - pad.right;
   const H = height - pad.top - pad.bottom;
   const allVals = [...strategy.map(e => e.value), ...buyhold.map(e => e.value)];
@@ -327,47 +236,43 @@ function EquityChart({ strategy, buyhold, trades = [], width = 700, height = 320
   return (
     <svg viewBox={`0 0 ${width} ${height}`} style={{ width: "100%", height: "auto", display: "block" }}>
       <g transform={`translate(${pad.left},${pad.top})`}>
-        {yLabels.map((l, i) => <line key={i} x1={0} y1={l.y.toFixed(1)} x2={W} y2={l.y.toFixed(1)} stroke={P.dim} strokeWidth="1" strokeDasharray="4,4" />)}
-        {yLabels.map((l, i) => <text key={i} x={-8} y={l.y + 4} textAnchor="end" style={{ fontFamily: F.mono, fontSize: 10, fill: P.faint }}>${(l.v / 1000).toFixed(1)}k</text>)}
-        {xLabels.map((l, i) => <text key={i} x={x(l.idx)} y={H + 18} textAnchor="middle" style={{ fontFamily: F.mono, fontSize: 9, fill: P.faint }}>{l.date}</text>)}
-        <path d={toPath(buyhold)} fill="none" stroke={P.slate} strokeWidth="1.5" strokeDasharray="6,3" opacity="0.6" />
-        <path d={toPath(strategy)} fill="none" stroke={P.accent} strokeWidth="2" />
-        {buyTrades.slice(0, 60).map((t, i) => <circle key={i} cx={x(t.idx).toFixed(1)} cy={y(t.v).toFixed(1)} r="4" fill={P.accent} opacity="0.8" />)}
-        {sellTrades.slice(0, 60).map((t, i) => <circle key={i} cx={x(t.idx).toFixed(1)} cy={y(t.v).toFixed(1)} r="4" fill={P.red} opacity="0.8" />)}
-        <line x1={W - 160} y1={10} x2={W - 140} y2={10} stroke={P.accent} strokeWidth="2" />
-        <text x={W - 135} y={14} style={{ fontFamily: F.sans, fontSize: 11, fill: P.ink }}>Strategy</text>
-        <line x1={W - 60} y1={10} x2={W - 40} y2={10} stroke={P.slate} strokeWidth="1.5" strokeDasharray="6,3" opacity="0.6" />
-        <text x={W - 35} y={14} style={{ fontFamily: F.sans, fontSize: 11, fill: P.faint }}>B&H</text>
+        {yLabels.map((l, i) => <line key={i} x1={0} y1={l.y.toFixed(1)} x2={W} y2={l.y.toFixed(1)} stroke={c.grid} strokeWidth="1" />)}
+        {yLabels.map((l, i) => <text key={i} x={-10} y={l.y + 4} textAnchor="end" style={{ fontFamily: font.mono, fontSize: 10, fill: c.text3 }}>${(l.v / 1000).toFixed(1)}k</text>)}
+        {xLabels.map((l, i) => <text key={i} x={x(l.idx)} y={H + 20} textAnchor="middle" style={{ fontFamily: font.mono, fontSize: 9, fill: c.text3 }}>{l.date}</text>)}
+        <path d={toPath(buyhold)} fill="none" stroke={c.seriesAlt} strokeWidth="1.5" strokeDasharray="6,4" opacity="0.7" />
+        <motion.path d={toPath(strategy)} fill="none" stroke={c.accent} strokeWidth="2.2"
+          initial={{ pathLength: 0 }} animate={{ pathLength: 1 }} transition={{ duration: 0.6, ease: [0.16,1,0.3,1] }}
+          style={{ filter: `drop-shadow(0 0 5px ${c.accentGlow})` }} />
+        {buyTrades.slice(0, 300).map((t, i) => <circle key={i} cx={x(t.idx).toFixed(1)} cy={y(t.v).toFixed(1)} r="3.5" fill={c.positive} />)}
+        {sellTrades.slice(0, 300).map((t, i) => <circle key={i} cx={x(t.idx).toFixed(1)} cy={y(t.v).toFixed(1)} r="3.5" fill={c.negative} />)}
       </g>
     </svg>
   );
 }
 
 // ── Stat card ─────────────────────────────────────────────────────────────────
-
-function StatCard({ label, strategy, buyhold, good = "high", unit = "%" }) {
+function StatCard({ label, strategy, buyhold, good = "high", unit = "%", baseLabel = "B&H" }) {
   const sVal = parseFloat(strategy), bVal = parseFloat(buyhold);
   const stratWins = good === "high" ? sVal > bVal : sVal < bVal;
   const diff = sVal - bVal;
   return (
-    <div style={{ background: P.wash, border: `1px solid ${P.cardBorder}`, borderRadius: 8, padding: "14px 16px", minWidth: 130 }}>
-      <div style={{ fontFamily: F.sans, fontSize: 11, color: P.faint, marginBottom: 8 }}><BtTooltip term={label}>{label}</BtTooltip></div>
-      <div style={{ fontFamily: F.mono, fontSize: 22, fontWeight: 700, color: stratWins ? P.accent : P.red, marginBottom: 4 }}>{strategy}{unit}</div>
-      <div style={{ fontFamily: F.sans, fontSize: 11, color: P.faint }}>
-        B&H: <span style={{ color: P.slate, fontFamily: F.mono }}>{buyhold}{unit}</span>
-        {" "}<span style={{ color: stratWins ? P.accent : P.red, fontFamily: F.mono }}>{diff > 0 ? "+" : ""}{diff.toFixed(2)}{unit}</span>
+    <div style={{ background: c.surface2, border: `1px solid ${c.hairline}`, borderRadius: radius.sm, padding: "13px 16px", minWidth: 132, flex: "1 1 132px" }}>
+      <div style={{ ...type.caption, color: c.text3, marginBottom: 8 }}><BtTip term={label} /></div>
+      <div style={{ ...type.data, fontSize: 22, fontWeight: 600, color: stratWins ? c.positive : c.negative, marginBottom: 4 }}>{strategy}{unit}</div>
+      <div style={{ ...type.caption, color: c.text3 }}>
+        {baseLabel} <span style={{ color: c.text2, fontFamily: font.mono }}>{buyhold}{unit}</span>{" "}
+        <span style={{ color: stratWins ? c.positive : c.negative, fontFamily: font.mono }}>{diff > 0 ? "+" : ""}{diff.toFixed(2)}{unit}</span>
       </div>
     </div>
   );
 }
 
 // ── Fundamentals context panel ────────────────────────────────────────────────
-
 function FundamentalsPanel({ f }) {
   if (!f) return null;
   return (
-    <div style={{ background: P.card, border: `1px solid ${P.cardBorder}`, borderRadius: 8, padding: "16px 20px", marginBottom: 14 }}>
-      <div style={{ fontFamily: F.mono, fontSize: 10, letterSpacing: 1.5, color: P.faint, marginBottom: 14 }}>FUNDAMENTAL DATA USED</div>
+    <div>
+      <Overline color={c.text3} style={{ marginBottom: 14 }}>Fundamental data used</Overline>
       <div style={{ display: "grid", gridTemplateColumns: "repeat(auto-fill, minmax(140px, 1fr))", gap: 10, marginBottom: 16 }}>
         {[
           ["Trailing P/E", f.trailingPE != null ? f.trailingPE.toFixed(1) + "×" : "—"],
@@ -377,47 +282,44 @@ function FundamentalsPanel({ f }) {
           ["Rev Growth", f.revenueGrowth != null ? (f.revenueGrowth * 100).toFixed(1) + "%" : "—"],
           ["EPS Growth", f.earningsGrowth != null ? (f.earningsGrowth * 100).toFixed(1) + "%" : "—"],
         ].map(([label, val]) => (
-          <div key={label} style={{ background: P.wash, borderRadius: 6, padding: "10px 12px" }}>
-            <div style={{ fontFamily: F.sans, fontSize: 10, color: P.faint, marginBottom: 4 }}>{label}</div>
-            <div style={{ fontFamily: F.mono, fontSize: 14, fontWeight: 700, color: P.ink }}>{val}</div>
+          <div key={label} style={{ background: c.surface2, borderRadius: radius.xs, padding: "10px 12px" }}>
+            <div style={{ ...type.caption, color: c.text3, marginBottom: 4 }}>{label}</div>
+            <div style={{ ...type.data, fontWeight: 600, color: c.text }}>{val}</div>
           </div>
         ))}
       </div>
-
       {f.earnings?.length > 0 && (
         <div style={{ marginBottom: f.quarterlyFinancials?.length ? 14 : 0 }}>
-          <div style={{ fontFamily: F.sans, fontSize: 11, fontWeight: 600, color: P.faint, marginBottom: 8 }}>Earnings surprise history</div>
+          <div style={{ ...type.caption, fontWeight: 600, color: c.text3, marginBottom: 8 }}>Earnings surprise history</div>
           <div style={{ display: "flex", gap: 6, flexWrap: "wrap" }}>
             {f.earnings.map((e, i) => (
-              <div key={i} style={{ background: P.wash, borderRadius: 6, padding: "6px 10px", border: `1px solid ${e.surprisePct >= 5 ? P.accent + "44" : e.surprisePct < 0 ? P.red + "44" : P.dim}` }}>
-                <div style={{ fontFamily: F.mono, fontSize: 10, color: P.faint }}>{e.date}</div>
-                <div style={{ fontFamily: F.mono, fontSize: 13, fontWeight: 700, color: e.surprisePct >= 5 ? P.accent : e.surprisePct < 0 ? P.red : P.amber }}>
+              <div key={i} style={{ background: c.surface2, borderRadius: radius.xs, padding: "6px 10px", border: `1px solid ${e.surprisePct >= 5 ? "rgba(61,220,132,0.3)" : e.surprisePct < 0 ? "rgba(255,92,92,0.3)" : c.hairline}` }}>
+                <div style={{ fontFamily: font.mono, fontSize: 10, color: c.text3 }}>{e.date}</div>
+                <div style={{ fontFamily: font.mono, fontSize: 13, fontWeight: 600, color: e.surprisePct >= 5 ? c.positive : e.surprisePct < 0 ? c.negative : c.warning }}>
                   {e.surprisePct != null ? (e.surprisePct > 0 ? "+" : "") + e.surprisePct.toFixed(1) + "%" : "—"}
                 </div>
-                <div style={{ fontFamily: F.sans, fontSize: 10, color: P.faint }}>A: {e.actual?.toFixed(2)} / E: {e.estimate?.toFixed(2)}</div>
+                <div style={{ ...type.caption, color: c.text3 }}>A: {e.actual?.toFixed(2)} / E: {e.estimate?.toFixed(2)}</div>
               </div>
             ))}
           </div>
         </div>
       )}
-
       {f.quarterlyFinancials?.length > 0 && (
         <div>
-          <div style={{ fontFamily: F.sans, fontSize: 11, fontWeight: 600, color: P.faint, marginBottom: 8 }}>Quarterly revenue</div>
+          <div style={{ ...type.caption, fontWeight: 600, color: c.text3, marginBottom: 8 }}>Quarterly revenue</div>
           <div style={{ display: "flex", gap: 6, flexWrap: "wrap" }}>
             {f.quarterlyFinancials.map((q, i) => (
-              <div key={i} style={{ background: P.wash, borderRadius: 6, padding: "6px 10px" }}>
-                <div style={{ fontFamily: F.mono, fontSize: 10, color: P.faint }}>{q.date}</div>
-                <div style={{ fontFamily: F.mono, fontSize: 13, fontWeight: 700, color: P.ink }}>{q.totalRevenue ? `$${(q.totalRevenue / 1e9).toFixed(1)}B` : "—"}</div>
-                <div style={{ fontFamily: F.sans, fontSize: 10, color: P.faint }}>EPS: {q.eps?.toFixed(2) ?? "—"}</div>
+              <div key={i} style={{ background: c.surface2, borderRadius: radius.xs, padding: "6px 10px" }}>
+                <div style={{ fontFamily: font.mono, fontSize: 10, color: c.text3 }}>{q.date}</div>
+                <div style={{ fontFamily: font.mono, fontSize: 13, fontWeight: 600, color: c.text }}>{q.totalRevenue ? `$${(q.totalRevenue / 1e9).toFixed(1)}B` : "—"}</div>
+                <div style={{ ...type.caption, color: c.text3 }}>EPS: {q.eps?.toFixed(2) ?? "—"}</div>
               </div>
             ))}
           </div>
         </div>
       )}
-
       {f.dividends?.length > 0 && (
-        <div style={{ marginTop: 12, fontFamily: F.sans, fontSize: 12, color: P.faint }}>
+        <div style={{ marginTop: 12, ...type.caption, color: c.text3 }}>
           {f.dividends.length} dividend payments on record · latest ${f.dividends[f.dividends.length - 1]?.amount?.toFixed(4)} on {f.dividends[f.dividends.length - 1]?.date}
         </div>
       )}
@@ -426,84 +328,54 @@ function FundamentalsPanel({ f }) {
 }
 
 // ── Strategy definitions ──────────────────────────────────────────────────────
-
 const STRATEGIES = [
-  {
-    id: "sma_crossover", name: "SMA Crossover", type: "technical",
-    origin: "Wall Street, mid-1900s",
+  { id: "sma_crossover", name: "SMA Crossover", type: "technical", origin: "Wall Street, mid-1900s",
     desc: "Buy on golden cross (fast MA crosses above slow MA), sell on death cross.",
-    params: [
-      { id: "fast", label: "Fast SMA (days)", default: 50, min: 5, max: 100 },
-      { id: "slow", label: "Slow SMA (days)", default: 200, min: 20, max: 400 },
-    ],
-  },
-  {
-    id: "rsi_mean_reversion", name: "RSI Mean Reversion", type: "technical",
-    origin: "J. Welles Wilder Jr., 1978",
+    params: [ { id: "fast", label: "Fast SMA (days)", default: 50, min: 5, max: 100 }, { id: "slow", label: "Slow SMA (days)", default: 200, min: 20, max: 400 } ] },
+  { id: "rsi_mean_reversion", name: "RSI Mean Reversion", type: "technical", origin: "J. Welles Wilder Jr., 1978",
     desc: "Buy when RSI dips into oversold territory, sell when it reaches overbought.",
-    params: [
-      { id: "period", label: "RSI Period", default: 14, min: 5, max: 30 },
-      { id: "oversold", label: "Oversold threshold", default: 30, min: 10, max: 45 },
-      { id: "overbought", label: "Overbought threshold", default: 70, min: 55, max: 90 },
-    ],
-  },
-  {
-    id: "momentum", name: "Price Momentum", type: "technical",
-    origin: "Jegadeesh & Titman, 1993",
+    params: [ { id: "period", label: "RSI Period", default: 14, min: 5, max: 30 }, { id: "oversold", label: "Oversold threshold", default: 30, min: 10, max: 45 }, { id: "overbought", label: "Overbought threshold", default: 70, min: 55, max: 90 } ] },
+  { id: "momentum", name: "Price Momentum", type: "technical", origin: "Jegadeesh & Titman, 1993",
     desc: "Buy when price is up >5% over lookback period, sell when down >5%.",
-    params: [
-      { id: "lookback", label: "Lookback (days)", default: 90, min: 20, max: 252 },
-    ],
-  },
-  {
-    id: "earnings_momentum", name: "Earnings Surprise Momentum", type: "fundamental",
-    origin: "Post-earnings drift (PEAD) — Bernard & Thomas, 1989",
+    params: [ { id: "lookback", label: "Lookback (days)", default: 90, min: 20, max: 252 } ] },
+  { id: "earnings_momentum", name: "Earnings Surprise Momentum", type: "fundamental", origin: "Post-earnings drift (PEAD) — Bernard & Thomas, 1989",
     desc: "Buy within days of a positive earnings surprise. Captures the drift where markets under-react to beats. Hold for a set period then exit.",
-    dataNote: "Uses last 4 quarters of earnings data from Yahoo Finance.",
-    params: [
-      { id: "surpriseThreshold", label: "Min surprise (%)", default: 5, min: 1, max: 30 },
-      { id: "holdDays", label: "Hold period (trading days)", default: 60, min: 10, max: 180 },
-    ],
-  },
-  {
-    id: "pe_threshold", name: "P/E Value Threshold", type: "fundamental",
-    origin: "Benjamin Graham — The Intelligent Investor, 1949",
+    dataNote: "Earnings history and surprise % come from Yahoo Finance (last 4 reported quarters — that's all Yahoo exposes for analyst estimates). Yahoo dates quarters by fiscal period end, so buys are modeled ~40 days later to approximate the real announcement date — no trading on numbers before they were public.",
+    params: [ { id: "surpriseThreshold", label: "Min surprise (%)", default: 5, min: 1, max: 30 }, { id: "holdDays", label: "Hold period (trading days)", default: 60, min: 10, max: 180 } ] },
+  { id: "pe_threshold", name: "P/E Value Threshold", type: "fundamental", origin: "Benjamin Graham — The Intelligent Investor, 1949",
     desc: "Buy when trailing P/E falls below a value threshold. Sell when it rises into expensive territory. Graham-style: only buy when the price is objectively cheap.",
-    dataNote: "Computes trailing P/E from quarterly EPS. Needs 4+ quarters of data to activate.",
-    params: [
-      { id: "buyPE", label: "Buy when P/E below", default: 15, min: 5, max: 30 },
-      { id: "sellPE", label: "Sell when P/E above", default: 25, min: 15, max: 60 },
-    ],
-  },
-  {
-    id: "revenue_acceleration", name: "Revenue Growth Acceleration", type: "fundamental",
-    origin: "Peter Lynch / growth investing, popularised 1980s–90s",
+    dataNote: "Computes trailing P/E from quarterly EPS sourced from SEC filings — typically years of history. Signals only fire once a quarter's 10-Q was actually filed (real SEC filing date, or a conservative 45-day lag when unknown) — no look-ahead.",
+    params: [ { id: "buyPE", label: "Buy when P/E below", default: 15, min: 5, max: 30 }, { id: "sellPE", label: "Sell when P/E above", default: 25, min: 15, max: 60 } ] },
+  { id: "revenue_acceleration", name: "Revenue Growth Acceleration", type: "fundamental", origin: "Peter Lynch / growth investing, popularised 1980s–90s",
     desc: "Buy when YoY revenue growth accelerates quarter-over-quarter. Exit when growth decelerates. Captures the early stage of a growth inflection before the market fully prices it in.",
-    dataNote: "Needs 8+ quarters of revenue history to compute YoY acceleration.",
-    params: [
-      { id: "minGrowth", label: "Min YoY growth to buy (%)", default: 0, min: -20, max: 30 },
-    ],
-  },
-  {
-    id: "dividend_reversion", name: "Dividend Yield Reversion", type: "fundamental",
-    origin: "Dogs of the Dow / income investing, 1970s–present",
+    dataNote: "Needs 8+ quarters of revenue history to compute YoY acceleration — sourced from SEC filings (usually years of quarters). Signals fire on the SEC filing date (or a conservative 45-day lag when unknown), never on the quarter-end date itself — no look-ahead.",
+    params: [ { id: "minGrowth", label: "Min YoY growth to buy (%)", default: 0, min: -20, max: 30 } ] },
+  { id: "dividend_reversion", name: "Dividend Yield Reversion", type: "fundamental", origin: "Dogs of the Dow / income investing, 1970s–present",
     desc: "Buy when dividend yield spikes above its historical average — which happens when the price falls. Sell when yield normalises. Classic income investor entry signal.",
     dataNote: "Uses full dividend payment history. Only works for dividend-paying stocks (e.g. JNJ, KO, T).",
-    params: [
-      { id: "yieldPremium", label: "Buy when yield above avg by (%)", default: 25, min: 10, max: 75 },
-    ],
-  },
+    params: [ { id: "yieldPremium", label: "Buy when yield above avg by (%)", default: 25, min: 10, max: 75 } ] },
+  { id: "dca", name: "Dollar-Cost Averaging", type: "passive", origin: "Passive investing classic",
+    desc: "Invest a fixed amount every month, regardless of price, instead of a lump sum on day one. Removes market-timing risk — you're always buying at the average price over time. The question most long-term investors actually have.",
+    params: [ { id: "monthlyAmount", label: "Monthly contribution ($)", default: 500, min: 50, max: 5000 } ] },
 ];
+const RANGES = [ { value: "1y", label: "1Y" }, { value: "2y", label: "2Y" }, { value: "5y", label: "5Y" }, { value: "10y", label: "10Y" } ];
 
-const RANGES = [
-  { v: "1y", label: "1Y" }, { v: "2y", label: "2Y" },
-  { v: "5y", label: "5Y" }, { v: "10y", label: "10Y" },
-];
+// Hoisted (not defined inside the render body) so React reconciles instead of remounting the
+// whole strategy list on every parent state change.
+function StratBtn({ s, on, onSelect }) {
+  return (
+    <button onClick={onSelect} className="atlas-btn" aria-pressed={on}
+      style={{ textAlign: "left", padding: "9px 12px", borderRadius: radius.sm, cursor: "pointer", width: "100%",
+        border: `1px solid ${on ? c.accentBorder : c.hairline}`, background: on ? c.accentSoft : "transparent" }}>
+      <div style={{ ...type.bodyStrong, fontSize: 13, color: on ? c.accent : c.text }}>{s.name}</div>
+      <div style={{ ...type.caption, color: c.text3 }}>{s.origin}</div>
+    </button>
+  );
+}
 
 // ── Main component ────────────────────────────────────────────────────────────
-
-export default function Backtester() {
-  const [ticker, setTicker] = useState("");
+export default function Backtester({ initialTicker } = {}) {
+  const [ticker, setTicker] = useState(initialTicker || "");
   const [range, setRange] = useState("5y");
   const [stratId, setStratId] = useState("sma_crossover");
   const [costPct, setCostPct] = useState("0.1");
@@ -515,21 +387,27 @@ export default function Backtester() {
   const [multiTickers, setMultiTickers] = useState("");
   const [multiResult, setMultiResult] = useState(null);
   const [multiLoading, setMultiLoading] = useState(false);
+  const [resTab, setResTab] = useState("trades");
+
+  // The component stays mounted across tab switches now — adopt a new suggested ticker (e.g.
+  // "Explore in Backtester" from a fresh dossier) only while nothing has been run yet, so a
+  // finished backtest is never clobbered.
+  useEffect(() => { if (initialTicker && !result && !loading) setTicker(initialTicker); }, [initialTicker]); // eslint-disable-line react-hooks/exhaustive-deps
 
   const strat = STRATEGIES.find(s => s.id === stratId);
   const getParam = id => paramVals[stratId + "_" + id] ?? strat.params.find(p => p.id === id)?.default;
   const setParam = (id, v) => setParamVals(prev => ({ ...prev, [stratId + "_" + id]: Number(v) }));
   const isFundamental = strat.type === "fundamental";
+  const isDCA = strat.type === "passive";
 
   async function fetchPrices(t, r = range) {
-    const resp = await fetch(`/api/history?ticker=${encodeURIComponent(t)}&range=${r}`);
+    const resp = await fetch(apiUrl(`/api/history?ticker=${encodeURIComponent(t)}&range=${r}`));
     const data = await resp.json();
     if (data.error) throw new Error(data.error);
     return data;
   }
-
   async function fetchFundamentals(t) {
-    const resp = await fetch(`/api/fundamentals?ticker=${encodeURIComponent(t)}`);
+    const resp = await fetch(apiUrl(`/api/fundamentals?ticker=${encodeURIComponent(t)}`));
     const data = await resp.json();
     if (data.error) throw new Error(`Fundamentals: ${data.error}`);
     return data;
@@ -540,369 +418,339 @@ export default function Backtester() {
     setLoading(true); setError(null); setResult(null);
     try {
       const t = ticker.trim().toUpperCase();
-      // Always fetch max range for fundamental strategies so we get all available fundamental data,
-      // then clip prices to the window covered by that data.
       const fetchRange = isFundamental ? "10y" : range;
       const [priceData, fundamentals] = await Promise.all([
         fetchPrices(t, fetchRange),
         isFundamental ? fetchFundamentals(t) : Promise.resolve(null),
       ]);
-
       if (priceData.prices.length < 60) throw new Error("Not enough price history for this range.");
-
       let prices = priceData.prices;
       let dataWindow = null;
-
       if (isFundamental && fundamentals) {
-        // Determine the earliest price date where we have enough fundamental data
         const qf = (fundamentals.quarterlyFinancials || []).filter(q => q.eps != null || q.totalRevenue != null);
         const earningsDates = (fundamentals.earnings || []).map(e => e.date).sort();
         const divDates = (fundamentals.dividends || []).map(d => d.date).sort();
-
         let clipFrom = null;
-
-        if (stratId === "pe_threshold") {
-          // Need 4 quarters of EPS before we can compute trailing P/E
-          const epsQ = qf.filter(q => q.eps != null);
-          clipFrom = epsQ.length >= 4 ? epsQ[3].date : epsQ[0]?.date ?? null;
-        } else if (stratId === "revenue_acceleration") {
-          // Need 8 quarters for YoY + acceleration comparison
-          const revQ = qf.filter(q => q.totalRevenue != null);
-          clipFrom = revQ.length >= 8 ? revQ[7].date : revQ[0]?.date ?? null;
-        } else if (stratId === "earnings_momentum") {
-          clipFrom = earningsDates[0] ?? null;
-        } else if (stratId === "dividend_reversion") {
-          clipFrom = divDates[0] ?? null;
-        }
-
-        // Also apply the user-selected range as an additional constraint
+        if (stratId === "pe_threshold") { const epsQ = qf.filter(q => q.eps != null); clipFrom = epsQ.length >= 4 ? quarterKnownDate(epsQ[3]) : (epsQ[0] ? quarterKnownDate(epsQ[0]) : null); }
+        else if (stratId === "revenue_acceleration") { const revQ = qf.filter(q => q.totalRevenue != null); clipFrom = revQ.length >= 8 ? quarterKnownDate(revQ[7]) : (revQ[0] ? quarterKnownDate(revQ[0]) : null); }
+        else if (stratId === "earnings_momentum") { clipFrom = earningsDates[0] ?? null; }
+        else if (stratId === "dividend_reversion") { clipFrom = divDates[0] ?? null; }
         const rangeYears = { "1y": 1, "2y": 2, "5y": 5, "10y": 10 };
         const yearsBack = rangeYears[range] ?? 5;
-        const rangeStart = new Date();
-        rangeStart.setFullYear(rangeStart.getFullYear() - yearsBack);
+        const rangeStart = new Date(); rangeStart.setFullYear(rangeStart.getFullYear() - yearsBack);
         const rangeStartStr = rangeStart.toISOString().slice(0, 10);
-
-        // Use the later of clipFrom and rangeStart
         const effectiveStart = clipFrom && clipFrom > rangeStartStr ? clipFrom : rangeStartStr;
         const clipped = prices.filter(p => p.date >= effectiveStart);
-
         if (clipped.length >= 60) {
           prices = clipped;
           dataWindow = { from: prices[0].date, to: prices[prices.length - 1].date, clipped: prices.length < priceData.prices.length };
         } else if (clipFrom) {
-          // Relax: just use available fundamental data period regardless of user range
           const looseClip = prices.filter(p => p.date >= clipFrom);
-          if (looseClip.length >= 30) {
-            prices = looseClip;
-            dataWindow = { from: prices[0].date, to: prices[prices.length - 1].date, clipped: true, warning: `Only ${looseClip.length} trading days of fundamental data available` };
-          }
+          if (looseClip.length >= 30) { prices = looseClip; dataWindow = { from: prices[0].date, to: prices[prices.length - 1].date, clipped: true, warning: `Only ${looseClip.length} trading days of fundamental data available` }; }
         }
       }
-
       const params = {};
       strat.params.forEach(p => { params[p.id] = getParam(p.id); });
-      const initialCash = parseFloat(cash) || 10000;
       const cost = parseFloat(costPct) / 100;
-
-      const bh = runBuyAndHold(prices, initialCash);
-      const { equity, trades } = runStrategy(prices, stratId, params, initialCash, cost, fundamentals);
-
+      let bh, equity, trades, invested = null;
+      if (isDCA) {
+        // DCA isn't "start with $X lump sum" — it's "commit $X every month". The honest comparison
+        // is against a lump sum of the SAME total amount actually contributed, not the Capital field
+        // (which doesn't apply here), so buy-and-hold is built from the DCA run's own invested total.
+        const dca = runDCA(prices, params.monthlyAmount, cost);
+        equity = dca.equity; trades = dca.trades; invested = dca.invested;
+        bh = runBuyAndHold(prices, invested, cost);
+      } else {
+        const initialCash = parseFloat(cash) || 10000;
+        bh = runBuyAndHold(prices, initialCash, cost);
+        ({ equity, trades } = runStrategy(prices, stratId, params, initialCash, cost, fundamentals));
+      }
       if (equity.length < 2) throw new Error("Strategy produced no equity curve — try a longer range or different parameters.");
-
-      const stratStats = calcStats(equity);
+      const stratStats = isDCA ? calcDCAStats({ equity, trades, invested }) : calcStats(equity);
       const bhStats = calcStats(bh);
       const stratCAGR = parseFloat(stratStats.cagr);
       const bhCAGR = parseFloat(bhStats.cagr);
-
       setResult({
-        ticker: priceData.ticker, name: priceData.name,
-        equity, bh, trades, stratStats, bhStats,
-        beats: stratCAGR > bhCAGR,
-        margin: Math.abs(stratCAGR - bhCAGR).toFixed(2),
-        totalTrades: trades.length,
-        fundamentals,
-        dataWindow,
+        ticker: priceData.ticker, name: priceData.name, equity, bh, trades, stratStats, bhStats,
+        beats: stratCAGR > bhCAGR, margin: Math.abs(stratCAGR - bhCAGR).toFixed(2),
+        totalTrades: trades.length, fundamentals, dataWindow, invested,
       });
-    } catch (e) {
-      setError(e.message || "Something went wrong.");
-    } finally {
-      setLoading(false);
-    }
+      setResTab(fundamentals ? "fundamentals" : "trades");
+    } catch (e) { setError(e.message || "Something went wrong."); }
+    finally { setLoading(false); }
   }
 
   async function runMultiStress() {
     const tickers = multiTickers.split(/[\s,]+/).map(t => t.trim().toUpperCase()).filter(Boolean);
     if (!tickers.length) return;
     setMultiLoading(true); setMultiResult(null);
-    const results = [];
-    const fetchRange = isFundamental ? "max" : range;
+    // "max" range silently returns quarterly (not daily) candles from Yahoo despite requesting
+    // interval=1d — that broke the date-based clip below (too few points to pass its length
+    // check) and let 42 years of quarterly data flow into calcStats(), which assumes daily rows
+    // (years = n/252) and produced a "13,752,097% CAGR". "10y" reliably returns daily data,
+    // matching the single-ticker path in runBacktest() above.
+    const fetchRange = isFundamental ? "10y" : range;
     const rangeYears = { "1y": 1, "2y": 2, "5y": 5, "10y": 10 };
     const yearsBack = rangeYears[range] ?? 5;
     const rangeStartStr = (() => { const d = new Date(); d.setFullYear(d.getFullYear() - yearsBack); return d.toISOString().slice(0, 10); })();
-
-    for (const t of tickers.slice(0, 8)) {
+    // All tickers fetched concurrently — a sequential loop made an 8-ticker fundamental stress
+    // test take 8× the single-ticker latency for no reason.
+    const results = await Promise.all(tickers.slice(0, 8).map(async (t) => {
       try {
         const [priceData, fundamentals] = await Promise.all([
           fetchPrices(t, fetchRange),
           isFundamental ? fetchFundamentals(t) : Promise.resolve(null),
         ]);
-        if (priceData.prices.length < 60) { results.push({ ticker: t, error: "Not enough data" }); continue; }
-
+        if (priceData.prices.length < 60) return { ticker: t, error: "Not enough data" };
         let prices = priceData.prices;
         if (isFundamental && fundamentals) {
           const qf = (fundamentals.quarterlyFinancials || []).filter(q => q.eps != null || q.totalRevenue != null);
           let clipFrom = null;
-          if (stratId === "pe_threshold") { const epsQ = qf.filter(q => q.eps != null); clipFrom = epsQ.length >= 4 ? epsQ[3].date : epsQ[0]?.date ?? null; }
-          else if (stratId === "revenue_acceleration") { const revQ = qf.filter(q => q.totalRevenue != null); clipFrom = revQ.length >= 8 ? revQ[7].date : revQ[0]?.date ?? null; }
+          if (stratId === "pe_threshold") { const epsQ = qf.filter(q => q.eps != null); clipFrom = epsQ.length >= 4 ? quarterKnownDate(epsQ[3]) : (epsQ[0] ? quarterKnownDate(epsQ[0]) : null); }
+          else if (stratId === "revenue_acceleration") { const revQ = qf.filter(q => q.totalRevenue != null); clipFrom = revQ.length >= 8 ? quarterKnownDate(revQ[7]) : (revQ[0] ? quarterKnownDate(revQ[0]) : null); }
           else if (stratId === "earnings_momentum") { clipFrom = (fundamentals.earnings || [])[0]?.date ?? null; }
           else if (stratId === "dividend_reversion") { clipFrom = (fundamentals.dividends || [])[0]?.date ?? null; }
           const effectiveStart = clipFrom && clipFrom > rangeStartStr ? clipFrom : rangeStartStr;
           const clipped = prices.filter(p => p.date >= effectiveStart);
           if (clipped.length >= 30) prices = clipped;
         }
-
         const params = {};
         strat.params.forEach(p => { params[p.id] = getParam(p.id); });
-        const initialCash = parseFloat(cash) || 10000;
         const cost = parseFloat(costPct) / 100;
-        const bh = runBuyAndHold(prices, initialCash);
-        const { equity } = runStrategy(prices, stratId, params, initialCash, cost, fundamentals);
-        const ss = calcStats(equity), bs = calcStats(bh);
-        results.push({ ticker: t, name: priceData.name, stratCAGR: parseFloat(ss.cagr), bhCAGR: parseFloat(bs.cagr), beats: parseFloat(ss.cagr) > parseFloat(bs.cagr), sharpe: ss.sharpe, maxDD: ss.maxDrawdown });
-      } catch (e) {
-        results.push({ ticker: t, error: e.message });
-      }
-    }
+        let bh, equity, ss;
+        if (isDCA) {
+          const dca = runDCA(prices, params.monthlyAmount, cost);
+          equity = dca.equity;
+          bh = runBuyAndHold(prices, dca.invested, cost);
+          ss = calcDCAStats(dca);
+        } else {
+          const initialCash = parseFloat(cash) || 10000;
+          bh = runBuyAndHold(prices, initialCash, cost);
+          ({ equity } = runStrategy(prices, stratId, params, initialCash, cost, fundamentals));
+          ss = calcStats(equity);
+        }
+        const bs = calcStats(bh);
+        return { ticker: t, name: priceData.name, stratCAGR: parseFloat(ss.cagr), bhCAGR: parseFloat(bs.cagr), beats: parseFloat(ss.cagr) > parseFloat(bs.cagr), sharpe: ss.sharpe, maxDD: ss.maxDrawdown };
+      } catch (e) { return { ticker: t, error: e.message }; }
+    }));
     setMultiResult(results);
     setMultiLoading(false);
   }
 
-  const inputStyle = { width: "100%", boxSizing: "border-box", fontFamily: F.mono, fontSize: 14, color: P.ink, background: P.wash, border: `1px solid ${P.dim}`, borderRadius: 6, padding: "9px 12px" };
-  const labelStyle = { fontFamily: F.sans, fontSize: 11, fontWeight: 600, color: P.faint, marginBottom: 5, display: "block" };
   const technical = STRATEGIES.filter(s => s.type === "technical");
   const fundamental = STRATEGIES.filter(s => s.type === "fundamental");
+  const passive = STRATEGIES.filter(s => s.type === "passive");
 
   return (
-    <div style={{ paddingBottom: 60 }}>
-      <style>{`.bt-btn{transition:all .15s}.bt-btn:hover{filter:brightness(1.15)}.bt-input:focus{outline:none;border-color:${P.accent}!important;box-shadow:0 0 0 2px ${P.accent}22}`}</style>
-
+    <div style={{ paddingBottom: 40 }}>
       <div style={{ marginBottom: 20 }}>
-        <h2 style={{ fontFamily: F.sans, fontWeight: 700, fontSize: 22, color: P.ink, margin: "0 0 4px" }}>Strategy Backtester</h2>
-        <p style={{ fontFamily: F.sans, fontSize: 13, color: P.faint, margin: 0 }}>Does this strategy actually beat buy-and-hold after costs — or does it just look like it does?</p>
+        <h2 style={{ ...type.displayL, fontSize: 30, color: c.text, margin: "0 0 6px" }}>Strategy Backtester</h2>
+        <p style={{ ...type.body, color: c.text3, margin: 0 }}>Does this strategy actually beat buy-and-hold after costs — or does it just look like it does?</p>
       </div>
 
-      <div style={{ display: "grid", gridTemplateColumns: "1fr 1fr", gap: 12, marginBottom: 12 }}>
-        {/* Setup */}
-        <div style={{ background: P.card, border: `1px solid ${P.cardBorder}`, borderRadius: 8, padding: "18px 20px" }}>
-          <div style={{ fontFamily: F.mono, fontSize: 10, letterSpacing: 1.5, color: P.accent, opacity: 0.7, marginBottom: 14, textTransform: "uppercase" }}>Setup</div>
-          <div style={{ display: "flex", flexDirection: "column", gap: 12 }}>
-            <div>
-              <label style={labelStyle}>Ticker</label>
-              <input className="bt-input" style={{ ...inputStyle, color: P.accent, fontWeight: 700, fontSize: 16, textTransform: "uppercase" }}
-                value={ticker} onChange={e => setTicker(e.target.value)} onKeyDown={e => e.key === "Enter" && runBacktest()} placeholder="e.g. AAPL" />
+      <div style={{ display: "grid", gridTemplateColumns: "minmax(0, 340px) 1fr", gap: 16, alignItems: "start" }} className="bt-grid">
+        {/* ── Config rail ── */}
+        <div style={{ display: "flex", flexDirection: "column", gap: 12, position: "sticky", top: 16 }}>
+          <Card pad={18}>
+            <Overline color={c.accent} style={{ marginBottom: 14 }}>Setup</Overline>
+            <div style={{ display: "flex", flexDirection: "column", gap: 14 }}>
+              <Field label="Ticker">
+                <Input mono value={ticker} onChange={e => setTicker(e.target.value)} onKeyDown={e => e.key === "Enter" && runBacktest()} placeholder="e.g. AAPL"
+                  style={{ color: c.accent, fontWeight: 700, fontSize: 16, textTransform: "uppercase" }} />
+              </Field>
+              <Field label="Historical range">
+                <SegmentedControl value={range} onChange={setRange} options={RANGES} size="sm" style={{ width: "100%", justifyContent: "stretch" }} />
+              </Field>
+              <div style={{ display: "grid", gridTemplateColumns: isDCA ? "1fr" : "1fr 1fr", gap: 10 }}>
+                {!isDCA && <Field label="Capital ($)"><Input mono value={cash} onChange={e => setCash(e.target.value)} inputMode="decimal" /></Field>}
+                <Field label="Cost (%)"><Input mono value={costPct} onChange={e => setCostPct(e.target.value)} inputMode="decimal" placeholder="0.1" /></Field>
+              </div>
+              {isDCA && <p style={{ ...type.caption, color: c.text3, margin: 0 }}>DCA ignores the Capital field — it invests the monthly amount below on a recurring schedule instead of a lump sum.</p>}
             </div>
-            <div>
-              <label style={labelStyle}>Historical range</label>
-              <div style={{ display: "flex", gap: 6 }}>
-                {RANGES.map(r => (
-                  <button key={r.v} onClick={() => setRange(r.v)} className="bt-btn" style={{ flex: 1, padding: "8px 4px", borderRadius: 6, border: `1.5px solid ${range === r.v ? P.accent : P.dim}`, background: range === r.v ? `${P.accent}18` : "transparent", fontFamily: F.sans, fontSize: 13, fontWeight: 600, color: range === r.v ? P.accent : P.slate, cursor: "pointer" }}>{r.label}</button>
+          </Card>
+
+          <Card pad={18}>
+            <Overline color={c.text3} style={{ marginBottom: 10 }}>Technical</Overline>
+            <div style={{ display: "flex", flexDirection: "column", gap: 6, marginBottom: 16 }}>{technical.map(s => <StratBtn key={s.id} s={s} on={stratId === s.id} onSelect={() => setStratId(s.id)} />)}</div>
+            <Overline color={c.warning} style={{ marginBottom: 10 }}>Fundamental</Overline>
+            <div style={{ display: "flex", flexDirection: "column", gap: 6, marginBottom: 16 }}>{fundamental.map(s => <StratBtn key={s.id} s={s} on={stratId === s.id} onSelect={() => setStratId(s.id)} />)}</div>
+            <Overline color={c.positive} style={{ marginBottom: 10 }}>Passive</Overline>
+            <div style={{ display: "flex", flexDirection: "column", gap: 6 }}>{passive.map(s => <StratBtn key={s.id} s={s} on={stratId === s.id} onSelect={() => setStratId(s.id)} />)}</div>
+          </Card>
+        </div>
+
+        {/* ── Results canvas ── */}
+        <div style={{ display: "flex", flexDirection: "column", gap: 12, minWidth: 0 }}>
+          {/* Strategy detail + params */}
+          <Card pad={18} accentEdge style={{ borderLeftColor: isFundamental ? c.warning : isDCA ? c.positive : c.accent }}>
+            <div style={{ display: "flex", alignItems: "center", gap: 8, marginBottom: 6, flexWrap: "wrap" }}>
+              <span style={{ ...type.heading, color: c.text }}>{strat.name}</span>
+              <Badge tone={isFundamental ? "warning" : isDCA ? "positive" : "accent"}>{isFundamental ? "Fundamental" : isDCA ? "Passive" : "Technical"}</Badge>
+            </div>
+            <p style={{ ...type.small, color: c.text3, margin: "0 0 6px" }}>{strat.desc}</p>
+            {strat.dataNote && <p style={{ ...type.caption, color: c.text3, margin: "0 0 8px", fontStyle: "italic" }}>{strat.dataNote}</p>}
+            {isFundamental && <p style={{ ...type.caption, color: c.warning, margin: "0 0 12px" }}>Fundamental data availability varies by ticker and strategy (see the note above) — the backtest is automatically clipped to the period where data actually exists, so your selected range is a maximum, not a guarantee.</p>}
+            {strat.params.length > 0 && (
+              <div style={{ display: "grid", gridTemplateColumns: "repeat(auto-fill, minmax(170px, 1fr))", gap: 10, marginTop: 12 }}>
+                {strat.params.map(p => (
+                  <Field key={p.id} label={p.label}>
+                    <Input mono type="number" value={getParam(p.id)} min={p.min} max={p.max} onChange={e => setParam(p.id, e.target.value)} />
+                  </Field>
                 ))}
               </div>
-            </div>
-            <div style={{ display: "grid", gridTemplateColumns: "1fr 1fr", gap: 10 }}>
-              <div>
-                <label style={labelStyle}>Starting capital ($)</label>
-                <input className="bt-input" style={inputStyle} value={cash} onChange={e => setCash(e.target.value)} inputMode="decimal" />
-              </div>
-              <div>
-                <label style={labelStyle}>Transaction cost (%)</label>
-                <input className="bt-input" style={inputStyle} value={costPct} onChange={e => setCostPct(e.target.value)} inputMode="decimal" placeholder="0.1" />
-              </div>
-            </div>
-          </div>
-        </div>
+            )}
+            <Button size="lg" full glow loading={loading} disabled={!ticker.trim()} onClick={runBacktest} style={{ marginTop: 16, background: isFundamental ? c.warning : isDCA ? c.positive : c.accent, borderColor: isFundamental ? c.warning : isDCA ? c.positive : c.accent, color: "#0B0B10" }}>
+              {loading ? (isFundamental ? "Fetching fundamentals…" : "Running backtest…") : "Run Backtest"}
+            </Button>
+          </Card>
 
-        {/* Strategy picker */}
-        <div style={{ background: P.card, border: `1px solid ${P.cardBorder}`, borderRadius: 8, padding: "18px 20px", display: "flex", flexDirection: "column", gap: 14, overflowY: "auto", maxHeight: 420 }}>
-          <div>
-            <div style={{ fontFamily: F.mono, fontSize: 10, letterSpacing: 1.5, color: P.slate, marginBottom: 8, textTransform: "uppercase" }}>Technical</div>
-            <div style={{ display: "flex", flexDirection: "column", gap: 5 }}>
-              {technical.map(s => (
-                <button key={s.id} onClick={() => setStratId(s.id)} className="bt-btn" style={{ textAlign: "left", padding: "8px 12px", borderRadius: 6, border: `1.5px solid ${stratId === s.id ? P.accent : P.dim}`, background: stratId === s.id ? `${P.accent}18` : "transparent", cursor: "pointer" }}>
-                  <div style={{ fontFamily: F.sans, fontWeight: 600, fontSize: 13, color: stratId === s.id ? P.accent : P.ink }}>{s.name}</div>
-                  <div style={{ fontFamily: F.sans, fontSize: 11, color: P.faint }}>{s.origin}</div>
-                </button>
-              ))}
-            </div>
-          </div>
-          <div>
-            <div style={{ fontFamily: F.mono, fontSize: 10, letterSpacing: 1.5, color: P.amber, marginBottom: 8, textTransform: "uppercase" }}>Fundamental</div>
-            <div style={{ display: "flex", flexDirection: "column", gap: 5 }}>
-              {fundamental.map(s => (
-                <button key={s.id} onClick={() => setStratId(s.id)} className="bt-btn" style={{ textAlign: "left", padding: "8px 12px", borderRadius: 6, border: `1.5px solid ${stratId === s.id ? P.amber : P.dim}`, background: stratId === s.id ? `${P.amber}18` : "transparent", cursor: "pointer" }}>
-                  <div style={{ fontFamily: F.sans, fontWeight: 600, fontSize: 13, color: stratId === s.id ? P.amber : P.ink }}>{s.name}</div>
-                  <div style={{ fontFamily: F.sans, fontSize: 11, color: P.faint }}>{s.origin}</div>
-                </button>
-              ))}
-            </div>
-          </div>
-        </div>
-      </div>
+          {error && <ErrorBanner msg={error} onRetry={runBacktest} />}
 
-      {/* Strategy detail + params */}
-      <div style={{ background: P.card, border: `1px solid ${isFundamental ? P.amber + "55" : P.cardBorder}`, borderRadius: 8, padding: "16px 20px", marginBottom: 12 }}>
-        <div style={{ display: "flex", alignItems: "center", gap: 8, marginBottom: 6 }}>
-          <span style={{ fontFamily: F.sans, fontWeight: 700, fontSize: 15, color: P.ink }}>{strat.name}</span>
-          <span style={{ fontFamily: F.sans, fontSize: 11, fontWeight: 600, padding: "2px 8px", borderRadius: 20, background: isFundamental ? `${P.amber}22` : `${P.accent}18`, color: isFundamental ? P.amber : P.accent }}>
-            {isFundamental ? "Fundamental" : "Technical"}
-          </span>
-        </div>
-        <p style={{ fontFamily: F.sans, fontSize: 13, color: P.faint, margin: "0 0 6px" }}>{strat.desc}</p>
-        {strat.dataNote && <p style={{ fontFamily: F.sans, fontSize: 12, color: P.faint, margin: "0 0 8px", fontStyle: "italic" }}>{strat.dataNote}</p>}
-        {isFundamental && (
-          <p style={{ fontFamily: F.sans, fontSize: 12, color: P.amber, margin: "0 0 14px" }}>
-            ⚠ Yahoo Finance only provides ~4–8 quarters of fundamental data. The backtest will be automatically clipped to the period where data is available — your selected range is used as a maximum, not a guarantee.
-          </p>
-        )}
-        {strat.params.length > 0 && (
-          <div style={{ display: "grid", gridTemplateColumns: "repeat(auto-fill, minmax(180px, 1fr))", gap: 10, marginTop: strat.dataNote ? 0 : 14 }}>
-            {strat.params.map(p => (
-              <div key={p.id}>
-                <label style={labelStyle}>{p.label}</label>
-                <input className="bt-input" style={inputStyle} type="number" value={getParam(p.id)} min={p.min} max={p.max} onChange={e => setParam(p.id, e.target.value)} />
-              </div>
-            ))}
-          </div>
-        )}
-      </div>
-
-      <button onClick={runBacktest} disabled={loading || !ticker.trim()} className="bt-btn"
-        style={{ width: "100%", padding: "13px", fontFamily: F.sans, fontWeight: 700, fontSize: 15, color: "#000", background: isFundamental ? P.amber : P.accent, border: "none", borderRadius: 8, cursor: loading || !ticker.trim() ? "default" : "pointer", opacity: loading || !ticker.trim() ? 0.6 : 1, marginBottom: 20 }}>
-        {loading ? (isFundamental ? "Fetching fundamentals + running backtest…" : "Running backtest…") : "▶ Run Backtest"}
-      </button>
-
-      {error && <div style={{ padding: "12px 16px", background: `${P.red}11`, border: `1px solid ${P.red}44`, borderLeft: `3px solid ${P.red}`, borderRadius: 6, marginBottom: 16, fontFamily: F.sans, fontSize: 13, color: P.red }}>⚠ {error}</div>}
-
-      {result && (
-        <div>
-          <div style={{ padding: "16px 20px", marginBottom: 14, background: result.beats ? `${P.accent}12` : `${P.red}12`, border: `1px solid ${result.beats ? P.accent : P.red}44`, borderLeft: `3px solid ${result.beats ? P.accent : P.red}`, borderRadius: 8 }}>
-            <div style={{ fontFamily: F.mono, fontSize: 10, letterSpacing: 2, color: result.beats ? P.accent : P.red, marginBottom: 6 }}>HONEST VERDICT</div>
-            <p style={{ fontFamily: F.sans, fontSize: 15, fontWeight: 600, color: P.ink, margin: "0 0 4px" }}>
-              {result.beats
-                ? `✓ ${strat.name} beat buy-and-hold by ${result.margin}% CAGR on ${result.ticker} over ${range}.`
-                : `✗ Buy-and-hold beat ${strat.name} by ${result.margin}% CAGR on ${result.ticker} over ${range}.`}
-            </p>
-            <p style={{ fontFamily: F.sans, fontSize: 13, color: P.faint, margin: 0 }}>
-              {result.totalTrades} trades executed · {parseFloat(costPct)}% cost per trade
-              {result.totalTrades === 0 && " · No signals triggered — try adjusting parameters or using a longer range"}
-              {!result.beats && result.totalTrades > 0 && " · Most active strategies underperform simple buy-and-hold after costs"}
-            </p>
-          </div>
-
-          <div style={{ display: "flex", gap: 10, flexWrap: "wrap", marginBottom: 14 }}>
-            <StatCard label="CAGR" strategy={result.stratStats.cagr} buyhold={result.bhStats.cagr} />
-            <StatCard label="Total Return" strategy={result.stratStats.totalReturn} buyhold={result.bhStats.totalReturn} />
-            <StatCard label="Max Drawdown" strategy={result.stratStats.maxDrawdown} buyhold={result.bhStats.maxDrawdown} good="low" />
-            <StatCard label="Sharpe Ratio" strategy={result.stratStats.sharpe} buyhold={result.bhStats.sharpe} unit="" />
-            <StatCard label="Volatility" strategy={result.stratStats.volatility} buyhold={result.bhStats.volatility} good="low" />
-          </div>
-
-          {result.dataWindow && (
-            <div style={{ display: "flex", alignItems: "center", gap: 10, padding: "10px 14px", marginBottom: 10, background: `${P.amber}10`, border: `1px solid ${P.amber}44`, borderRadius: 7 }}>
-              <span style={{ fontFamily: F.mono, fontSize: 10, color: P.amber }}>DATA WINDOW</span>
-              <span style={{ fontFamily: F.sans, fontSize: 12, color: P.slate }}>
-                Backtest clipped to <strong style={{ fontFamily: F.mono, color: P.ink }}>{result.dataWindow.from}</strong> → <strong style={{ fontFamily: F.mono, color: P.ink }}>{result.dataWindow.to}</strong> — this is the period covered by available fundamental data.
-                {result.dataWindow.warning && <span style={{ color: P.amber }}> {result.dataWindow.warning}.</span>}
-              </span>
-            </div>
+          {!result && !loading && !error && (
+            <Card><EmptyState title="No backtest yet" hint="Pick a strategy, enter a ticker, and run it to see whether it beats a simple buy-and-hold after trading costs." /></Card>
           )}
 
-          <div style={{ background: P.card, border: `1px solid ${P.cardBorder}`, borderRadius: 8, padding: "16px 20px", marginBottom: 14 }}>
-            <div style={{ fontFamily: F.mono, fontSize: 10, letterSpacing: 1.5, color: P.faint, marginBottom: 12 }}>
-              EQUITY CURVE — {result.ticker} · {result.dataWindow ? `${result.dataWindow.from.slice(0,7)} → ${result.dataWindow.to.slice(0,7)}` : range} · ● buy  ● sell  ╌ buy-and-hold
-            </div>
-            <EquityChart strategy={result.equity} buyhold={result.bh} trades={result.trades} />
-          </div>
+          {result && (
+            <>
+              {/* Verdict */}
+              <Card accentEdge pad={18} style={{ borderLeftColor: result.beats ? c.positive : c.negative, background: result.beats ? c.positiveSoft : c.negativeSoft }}>
+                <Overline color={result.beats ? c.positive : c.negative} style={{ marginBottom: 6 }}>Honest verdict</Overline>
+                <p style={{ ...type.bodyL, fontWeight: 600, color: c.text, margin: "0 0 4px" }}>
+                  {isDCA
+                    ? (result.beats
+                      ? `Dollar-cost averaging $${getParam("monthlyAmount")}/month beat a lump sum of the same ${result.invested ? `$${Math.round(result.invested).toLocaleString()}` : "total"} by ${result.margin}% CAGR on ${result.ticker} over ${range}.`
+                      : `A lump sum of the same ${result.invested ? `$${Math.round(result.invested).toLocaleString()}` : "total"} beat dollar-cost averaging $${getParam("monthlyAmount")}/month by ${result.margin}% CAGR on ${result.ticker} over ${range}.`)
+                    : (result.beats
+                      ? `${strat.name} beat buy-and-hold by ${result.margin}% CAGR on ${result.ticker} over ${range}.`
+                      : `Buy-and-hold beat ${strat.name} by ${result.margin}% CAGR on ${result.ticker} over ${range}.`)}
+                </p>
+                <p style={{ ...type.small, color: c.text3, margin: 0 }}>
+                  {isDCA
+                    ? `${result.totalTrades} monthly contributions · ${parseFloat(costPct)}% cost per buy · $${result.invested ? Math.round(result.invested).toLocaleString() : "0"} total invested`
+                    : <>
+                        {result.totalTrades} trades executed · {parseFloat(costPct)}% cost per trade
+                        {result.totalTrades === 0 && " · No signals triggered — try adjusting parameters or a longer range"}
+                        {!result.beats && result.totalTrades > 0 && " · Most active strategies underperform simple buy-and-hold after costs"}
+                      </>}
+                </p>
+              </Card>
 
-          {result.fundamentals && <FundamentalsPanel f={result.fundamentals} />}
+              {/* Stats */}
+              <div style={{ display: "flex", gap: 10, flexWrap: "wrap" }}>
+                <StatCard label="CAGR" strategy={result.stratStats.cagr} buyhold={result.bhStats.cagr} baseLabel={isDCA ? "Lump" : "B&H"} />
+                <StatCard label="Total Return" strategy={result.stratStats.totalReturn} buyhold={result.bhStats.totalReturn} baseLabel={isDCA ? "Lump" : "B&H"} />
+                <StatCard label="Max Drawdown" strategy={result.stratStats.maxDrawdown} buyhold={result.bhStats.maxDrawdown} good="low" baseLabel={isDCA ? "Lump" : "B&H"} />
+                <StatCard label="Sharpe Ratio" strategy={result.stratStats.sharpe} buyhold={result.bhStats.sharpe} unit="" baseLabel={isDCA ? "Lump" : "B&H"} />
+                <StatCard label="Volatility" strategy={result.stratStats.volatility} buyhold={result.bhStats.volatility} good="low" baseLabel={isDCA ? "Lump" : "B&H"} />
+              </div>
 
-          {result.trades.length > 0 && (
-            <div style={{ background: P.card, border: `1px solid ${P.cardBorder}`, borderRadius: 8, padding: "16px 20px", marginBottom: 14 }}>
-              <div style={{ fontFamily: F.mono, fontSize: 10, letterSpacing: 1.5, color: P.faint, marginBottom: 12 }}>TRADE LOG ({result.trades.length} trades)</div>
-              <div style={{ maxHeight: 220, overflowY: "auto" }}>
-                <div style={{ display: "grid", gridTemplateColumns: "120px 60px 100px 80px 1fr", gap: 8, padding: "6px 0", borderBottom: `1px solid ${P.dim}`, marginBottom: 4 }}>
-                  {["Date", "Type", "Price", "Shares", "Signal"].map(h => <span key={h} style={{ fontFamily: F.sans, fontSize: 10, fontWeight: 600, color: P.faint, textTransform: "uppercase" }}>{h}</span>)}
+              {result.dataWindow && (
+                <div style={{ display: "flex", alignItems: "center", gap: 10, padding: "10px 14px", background: c.warningSoft, border: `1px solid rgba(251,184,69,0.32)`, borderRadius: radius.sm, flexWrap: "wrap" }}>
+                  <Badge tone="warning">Data window</Badge>
+                  <span style={{ ...type.caption, color: c.text2 }}>
+                    Clipped to <strong style={{ fontFamily: font.mono, color: c.text }}>{result.dataWindow.from}</strong> → <strong style={{ fontFamily: font.mono, color: c.text }}>{result.dataWindow.to}</strong> — the period covered by available fundamental data.
+                    {result.dataWindow.warning && <span style={{ color: c.warning }}> {result.dataWindow.warning}.</span>}
+                  </span>
                 </div>
-                {result.trades.map((t, i) => (
-                  <div key={i} style={{ display: "grid", gridTemplateColumns: "120px 60px 100px 80px 1fr", gap: 8, padding: "5px 0", borderBottom: `1px solid ${P.dim}33` }}>
-                    <span style={{ fontFamily: F.mono, fontSize: 12, color: P.faint }}>{t.date}</span>
-                    <span style={{ fontFamily: F.sans, fontWeight: 700, fontSize: 12, color: t.type === "BUY" ? P.accent : P.red }}>{t.type}</span>
-                    <span style={{ fontFamily: F.mono, fontSize: 12, color: P.ink }}>${t.price.toFixed(2)}</span>
-                    <span style={{ fontFamily: F.mono, fontSize: 12, color: P.faint }}>{t.shares.toFixed(4)}</span>
-                    <span style={{ fontFamily: F.sans, fontSize: 11, color: P.faint }}>{t.note || ""}</span>
+              )}
+
+              {/* Chart */}
+              <Card pad={18}>
+                <div style={{ display: "flex", alignItems: "center", justifyContent: "space-between", marginBottom: 12, flexWrap: "wrap", gap: 8 }}>
+                  <Overline color={c.text3}>Equity curve — {result.ticker}</Overline>
+                  <div style={{ display: "flex", gap: 14, ...type.caption, color: c.text3 }}>
+                    <span style={{ display: "flex", alignItems: "center", gap: 6 }}><span style={{ width: 12, height: 2, background: c.accent, display: "inline-block" }} /> {isDCA ? "DCA" : "Strategy"}</span>
+                    <span style={{ display: "flex", alignItems: "center", gap: 6 }}><span style={{ width: 12, height: 2, background: c.seriesAlt, display: "inline-block" }} /> {isDCA ? "Lump sum (same total)" : "Buy & hold"}</span>
+                    <span style={{ display: "flex", alignItems: "center", gap: 6 }}><span style={{ width: 7, height: 7, borderRadius: 99, background: c.positive, display: "inline-block" }} /> {isDCA ? "Monthly buy" : "Buy"}</span>
+                    {!isDCA && <span style={{ display: "flex", alignItems: "center", gap: 6 }}><span style={{ width: 7, height: 7, borderRadius: 99, background: c.negative, display: "inline-block" }} /> Sell</span>}
+                  </div>
+                </div>
+                <EquityChart strategy={result.equity} buyhold={result.bh} trades={result.trades} />
+              </Card>
+
+              {/* Trade log + fundamentals tabs */}
+              {(result.trades.length > 0 || result.fundamentals) && (
+                <Card pad={18}>
+                  <Tabs value={resTab} onChange={setResTab} style={{ marginBottom: 16 }}
+                    items={[
+                      ...(result.fundamentals ? [{ value: "fundamentals", label: "Fundamentals" }] : []),
+                      ...(result.trades.length ? [{ value: "trades", label: `Trade log (${result.trades.length})` }] : []),
+                    ]} />
+                  {resTab === "fundamentals" && result.fundamentals && <FundamentalsPanel f={result.fundamentals} />}
+                  {resTab === "trades" && result.trades.length > 0 && (
+                    <div style={{ maxHeight: 280, overflowY: "auto" }}>
+                      <div style={{ display: "grid", gridTemplateColumns: "120px 60px 100px 80px 1fr", gap: 8, padding: "6px 0", borderBottom: `1px solid ${c.hairline}`, marginBottom: 4 }}>
+                        {["Date", "Type", "Price", "Shares", "Signal"].map(h => <span key={h} style={{ ...type.overline, color: c.text3 }}>{h}</span>)}
+                      </div>
+                      {result.trades.map((t, i) => (
+                        <div key={i} style={{ display: "grid", gridTemplateColumns: "120px 60px 100px 80px 1fr", gap: 8, padding: "6px 0", borderBottom: `1px solid ${c.hairline}` }}>
+                          <span style={{ fontFamily: font.mono, fontSize: 12, color: c.text3 }}>{t.date}</span>
+                          <span style={{ ...type.bodyStrong, fontSize: 12, color: t.type === "BUY" ? c.positive : c.negative }}>{t.type}</span>
+                          <span style={{ fontFamily: font.mono, fontSize: 12, color: c.text }}>${t.price.toFixed(2)}</span>
+                          <span style={{ fontFamily: font.mono, fontSize: 12, color: c.text3 }}>{t.shares.toFixed(4)}</span>
+                          <span style={{ ...type.caption, color: c.text3 }}>{t.note || ""}</span>
+                        </div>
+                      ))}
+                    </div>
+                  )}
+                </Card>
+              )}
+            </>
+          )}
+
+          {/* Stress test */}
+          <Card pad={18}>
+            <Overline color={c.accent} style={{ marginBottom: 6 }}>Stress test — does it work everywhere?</Overline>
+            <p style={{ ...type.small, color: c.text3, margin: "0 0 12px" }}>
+              Run the same strategy across multiple tickers. If it only wins on some, that's overfitting.
+              {isFundamental ? " Fundamental strategies fetch extra data per ticker — allow extra time." : ""}
+            </p>
+            <div style={{ display: "flex", gap: 10, alignItems: "flex-end", flexWrap: "wrap" }}>
+              <Field label="Tickers (comma or space separated, max 8)" style={{ flex: "1 1 240px" }}>
+                <Input mono value={multiTickers} onChange={e => setMultiTickers(e.target.value)} placeholder="AAPL MSFT TSLA AMZN GOOGL" />
+              </Field>
+              <Button loading={multiLoading} disabled={!multiTickers.trim()} onClick={runMultiStress}>Run stress test</Button>
+            </div>
+            {multiResult && (
+              <div style={{ marginTop: 16, overflowX: "auto" }}>
+                <div style={{ display: "grid", gridTemplateColumns: "70px 1fr 86px 86px 70px 80px 76px", gap: 8, padding: "6px 0", borderBottom: `1px solid ${c.hairline}`, minWidth: 540 }}>
+                  {["Ticker", "Name", "Strat CAGR", "B&H CAGR", "Sharpe", "Max DD", "Result"].map(h => <span key={h} style={{ ...type.overline, color: c.text3 }}>{h}</span>)}
+                </div>
+                {multiResult.map((r, i) => r.error ? (
+                  <div key={i} style={{ display: "grid", gridTemplateColumns: "70px 1fr", gap: 8, padding: "8px 0", borderBottom: `1px solid ${c.hairline}`, minWidth: 540 }}>
+                    <span style={{ fontFamily: font.mono, fontSize: 12, color: c.accent }}>{r.ticker}</span>
+                    <span style={{ ...type.caption, color: c.negative }}>{r.error}</span>
+                  </div>
+                ) : (
+                  <div key={i} style={{ display: "grid", gridTemplateColumns: "70px 1fr 86px 86px 70px 80px 76px", gap: 8, padding: "8px 0", borderBottom: `1px solid ${c.hairline}`, minWidth: 540, alignItems: "center" }}>
+                    <span style={{ fontFamily: font.mono, fontWeight: 700, fontSize: 12, color: c.accent }}>{r.ticker}</span>
+                    <span style={{ ...type.caption, color: c.text3, overflow: "hidden", textOverflow: "ellipsis", whiteSpace: "nowrap" }}>{r.name}</span>
+                    <span style={{ fontFamily: font.mono, fontSize: 12, color: r.stratCAGR >= 0 ? c.positive : c.negative }}>{r.stratCAGR.toFixed(1)}%</span>
+                    <span style={{ fontFamily: font.mono, fontSize: 12, color: c.text2 }}>{r.bhCAGR.toFixed(1)}%</span>
+                    <span style={{ fontFamily: font.mono, fontSize: 12, color: c.text3 }}>{r.sharpe}</span>
+                    <span style={{ fontFamily: font.mono, fontSize: 12, color: c.warning }}>{r.maxDD}%</span>
+                    <span style={{ ...type.bodyStrong, fontSize: 11, color: r.beats ? c.positive : c.negative }}>{r.beats ? "Beats" : "Loses"}</span>
                   </div>
                 ))}
+                {(() => {
+                  const wins = multiResult.filter(r => !r.error && r.beats).length;
+                  const total = multiResult.filter(r => !r.error).length;
+                  const rate = total > 0 ? wins / total : 0;
+                  const tone = rate < 0.5 ? c.negative : rate < 0.75 ? c.warning : c.positive;
+                  return total > 1 && (
+                    <div style={{ marginTop: 12, padding: "10px 14px", background: `${tone}1a`, border: `1px solid ${tone}55`, borderRadius: radius.sm, ...type.small, color: tone }}>
+                      {rate < 0.5 ? `Beats buy-and-hold on only ${wins}/${total} tickers — likely overfit to specific conditions.`
+                        : rate < 0.75 ? `Mixed results: beats B&H on ${wins}/${total} tickers. Strategy is sensitive to the asset.`
+                        : `Strong consistency: beats buy-and-hold on ${wins}/${total} tickers.`}
+                    </div>
+                  );
+                })()}
               </div>
-            </div>
-          )}
+            )}
+          </Card>
         </div>
-      )}
-
-      {/* Stress test */}
-      <div style={{ background: P.card, border: `1px solid ${P.cardBorder}`, borderRadius: 8, padding: "18px 20px" }}>
-        <div style={{ fontFamily: F.mono, fontSize: 10, letterSpacing: 1.5, color: P.accent, opacity: 0.7, marginBottom: 6, textTransform: "uppercase" }}>Stress Test — does it work everywhere?</div>
-        <p style={{ fontFamily: F.sans, fontSize: 13, color: P.faint, margin: "0 0 12px" }}>
-          Run the same strategy across multiple tickers. If it only wins on some, that's overfitting.
-          {isFundamental ? " Fundamental strategies fetch extra data per ticker — allow extra time." : ""}
-        </p>
-        <div style={{ display: "flex", gap: 10, alignItems: "flex-end" }}>
-          <div style={{ flex: 1 }}>
-            <label style={labelStyle}>Tickers (comma or space separated, max 8)</label>
-            <input className="bt-input" style={inputStyle} value={multiTickers} onChange={e => setMultiTickers(e.target.value)} placeholder="AAPL MSFT TSLA AMZN GOOGL" />
-          </div>
-          <button onClick={runMultiStress} disabled={multiLoading || !multiTickers.trim()} className="bt-btn"
-            style={{ padding: "9px 20px", fontFamily: F.sans, fontWeight: 700, fontSize: 13, color: "#000", background: P.accent, border: "none", borderRadius: 6, cursor: multiLoading || !multiTickers.trim() ? "default" : "pointer", opacity: multiLoading || !multiTickers.trim() ? 0.6 : 1, whiteSpace: "nowrap" }}>
-            {multiLoading ? "Testing…" : "Run stress test"}
-          </button>
-        </div>
-        {multiResult && (
-          <div style={{ marginTop: 14 }}>
-            <div style={{ display: "grid", gridTemplateColumns: "80px 1fr 90px 90px 90px 90px 80px", gap: 8, padding: "6px 0", borderBottom: `1px solid ${P.dim}` }}>
-              {["Ticker", "Name", "Strat CAGR", "B&H CAGR", "Sharpe", "Max DD", "Result"].map(h => (
-                <span key={h} style={{ fontFamily: F.sans, fontSize: 10, fontWeight: 600, color: P.faint, textTransform: "uppercase" }}>{h}</span>
-              ))}
-            </div>
-            {multiResult.map((r, i) => r.error ? (
-              <div key={i} style={{ display: "grid", gridTemplateColumns: "80px 1fr", gap: 8, padding: "8px 0", borderBottom: `1px solid ${P.dim}22` }}>
-                <span style={{ fontFamily: F.mono, fontSize: 12, color: P.accent }}>{r.ticker}</span>
-                <span style={{ fontFamily: F.sans, fontSize: 12, color: P.red }}>{r.error}</span>
-              </div>
-            ) : (
-              <div key={i} style={{ display: "grid", gridTemplateColumns: "80px 1fr 90px 90px 90px 90px 80px", gap: 8, padding: "8px 0", borderBottom: `1px solid ${P.dim}22` }}>
-                <span style={{ fontFamily: F.mono, fontWeight: 700, fontSize: 12, color: P.accent }}>{r.ticker}</span>
-                <span style={{ fontFamily: F.sans, fontSize: 12, color: P.faint, overflow: "hidden", textOverflow: "ellipsis", whiteSpace: "nowrap" }}>{r.name}</span>
-                <span style={{ fontFamily: F.mono, fontSize: 12, color: r.stratCAGR >= 0 ? P.accent : P.red }}>{r.stratCAGR.toFixed(1)}%</span>
-                <span style={{ fontFamily: F.mono, fontSize: 12, color: P.slate }}>{r.bhCAGR.toFixed(1)}%</span>
-                <span style={{ fontFamily: F.mono, fontSize: 12, color: P.faint }}>{r.sharpe}</span>
-                <span style={{ fontFamily: F.mono, fontSize: 12, color: P.amber }}>{r.maxDD}%</span>
-                <span style={{ fontFamily: F.sans, fontWeight: 700, fontSize: 11, color: r.beats ? P.accent : P.red }}>{r.beats ? "✓ Beats" : "✗ Loses"}</span>
-              </div>
-            ))}
-            {(() => {
-              const wins = multiResult.filter(r => !r.error && r.beats).length;
-              const total = multiResult.filter(r => !r.error).length;
-              const rate = total > 0 ? wins / total : 0;
-              return total > 1 && (
-                <div style={{ marginTop: 12, padding: "10px 14px", background: rate < 0.5 ? `${P.red}11` : rate < 0.75 ? `${P.amber}11` : `${P.accent}11`, border: `1px solid ${rate < 0.5 ? P.red : rate < 0.75 ? P.amber : P.accent}44`, borderRadius: 6, fontFamily: F.sans, fontSize: 13, color: rate < 0.5 ? P.red : rate < 0.75 ? P.amber : P.accent }}>
-                  {rate < 0.5 ? `⚠ Beats buy-and-hold on only ${wins}/${total} tickers — likely overfit to specific conditions.`
-                    : rate < 0.75 ? `◈ Mixed results: beats B&H on ${wins}/${total} tickers. Strategy is sensitive to the asset.`
-                    : `✓ Strong consistency: beats buy-and-hold on ${wins}/${total} tickers.`}
-                </div>
-              );
-            })()}
-          </div>
-        )}
       </div>
+      <style>{`@media (max-width: 900px){ .bt-grid{ grid-template-columns: 1fr !important; } .bt-grid > div:first-child{ position: static !important; } }`}</style>
     </div>
   );
 }

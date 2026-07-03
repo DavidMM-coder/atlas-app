@@ -5,50 +5,15 @@ import {
   signInWithPopup, signInWithEmailAndPassword, createUserWithEmailAndPassword,
   signInWithPhoneNumber, RecaptchaVerifier, sendPasswordResetEmail,
 } from "./firebase.js";
-
-const P = {
-  paper: "#060a06", card: "#0b110b", ink: "#e8f5e9", slate: "#a5d6a7",
-  faint: "#4a7a4a", line: "#163016", accent: "#00e676", red: "#ff5252",
-  amber: "#ffab40", dim: "#1e3a1e", cardBorder: "#1a301a", wash: "#080d08",
-};
-const F = { mono: "'IBM Plex Mono', monospace", sans: "Inter, sans-serif" };
-
-function Input({ placeholder, type = "text", value, onChange, autoFocus, style = {} }) {
-  return (
-    <input
-      autoFocus={autoFocus}
-      type={type}
-      value={value}
-      onChange={onChange}
-      placeholder={placeholder}
-      style={{
-        width: "100%", boxSizing: "border-box",
-        fontFamily: F.sans, fontSize: 14, color: P.ink,
-        background: P.wash, border: `1px solid ${P.dim}`, borderRadius: 6,
-        padding: "11px 14px", outline: "none",
-        transition: "border-color .15s", ...style,
-      }}
-      onFocus={e => e.target.style.borderColor = P.accent}
-      onBlur={e => e.target.style.borderColor = P.dim}
-    />
-  );
-}
+import { color as c, font, type, radius, shadow } from "./ui/tokens.js";
+import { AtlasMark, Button, Input, Field, Overline, motion } from "./ui/primitives.jsx";
 
 function SocialBtn({ icon, label, onClick, disabled }) {
   return (
-    <button onClick={onClick} disabled={disabled} style={{
-      width: "100%", display: "flex", alignItems: "center", gap: 12,
-      background: "none", border: `1px solid ${P.dim}`, borderRadius: 6,
-      padding: "11px 16px", cursor: disabled ? "default" : "pointer",
-      fontFamily: F.sans, fontSize: 13, fontWeight: 500, color: P.slate,
-      transition: "all .15s", opacity: disabled ? 0.5 : 1,
-    }}
-    onMouseEnter={e => { if (!disabled) { e.currentTarget.style.borderColor = P.accent; e.currentTarget.style.color = P.ink; }}}
-    onMouseLeave={e => { e.currentTarget.style.borderColor = P.dim; e.currentTarget.style.color = P.slate; }}
-    >
-      <span style={{ fontSize: 18, lineHeight: 1, flexShrink: 0 }}>{icon}</span>
-      <span>{label}</span>
-    </button>
+    <Button variant="secondary" size="lg" full onClick={onClick} disabled={disabled} icon={icon}
+      style={{ justifyContent: "flex-start", fontWeight: 500, color: c.text2 }}>
+      <span style={{ flex: 1, textAlign: "left" }}>{label}</span>
+    </Button>
   );
 }
 
@@ -115,9 +80,15 @@ export default function AuthScreen({ onAuth }) {
   async function handleSendOtp() {
     setError(""); setLoading(true);
     try {
-      if (!window._recaptchaVerifier) {
-        window._recaptchaVerifier = new RecaptchaVerifier(auth, recaptchaRef.current, { size: "invisible" });
+      // Always tear down and rebuild the verifier against the CURRENT container div rather than
+      // reusing one cached on window — navigating away from phone mode (e.g. "← Back") unmounts
+      // that div, so a cached verifier from an earlier attempt in this session ends up pointing at
+      // a detached node and Firebase throws "reCAPTCHA client element has been removed".
+      if (window._recaptchaVerifier) {
+        try { window._recaptchaVerifier.clear(); } catch {}
+        window._recaptchaVerifier = null;
       }
+      window._recaptchaVerifier = new RecaptchaVerifier(auth, recaptchaRef.current, { size: "invisible" });
       const result = await signInWithPhoneNumber(auth, phone, window._recaptchaVerifier);
       setConfirmResult(result);
       setInfo("Code sent — check your messages.");
@@ -136,112 +107,116 @@ export default function AuthScreen({ onAuth }) {
   }
 
   const configured = !!import.meta.env.VITE_FIREBASE_API_KEY;
+  const linkBtn = { fontFamily: font.sans, fontSize: 12.5, color: c.text3, background: "none", border: "none", cursor: "pointer", padding: 0 };
 
   return (
-    <div style={{ minHeight: "100vh", background: P.paper, display: "flex", flexDirection: "column", alignItems: "center", justifyContent: "center", padding: "24px 20px" }}>
-      <style>{`@import url('https://fonts.googleapis.com/css2?family=Inter:wght@400;500;600;700&family=IBM+Plex+Mono:wght@400;500;600&display=swap');`}</style>
+    <div style={{ minHeight: "100dvh", background: c.canvas, display: "flex", flexDirection: "column", alignItems: "center", justifyContent: "center", padding: "24px 20px", position: "relative", overflow: "hidden" }}>
+      {/* ambient accent glow */}
+      <div style={{ position: "absolute", top: "-10%", left: "50%", transform: "translateX(-50%)", width: 720, height: 480, background: `radial-gradient(ellipse at center, ${c.accentSoft} 0%, transparent 65%)`, pointerEvents: "none" }} />
 
-      {/* Logo */}
-      <div style={{ display: "flex", alignItems: "center", gap: 10, marginBottom: 40 }}>
-        <span style={{ width: 8, height: 8, borderRadius: 999, background: P.accent, display: "inline-block", boxShadow: `0 0 10px ${P.accent}` }} />
-        <span style={{ fontFamily: F.mono, fontSize: 16, fontWeight: 600, letterSpacing: 5, color: P.ink }}>ATLAS</span>
-      </div>
+      <motion.div initial={{ opacity: 0, y: 10 }} animate={{ opacity: 1, y: 0 }} transition={{ duration: 0.4 }}
+        style={{ position: "relative", width: "100%", maxWidth: 400, display: "flex", flexDirection: "column", alignItems: "center" }}>
+        {/* Logo */}
+        <div style={{ display: "flex", alignItems: "center", gap: 11, marginBottom: 32 }}>
+          <AtlasMark size={32} />
+          <span style={{ ...type.title, color: c.text }}>Atlas</span>
+        </div>
 
-      <div style={{ width: "100%", maxWidth: 380, background: P.card, border: `1px solid ${P.cardBorder}`, borderRadius: 8, padding: "28px 28px 24px" }}>
+        <div style={{ width: "100%", background: c.surface1, border: `1px solid ${c.hairline}`, borderRadius: radius.lg, boxShadow: shadow.e2, padding: "28px 28px 24px" }}>
 
-        {!configured && (
-          <div style={{ marginBottom: 20, background: `${P.amber}11`, border: `1px solid ${P.amber}44`, borderLeft: `3px solid ${P.amber}`, borderRadius: 4, padding: "10px 14px", fontFamily: F.mono, fontSize: 10, letterSpacing: 0.5, color: P.amber, lineHeight: 1.6 }}>
-            ⚠ FIREBASE NOT CONFIGURED<br/>
-            <span style={{ color: P.faint }}>Add VITE_FIREBASE_* keys to .env and restart the dev server.</span>
-          </div>
-        )}
+          {!configured && (
+            <div style={{ marginBottom: 20, background: c.warningSoft, border: `1px solid rgba(251,184,69,0.32)`, borderRadius: radius.sm, padding: "10px 14px", ...type.caption, color: c.warning, lineHeight: 1.6 }}>
+              FIREBASE NOT CONFIGURED<br/>
+              <span style={{ color: c.text3 }}>Add VITE_FIREBASE_* keys to .env and restart the dev server.</span>
+            </div>
+          )}
 
-        {mode === "home" && (
-          <>
-            <div style={{ fontFamily: F.mono, fontSize: 9, letterSpacing: 2, color: P.accent, opacity: 0.7, marginBottom: 6 }}>SIGN IN / CREATE ACCOUNT</div>
-            <h2 style={{ fontFamily: F.mono, fontWeight: 600, fontSize: 17, color: P.ink, margin: "0 0 22px", letterSpacing: 0.3 }}>Welcome to Atlas</h2>
+          {mode === "home" && (
+            <>
+              <Overline color={c.accent} style={{ marginBottom: 6 }}>Sign in / Create account</Overline>
+              <h2 style={{ ...type.title, fontSize: 22, color: c.text, margin: "0 0 22px" }}>Welcome to Atlas</h2>
 
-            <div style={{ display: "flex", flexDirection: "column", gap: 9 }}>
-              <SocialBtn icon="G" label="Continue with Google" onClick={handleGoogle} disabled={loading || !configured} />
-              <div style={{ display: "flex", alignItems: "center", gap: 10, margin: "4px 0" }}>
-                <div style={{ flex: 1, height: 1, background: P.dim }} />
-                <span style={{ fontFamily: F.mono, fontSize: 9, letterSpacing: 1.5, color: P.faint }}>OR</span>
-                <div style={{ flex: 1, height: 1, background: P.dim }} />
+              <div style={{ display: "flex", flexDirection: "column", gap: 10 }}>
+                <SocialBtn icon={<GoogleIcon />} label="Continue with Google" onClick={handleGoogle} disabled={loading || !configured} />
+                <div style={{ display: "flex", alignItems: "center", gap: 10, margin: "4px 0" }}>
+                  <div style={{ flex: 1, height: 1, background: c.hairline }} />
+                  <span style={{ ...type.overline, color: c.text3 }}>or</span>
+                  <div style={{ flex: 1, height: 1, background: c.hairline }} />
+                </div>
+                <SocialBtn icon={<MailIcon />} label="Continue with Email" onClick={() => setMode("email")} disabled={loading || !configured} />
+                <SocialBtn icon={<PhoneIcon />} label="Continue with Phone" onClick={() => setMode("phone")} disabled={loading || !configured} />
               </div>
-              <SocialBtn icon="✉" label="Continue with Email" onClick={() => setMode("email")} disabled={loading || !configured} />
-              <SocialBtn icon="📱" label="Continue with Phone" onClick={() => setMode("phone")} disabled={loading || !configured} />
-            </div>
 
-            {error && <div style={{ marginTop: 16, fontFamily: F.mono, fontSize: 10, color: P.red, letterSpacing: 0.3 }}>⚠ {error}</div>}
-          </>
-        )}
+              {error && <div style={{ marginTop: 16, ...type.caption, color: c.negative }}>{error}</div>}
+            </>
+          )}
 
-        {mode === "email" && (
-          <>
-            <button onClick={() => { setMode("home"); setError(""); setInfo(""); }} style={{ fontFamily: F.mono, fontSize: 10, letterSpacing: 1, color: P.faint, background: "none", border: "none", cursor: "pointer", padding: 0, marginBottom: 18 }}>← BACK</button>
-            <div style={{ fontFamily: F.mono, fontSize: 9, letterSpacing: 2, color: P.accent, opacity: 0.7, marginBottom: 6 }}>
-              {emailMode === "signin" ? "SIGN IN" : emailMode === "signup" ? "CREATE ACCOUNT" : "RESET PASSWORD"}
-            </div>
-            <form onSubmit={handleEmail} style={{ display: "flex", flexDirection: "column", gap: 10 }}>
-              <Input placeholder="Email address" type="email" value={email} onChange={e => setEmail(e.target.value)} autoFocus />
-              {emailMode !== "reset" && (
-                <Input placeholder="Password" type="password" value={password} onChange={e => setPassword(e.target.value)} />
+          {mode === "email" && (
+            <>
+              <button onClick={() => { setMode("home"); setError(""); setInfo(""); }} style={{ ...linkBtn, marginBottom: 18 }}>← Back</button>
+              <Overline color={c.accent} style={{ marginBottom: 14 }}>
+                {emailMode === "signin" ? "Sign in" : emailMode === "signup" ? "Create account" : "Reset password"}
+              </Overline>
+              <form onSubmit={handleEmail} style={{ display: "flex", flexDirection: "column", gap: 12 }}>
+                <Input placeholder="Email address" type="email" autoComplete="email" value={email} onChange={e => setEmail(e.target.value)} autoFocus />
+                {emailMode !== "reset" && (
+                  <Input placeholder="Password" type="password" autoComplete="current-password" value={password} onChange={e => setPassword(e.target.value)} />
+                )}
+                <Button type="submit" size="lg" full loading={loading} disabled={!configured} glow>
+                  {emailMode === "signin" ? "Sign in" : emailMode === "signup" ? "Create account" : "Send reset email"}
+                </Button>
+              </form>
+              {info && <div style={{ marginTop: 12, ...type.caption, color: c.positive }}>{info}</div>}
+              {error && <div style={{ marginTop: 12, ...type.caption, color: c.negative }}>{error}</div>}
+              <div style={{ marginTop: 16, display: "flex", gap: 16, flexWrap: "wrap" }}>
+                {emailMode !== "signup" && <button onClick={() => { setEmailMode("signup"); setError(""); setInfo(""); }} style={linkBtn}>Create account</button>}
+                {emailMode !== "signin" && <button onClick={() => { setEmailMode("signin"); setError(""); setInfo(""); }} style={linkBtn}>Sign in</button>}
+                {emailMode === "signin" && <button onClick={() => { setEmailMode("reset"); setError(""); setInfo(""); }} style={{ ...linkBtn, marginLeft: "auto" }}>Forgot password?</button>}
+              </div>
+            </>
+          )}
+
+          {mode === "phone" && (
+            <>
+              <button onClick={() => { setMode("home"); setError(""); setInfo(""); setConfirmResult(null); }} style={{ ...linkBtn, marginBottom: 18 }}>← Back</button>
+              <Overline color={c.accent} style={{ marginBottom: 14 }}>Phone sign in</Overline>
+              {!confirmResult ? (
+                <div style={{ display: "flex", flexDirection: "column", gap: 12 }}>
+                  <Input placeholder="+1 555 000 0000" type="tel" autoComplete="tel" value={phone} onChange={e => setPhone(e.target.value)} autoFocus />
+                  <div style={{ ...type.caption, color: c.text3 }}>Include country code (e.g. +1 for US)</div>
+                  <Button size="lg" full loading={loading} disabled={!configured} onClick={handleSendOtp} glow>Send code</Button>
+                </div>
+              ) : (
+                <div style={{ display: "flex", flexDirection: "column", gap: 12 }}>
+                  <div style={{ ...type.caption, color: c.positive, marginBottom: 2 }}>{info}</div>
+                  <Input placeholder="6-digit code" type="tel" inputMode="numeric" value={otp} onChange={e => setOtp(e.target.value)} autoFocus />
+                  <Button size="lg" full loading={loading} disabled={!configured} onClick={handleVerifyOtp} glow>Verify & sign in</Button>
+                </div>
               )}
-              <button type="submit" disabled={loading || !configured} style={{
-                fontFamily: F.sans, fontWeight: 600, fontSize: 14,
-                color: "#000", background: P.accent, border: "none", borderRadius: 6,
-                padding: "11px", cursor: loading ? "default" : "pointer", opacity: loading ? 0.6 : 1, marginTop: 4,
-              }}>
-                {loading ? "Loading…" : emailMode === "signin" ? "Sign in" : emailMode === "signup" ? "Create account" : "Send reset email"}
-              </button>
-            </form>
-            {info && <div style={{ marginTop: 12, fontFamily: F.mono, fontSize: 10, color: P.accent, letterSpacing: 0.3 }}>✓ {info}</div>}
-            {error && <div style={{ marginTop: 12, fontFamily: F.mono, fontSize: 10, color: P.red, letterSpacing: 0.3 }}>⚠ {error}</div>}
-            <div style={{ marginTop: 16, display: "flex", gap: 16, flexWrap: "wrap" }}>
-              {emailMode !== "signup" && <button onClick={() => { setEmailMode("signup"); setError(""); setInfo(""); }} style={{ fontFamily: F.mono, fontSize: 10, letterSpacing: 0.5, color: P.faint, background: "none", border: "none", cursor: "pointer", padding: 0 }}>Create account</button>}
-              {emailMode !== "signin" && <button onClick={() => { setEmailMode("signin"); setError(""); setInfo(""); }} style={{ fontFamily: F.mono, fontSize: 10, letterSpacing: 0.5, color: P.faint, background: "none", border: "none", cursor: "pointer", padding: 0 }}>Sign in</button>}
-              {emailMode === "signin" && <button onClick={() => { setEmailMode("reset"); setError(""); setInfo(""); }} style={{ fontFamily: F.mono, fontSize: 10, letterSpacing: 0.5, color: P.faint, background: "none", border: "none", cursor: "pointer", padding: 0, marginLeft: "auto" }}>Forgot password?</button>}
-            </div>
-          </>
-        )}
+              {error && <div style={{ marginTop: 12, ...type.caption, color: c.negative }}>{error}</div>}
+              <div ref={recaptchaRef} />
+            </>
+          )}
+        </div>
 
-        {mode === "phone" && (
-          <>
-            <button onClick={() => { setMode("home"); setError(""); setInfo(""); setConfirmResult(null); }} style={{ fontFamily: F.mono, fontSize: 10, letterSpacing: 1, color: P.faint, background: "none", border: "none", cursor: "pointer", padding: 0, marginBottom: 18 }}>← BACK</button>
-            <div style={{ fontFamily: F.mono, fontSize: 9, letterSpacing: 2, color: P.accent, opacity: 0.7, marginBottom: 6 }}>PHONE SIGN IN</div>
-            {!confirmResult ? (
-              <div style={{ display: "flex", flexDirection: "column", gap: 10 }}>
-                <Input placeholder="+1 555 000 0000" type="tel" value={phone} onChange={e => setPhone(e.target.value)} autoFocus />
-                <div style={{ fontFamily: F.mono, fontSize: 9, color: P.faint, letterSpacing: 0.3 }}>Include country code (e.g. +1 for US)</div>
-                <button onClick={handleSendOtp} disabled={loading || !configured} style={{
-                  fontFamily: F.sans, fontWeight: 600, fontSize: 14,
-                  color: "#000", background: P.accent, border: "none", borderRadius: 6,
-                  padding: "11px", cursor: loading ? "default" : "pointer", opacity: loading ? 0.6 : 1,
-                }}>{loading ? "Sending…" : "Send code"}</button>
-              </div>
-            ) : (
-              <div style={{ display: "flex", flexDirection: "column", gap: 10 }}>
-                <div style={{ fontFamily: F.mono, fontSize: 10, color: P.accent, letterSpacing: 0.3, marginBottom: 4 }}>✓ {info}</div>
-                <Input placeholder="6-digit code" type="tel" value={otp} onChange={e => setOtp(e.target.value)} autoFocus />
-                <button onClick={handleVerifyOtp} disabled={loading || !configured} style={{
-                  fontFamily: F.sans, fontWeight: 600, fontSize: 14,
-                  color: "#000", background: P.accent, border: "none", borderRadius: 6,
-                  padding: "11px", cursor: loading ? "default" : "pointer", opacity: loading ? 0.6 : 1,
-                }}>{loading ? "Verifying…" : "Verify & sign in"}</button>
-              </div>
-            )}
-            {error && <div style={{ marginTop: 12, fontFamily: F.mono, fontSize: 10, color: P.red, letterSpacing: 0.3 }}>⚠ {error}</div>}
-            <div ref={recaptchaRef} />
-          </>
-        )}
-      </div>
-
-      <p style={{ fontFamily: F.mono, fontSize: 9, letterSpacing: 0.3, color: P.faint, marginTop: 20, textAlign: "center", lineHeight: 1.7, maxWidth: 340 }}>
-        By signing in you agree to Atlas's terms. Your account lets us remember your profile and holdings across devices.
-      </p>
+        <p style={{ ...type.caption, color: c.text3, marginTop: 20, textAlign: "center", lineHeight: 1.7, maxWidth: 340 }}>
+          Atlas is a research and education tool — not financial advice. Your account keeps your profile and holdings in sync across devices.
+        </p>
+      </motion.div>
     </div>
   );
 }
+
+// ── inline brand/util icons (stroke-consistent) ──
+const GoogleIcon = () => (
+  <svg width="18" height="18" viewBox="0 0 18 18"><path fill="#FFC107" d="M17.6 9.2c0-.6 0-1.1-.1-1.6H9v3.3h4.8a4 4 0 0 1-1.8 2.7v2.2h2.9c1.7-1.6 2.7-3.9 2.7-6.6Z"/><path fill="#FF3D00" d="M9 18c2.4 0 4.5-.8 6-2.2l-2.9-2.2c-.8.5-1.8.9-3.1.9-2.4 0-4.4-1.6-5.1-3.8H.8v2.3A9 9 0 0 0 9 18Z" transform="translate(0)" opacity="0"/><path fill="#4CAF50" d="M3.9 10.7A5.4 5.4 0 0 1 3.6 9c0-.6.1-1.2.3-1.7V5H.8A9 9 0 0 0 0 9c0 1.5.3 2.8.8 4l3.1-2.3Z"/><path fill="#1976D2" d="M9 3.6c1.3 0 2.5.5 3.4 1.3l2.6-2.6A9 9 0 0 0 .8 5l3.1 2.3C4.6 5.2 6.6 3.6 9 3.6Z"/><path fill="#fff" d="M9 18c2.4 0 4.5-.8 6-2.2l-2.9-2.2c-.8.5-1.8.9-3.1.9-2.4 0-4.4-1.6-5.1-3.8H.8v2.3A9 9 0 0 0 9 18Z"/></svg>
+);
+const MailIcon = () => (
+  <svg width="18" height="18" viewBox="0 0 24 24" fill="none" stroke="currentColor" strokeWidth="1.7" strokeLinecap="round" strokeLinejoin="round"><rect x="3" y="5" width="18" height="14" rx="2"/><path d="m3 7 9 6 9-6"/></svg>
+);
+const PhoneIcon = () => (
+  <svg width="18" height="18" viewBox="0 0 24 24" fill="none" stroke="currentColor" strokeWidth="1.7" strokeLinecap="round" strokeLinejoin="round"><rect x="6" y="2" width="12" height="20" rx="3"/><line x1="11" y1="18" x2="13" y2="18"/></svg>
+);
 
 function friendlyError(e) {
   const m = e?.code || e?.message || "";

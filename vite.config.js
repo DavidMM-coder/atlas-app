@@ -60,6 +60,65 @@ async function getYahooCrumb() {
   return { crumb, cookieStr };
 }
 
+const SEC_HEADERS = { "User-Agent": "Atlas Investment Research App (contact: atlas-app@verdict-app.example)" };
+let cikMapCache = null, cikMapFetchedAt = 0;
+async function getCikMap() {
+  const ONE_DAY = 24 * 60 * 60 * 1000;
+  if (cikMapCache && Date.now() - cikMapFetchedAt < ONE_DAY) return cikMapCache;
+  const r = await fetch("https://www.sec.gov/files/company_tickers.json", { headers: SEC_HEADERS });
+  if (!r.ok) return cikMapCache;
+  const data = await r.json();
+  const map = {};
+  for (const entry of Object.values(data)) map[entry.ticker.toUpperCase()] = entry.cik_str;
+  cikMapCache = map;
+  cikMapFetchedAt = Date.now();
+  return map;
+}
+// Mirrors api/fundamentals.js — stores {val, filed} so the backtester can gate signals on the
+// date data actually became public, and so restatements/zero values dedupe correctly.
+function extractQuarterly(usgaap, concepts, unitKey) {
+  const byEnd = {};
+  for (const concept of concepts) {
+    const arr = usgaap[concept]?.units?.[unitKey];
+    if (!arr) continue;
+    for (const e of arr) {
+      if (!e.start || !e.end) continue;
+      const days = (new Date(e.end) - new Date(e.start)) / 86400000;
+      if (days <= 80 || days >= 100) continue;
+      const prev = byEnd[e.end];
+      if (!prev || String(e.filed || "") > String(prev.filed || "")) byEnd[e.end] = { val: e.val, filed: e.filed || null };
+    }
+  }
+  return byEnd;
+}
+async function fetchSecQuarterlyFinancials(ticker) {
+  try {
+    const cikMap = await getCikMap();
+    const cik = cikMap?.[ticker.toUpperCase()];
+    if (!cik) return null;
+    const cikStr = String(cik).padStart(10, "0");
+    const r = await fetch(`https://data.sec.gov/api/xbrl/companyfacts/CIK${cikStr}.json`, { headers: SEC_HEADERS });
+    if (!r.ok) return null;
+    const data = await r.json();
+    const usgaap = data?.facts?.["us-gaap"];
+    if (!usgaap) return null;
+    const revByDate = extractQuarterly(usgaap, ["RevenueFromContractWithCustomerExcludingAssessedTax", "Revenues", "SalesRevenueNet", "SalesRevenueServicesGross"], "USD");
+    const epsByDate = extractQuarterly(usgaap, ["EarningsPerShareDiluted", "EarningsPerShareBasic"], "USD/shares");
+    const niByDate = extractQuarterly(usgaap, ["NetIncomeLoss"], "USD");
+    const allDates = new Set([...Object.keys(revByDate), ...Object.keys(epsByDate), ...Object.keys(niByDate)]);
+    const quarterlyFinancials = [...allDates].sort().map(date => ({
+      date,
+      totalRevenue: revByDate[date]?.val ?? null,
+      netIncome: niByDate[date]?.val ?? null,
+      eps: epsByDate[date]?.val ?? null,
+      filed: [revByDate[date]?.filed, niByDate[date]?.filed, epsByDate[date]?.filed].filter(Boolean).sort().pop() || null,
+    })).filter(q => q.totalRevenue != null || q.eps != null);
+    return quarterlyFinancials.length ? quarterlyFinancials : null;
+  } catch (_) {
+    return null;
+  }
+}
+
 function fundamentalsProxy() {
   return {
     name: "fundamentals-proxy",
@@ -73,7 +132,7 @@ function fundamentalsProxy() {
           return res.end(JSON.stringify({ error: "ticker required" }));
         }
         (async () => {
-          const { crumb, cookieStr } = await getYahooCrumb();
+          const [{ crumb, cookieStr }, secQuarterlyFinancials] = await Promise.all([getYahooCrumb(), fetchSecQuarterlyFinancials(ticker)]);
           const modules = ["defaultKeyStatistics","financialData","incomeStatementHistoryQuarterly","earningsHistory","summaryDetail"].join(",");
           const yhUrl = `https://query1.finance.yahoo.com/v10/finance/quoteSummary/${encodeURIComponent(ticker)}?modules=${encodeURIComponent(modules)}&crumb=${encodeURIComponent(crumb)}`;
           const r = await fetch(yhUrl, { headers: { ...YF_HEADERS, Cookie: cookieStr } });
@@ -87,8 +146,13 @@ function fundamentalsProxy() {
           const qStmts = result.incomeStatementHistoryQuarterly?.incomeStatementHistory || [];
           const epsHistory = result.earningsHistory?.history || [];
           const earnings = epsHistory.map(e => ({ date: new Date(e.quarter.raw * 1000).toISOString().slice(0, 10), actual: e.epsActual?.raw ?? null, estimate: e.epsEstimate?.raw ?? null, surprisePct: e.surprisePercent?.raw != null ? e.surprisePercent.raw * 100 : null })).filter(e => e.actual !== null).sort((a, b) => a.date.localeCompare(b.date));
-          const earningsEpsByDate = Object.fromEntries(earnings.map(e => [e.date, e.actual]));
-          const quarterlyFinancials = qStmts.map(s => { const date = new Date(s.endDate.raw * 1000).toISOString().slice(0, 10); const eps = s.dilutedEPS?.raw ?? earningsEpsByDate[date] ?? null; return { date, totalRevenue: s.totalRevenue?.raw ?? null, netIncome: s.netIncome?.raw ?? null, eps }; }).filter(s => s.totalRevenue != null).sort((a, b) => a.date.localeCompare(b.date));
+          let quarterlyFinancials;
+          if (secQuarterlyFinancials) {
+            quarterlyFinancials = secQuarterlyFinancials;
+          } else {
+            const earningsEpsByDate = Object.fromEntries(earnings.map(e => [e.date, e.actual]));
+            quarterlyFinancials = qStmts.map(s => { const date = new Date(s.endDate.raw * 1000).toISOString().slice(0, 10); const eps = s.dilutedEPS?.raw ?? earningsEpsByDate[date] ?? null; return { date, totalRevenue: s.totalRevenue?.raw ?? null, netIncome: s.netIncome?.raw ?? null, eps, filed: null }; }).filter(s => s.totalRevenue != null).sort((a, b) => a.date.localeCompare(b.date));
+          }
           let dividends = [];
           try {
             const divR = await fetch(`https://query1.finance.yahoo.com/v8/finance/chart/${encodeURIComponent(ticker)}?interval=1mo&range=10y&events=div&crumb=${encodeURIComponent(crumb)}`, { headers: { ...YF_HEADERS, Cookie: cookieStr } });
@@ -101,7 +165,7 @@ function fundamentalsProxy() {
           const summary = result.summaryDetail || {};
           res.statusCode = 200;
           res.setHeader("content-type", "application/json");
-          res.end(JSON.stringify({ ticker: ticker.toUpperCase(), trailingPE: stats.trailingPE?.raw ?? null, forwardPE: stats.forwardPE?.raw ?? null, pb: stats.priceToBook?.raw ?? null, dividendYield: summary.trailingAnnualDividendYield?.raw ?? null, revenueGrowth: financial.revenueGrowth?.raw ?? null, earningsGrowth: financial.earningsGrowth?.raw ?? null, quarterlyFinancials, earnings, dividends }));
+          res.end(JSON.stringify({ ticker: ticker.toUpperCase(), trailingPE: summary.trailingPE?.raw ?? null, forwardPE: stats.forwardPE?.raw ?? null, pb: stats.priceToBook?.raw ?? null, dividendYield: summary.trailingAnnualDividendYield?.raw ?? null, revenueGrowth: financial.revenueGrowth?.raw ?? null, earningsGrowth: financial.earningsGrowth?.raw ?? null, quarterlyFinancials, earnings, dividends }));
         })().catch(e => { res.statusCode = 500; res.setHeader("content-type", "application/json"); res.end(JSON.stringify({ error: String(e) })); });
       });
     },
@@ -152,11 +216,50 @@ function historyProxy() {
   };
 }
 
+function fxProxy() {
+  return {
+    name: "fx-proxy",
+    configureServer(server) {
+      server.middlewares.use("/api/fx", (req, res) => {
+        fetch("https://api.frankfurter.app/latest?from=USD")
+          .then(r => r.json())
+          .then(data => {
+            res.statusCode = 200;
+            res.setHeader("content-type", "application/json");
+            if (!data?.rates) { res.statusCode = 502; return res.end(JSON.stringify({ error: "No rates returned" })); }
+            res.end(JSON.stringify({ base: data.base || "USD", date: data.date, rates: data.rates }));
+          })
+          .catch(e => {
+            res.statusCode = 500;
+            res.setHeader("content-type", "application/json");
+            res.end(JSON.stringify({ error: "Failed to fetch FX rates: " + String(e) }));
+          });
+      });
+    },
+  };
+}
+
 export default defineConfig(({ mode }) => {
   const env = loadEnv(mode, process.cwd(), "");
   const apiKey = env.ANTHROPIC_API_KEY || process.env.ANTHROPIC_API_KEY || "";
   return {
-    plugins: [react(), anthropicProxy(apiKey), historyProxy(), fundamentalsProxy()],
-    server: { port: 5173, host: true },
+    plugins: [react(), anthropicProxy(apiKey), historyProxy(), fundamentalsProxy(), fxProxy()],
+    server: { port: Number(process.env.PORT) || 5173, host: true },
+    build: {
+      rollupOptions: {
+        output: {
+          // Split the heavyweight vendors into their own long-cacheable chunks so an app-code
+          // change doesn't force users to re-download Firebase/Framer/React, and the entry
+          // chunk stays small. xlsx is already lazy-loaded and chunks itself.
+          manualChunks(id) {
+            if (!id.includes("node_modules")) return undefined;
+            if (id.includes("firebase") || id.includes("@firebase")) return "firebase";
+            if (id.includes("framer-motion")) return "motion";
+            if (id.includes("react")) return "react";
+            return undefined;
+          },
+        },
+      },
+    },
   };
 });
