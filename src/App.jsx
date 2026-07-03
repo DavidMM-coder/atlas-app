@@ -545,26 +545,83 @@ async function callClaudeOnce(system, user, maxTokens, maxSearches) {
   return { parsed: extractJSON(text), stopReason: data.stop_reason, text };
 }
 
-async function callClaude(system, user, { maxTokens = 4000, maxSearches = 4 } = {}) {
+// A truncated response almost always means the answer just needed more room, not a different query —
+// the search results and reasoning were fine, only the OUTPUT budget ran out. Heal it silently with one
+// automatic retry at a much larger budget (same search depth, same prompt) before ever bothering the
+// user with an error they'd have to act on themselves.
+async function callClaudeAttempt(system, user, maxTokens, maxSearches) {
   let { parsed, stopReason, text } = await callClaudeOnce(system, user, maxTokens, maxSearches);
-  // A truncated response almost always means the answer just needed more room, not a different query —
-  // the search results and reasoning were fine, only the OUTPUT budget ran out. Heal it silently with one
-  // automatic retry at a much larger budget (same search depth, same prompt) before ever bothering the
-  // user with an error they'd have to act on themselves.
   if (!parsed && stopReason === "max_tokens") {
     ({ parsed, stopReason, text } = await callClaudeOnce(system, user, Math.round(maxTokens * 1.8) + 1500, maxSearches));
   }
-  if (!parsed) {
-    if (stopReason === "max_tokens") throw new Error("The response was too long even after retrying with more room. Try again in a moment.");
-    console.error("extractJSON failed, raw text:", text.slice(0, 500));
-    // When web search is rate-limited upstream, the model explains that in prose instead of
-    // returning JSON — surface the real cause instead of a generic "unreadable" error.
-    if (/limit exceeded|rate.?limit|temporarily unavailable|tool.*(unavailable|error)/i.test(text)) {
-      throw new Error("Live web search is temporarily rate-limited upstream. Wait a minute or two and try again.");
+  return { parsed, stopReason, text };
+}
+
+const sleep = (ms) => new Promise((r) => setTimeout(r, ms));
+
+// Every AI request draws on ONE org-wide web-search rate limit upstream, so it's the combined
+// burst that trips it, not any single request — the Today screen alone fires market news, top
+// picks and portfolio news together. Full serialization fixed that but made everything feel
+// glacial (each widget waited for the previous one to fully finish). This pool is the middle
+// ground: two requests may run at once, and starts are staggered by a couple of seconds so
+// parallel requests don't fire their opening searches in the same instant.
+const AI_MAX_CONCURRENT = 2;
+const AI_START_GAP_MS = 2500;
+let aiActive = 0;
+let aiLastStart = 0;
+const aiWaiters = [];
+async function acquireAISlot() {
+  if (aiActive >= AI_MAX_CONCURRENT) await new Promise((resolve) => aiWaiters.push(resolve));
+  aiActive++;
+  const gap = aiLastStart + AI_START_GAP_MS - Date.now();
+  if (gap > 0) await sleep(gap);
+  aiLastStart = Date.now();
+}
+function releaseAISlot() {
+  aiActive--;
+  const next = aiWaiters.shift();
+  if (next) next();
+}
+// Broad match for the model explaining a search-tool failure in prose instead of returning JSON.
+const SEARCH_LIMITED_TEXT_RE = /limit exceeded|rate.?limit|too many requests|temporarily unavailable|tool.*(unavailable|error)/i;
+// Narrow match for request-level API errors that are transient by definition (Anthropic 429/529,
+// or this app's own per-user proxy limiter) — anything else (auth, validation) must throw as-is.
+const RETRYABLE_ERROR_RE = /rate.?limit|too many requests|overloaded/i;
+
+async function callClaude(system, user, { maxTokens = 4000, maxSearches = 4 } = {}) {
+  await acquireAISlot();
+  try {
+    // Rate limiting is transient by definition — retry with backoff before surfacing anything.
+    // The backoff sleeps hold only THIS call's slot: a limited call quietly waits its turn again
+    // while the other slot keeps serving fresh requests at full speed.
+    let parsed, stopReason, text, apiError;
+    for (const delay of [0, 15000, 35000]) {
+      if (delay) await sleep(delay);
+      apiError = null;
+      try {
+        ({ parsed, stopReason, text } = await callClaudeAttempt(system, user, maxTokens, maxSearches));
+      } catch (e) {
+        if (!RETRYABLE_ERROR_RE.test(String(e?.message))) throw e;
+        apiError = e;
+        continue;
+      }
+      if (parsed || !SEARCH_LIMITED_TEXT_RE.test(text)) break;
     }
-    throw new Error("The response came back unreadable. Try again.");
+    if (apiError) throw apiError;
+    if (!parsed) {
+      if (stopReason === "max_tokens") throw new Error("The response was too long even after retrying with more room. Try again in a moment.");
+      console.error("extractJSON failed, raw text:", text.slice(0, 500));
+      // When web search is rate-limited upstream, the model explains that in prose instead of
+      // returning JSON — surface the real cause instead of a generic "unreadable" error.
+      if (SEARCH_LIMITED_TEXT_RE.test(text)) {
+        throw new Error("Live web search is rate-limited upstream right now. Atlas already retried a few times — give it a minute, then try again.");
+      }
+      throw new Error("The response came back unreadable. Try again.");
+    }
+    return parsed;
+  } finally {
+    releaseAISlot();
   }
-  return parsed;
 }
 
 // The model doesn't always obey the "no vague aggregate rows" prompt instruction (e.g. still

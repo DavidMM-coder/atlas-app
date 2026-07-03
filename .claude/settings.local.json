@@ -50,7 +50,13 @@
       "Bash(time curl -s -X POST http://localhost:5173/api/messages -H \"Content-Type: application/json\" -d '{\"model\":\"claude-sonnet-4-6\",\"max_tokens\":50,\"system\":\"Reply with the single word OK.\",\"messages\":[{\"role\":\"user\",\"content\":\"ping\"}]}' -o /tmp/ping2.json -w \"HTTP %{http_code}\\\\n\")",
       "Bash(awk 'NR==869,NR==1050' src/App.jsx)",
       "Bash(grep -n \"callClaude\\(sys, \\\\`Evaluate\" src/App.jsx)",
-      "Bash(node src/lib/_test_xirr_temp.mjs)"
+      "Bash(node src/lib/_test_xirr_temp.mjs)",
+      "Bash(git -C /Users/davidmihailescu/atlas-app remote -v)",
+      "Bash(vercel project *)",
+      "Skill(claude-api)",
+      "Skill(claude-api:*)",
+      "Bash(awk -F= '/^ANTHROPIC_API_KEY=/{print \"raw line length:\", length\\($0\\)}' /private/tmp/claude-501/-Users-davidmihailescu-atlas-app/6341e1b2-3982-43e9-a183-313ee6f3327b/scratchpad/.env.vercel)",
+      "Bash(awk -F= '/^ANTHROPIC_API_KEY=/{v=substr\\($0,19\\); gsub\\(/[a-zA-Z0-9_-]/,\"*\",v\\); print \"masked value: [\" v \"]\"}' /private/tmp/claude-501/-Users-davidmihailescu-atlas-app/6341e1b2-3982-43e9-a183-313ee6f3327b/scratchpad/.env.vercel)"
     ]
   }
 }
