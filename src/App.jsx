@@ -630,14 +630,14 @@ async function callClaudeAttempt(system, user, maxTokens, maxSearches) {
 
 const sleep = (ms) => new Promise((r) => setTimeout(r, ms));
 
-// Every AI request draws on ONE org-wide web-search rate limit upstream, so it's the combined
-// burst that trips it, not any single request — the Today screen alone fires market news, top
-// picks and portfolio news together. Full serialization fixed that but made everything feel
-// glacial (each widget waited for the previous one to fully finish). This pool is the middle
-// ground: two requests may run at once, and starts are staggered by a couple of seconds so
-// parallel requests don't fire their opening searches in the same instant.
-const AI_MAX_CONCURRENT = 2;
-const AI_START_GAP_MS = 2500;
+// Every AI request draws on ONE org-wide web-search rate limit upstream. Measured live: running
+// two search-heavy calls at once (market news = 4 searches + Discover = 2, fired together on the
+// Today screen) reliably TRIPS that limit, and the loser then sits in a 15s+35s backoff — so the
+// Today screen took 75s+ to settle. The shared limit is effectively a serial resource, so parallel
+// calls are counterproductive: run ONE at a time. Market news (the Today headline) then completes
+// clean and first, Discover runs right after, and neither trips the limit into a long backoff.
+const AI_MAX_CONCURRENT = 1;
+const AI_START_GAP_MS = 800;
 let aiActive = 0;
 let aiLastStart = 0;
 const aiWaiters = [];
