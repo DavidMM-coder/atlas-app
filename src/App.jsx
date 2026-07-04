@@ -579,11 +579,16 @@ async function aiAuthHeaders(forceRefresh = false) {
 
 const AI_MODEL = "claude-sonnet-5";
 
-async function callClaudeOnce(system, user, maxTokens, maxSearches) {
+async function callClaudeOnce(system, user, maxTokens, maxSearches, fast) {
   const body = JSON.stringify({
     model: AI_MODEL, max_tokens: maxTokens, system,
     messages: [{ role: "user", content: user }],
     tools: [{ type: "web_search_20260209", name: "web_search", max_uses: maxSearches }],
+    // "fast" calls are search-and-summarize (Discover picks, market/portfolio news) — they don't
+    // need Sonnet 5's adaptive thinking, which otherwise runs by default and adds seconds of
+    // latency before the answer. Turn it off and drop to low effort so these feel snappy. The
+    // deep dossier and portfolio review keep full thinking (fast omitted).
+    ...(fast ? { thinking: { type: "disabled" }, output_config: { effort: "low" } } : {}),
   });
   const doFetch = async (forceRefresh) => fetch(`${API_BASE}/api/messages`, {
     method: "POST", headers: { "Content-Type": "application/json", ...(await aiAuthHeaders(forceRefresh)) },
@@ -604,14 +609,14 @@ async function callClaudeOnce(system, user, maxTokens, maxSearches) {
 // the search results and reasoning were fine, only the OUTPUT budget ran out. Heal it silently with one
 // automatic retry at a much larger budget (same search depth, same prompt) before ever bothering the
 // user with an error they'd have to act on themselves.
-async function callClaudeAttempt(system, user, maxTokens, maxSearches) {
-  let { parsed, stopReason, text } = await callClaudeOnce(system, user, maxTokens, maxSearches);
+async function callClaudeAttempt(system, user, maxTokens, maxSearches, fast) {
+  let { parsed, stopReason, text } = await callClaudeOnce(system, user, maxTokens, maxSearches, fast);
   // Retry on truncation even when the truncated payload still PARSED. A response cut off inside a
   // number (e.g. a fitScore of 85 truncated to "8", or a currentPrice of 182.40 to "18") parses
   // to a valid-but-wrong value, so "parsed && max_tokens" isn't safe to trust — only "parsed &&
   // NOT truncated" is. Retrying with more room gets a complete, uncorrupted response.
   if (stopReason === "max_tokens") {
-    const retry = await callClaudeOnce(system, user, Math.round(maxTokens * 1.8) + 1500, maxSearches);
+    const retry = await callClaudeOnce(system, user, Math.round(maxTokens * 1.8) + 1500, maxSearches, fast);
     // Keep the retry unless it somehow came back worse (unparseable when the first parsed).
     if (retry.parsed || !parsed) ({ parsed, stopReason, text } = retry);
   }
@@ -649,7 +654,7 @@ const SEARCH_LIMITED_TEXT_RE = /limit exceeded|rate.?limit|too many requests|tem
 // or this app's own per-user proxy limiter) — anything else (auth, validation) must throw as-is.
 const RETRYABLE_ERROR_RE = /rate.?limit|too many requests|overloaded/i;
 
-async function callClaude(system, user, { maxTokens = 4000, maxSearches = 4 } = {}) {
+async function callClaude(system, user, { maxTokens = 4000, maxSearches = 4, fast = false } = {}) {
   await acquireAISlot();
   try {
     // Rate limiting is transient by definition — retry with backoff before surfacing anything.
@@ -660,7 +665,7 @@ async function callClaude(system, user, { maxTokens = 4000, maxSearches = 4 } = 
       if (delay) await sleep(delay);
       apiError = null;
       try {
-        ({ parsed, stopReason, text } = await callClaudeAttempt(system, user, maxTokens, maxSearches));
+        ({ parsed, stopReason, text } = await callClaudeAttempt(system, user, maxTokens, maxSearches, fast));
       } catch (e) {
         if (!RETRYABLE_ERROR_RE.test(String(e?.message))) throw e;
         apiError = e;
@@ -2135,7 +2140,7 @@ For each pick give:
 Schema:
 {"asOf":"","marketContext":"one sentence on current market conditions","picks":[{"ticker":"","company":"","sector":"","fitScore":0,"reason":"","concern":"","tags":[""],"snapshot":[{"label":"","value":""}]}]}`;
     try {
-      const parsed = await callClaude(sys, "Find the best stocks for me right now.", { maxTokens: 2800, maxSearches: 2 });
+      const parsed = await callClaude(sys, "Find the best stocks for me right now.", { maxTokens: 2800, maxSearches: 2, fast: true });
       if (seq !== discoverSeq.current) return;   // a newer scan (e.g. universe switch) superseded this
       if (!Array.isArray(parsed.picks)) throw new Error("Couldn't build the shortlist. Tap Scan again.");
       parsed.picks.sort((a, b) => (b.fitScore || 0) - (a.fitScore || 0));
@@ -2189,7 +2194,7 @@ Aim for 2-3 items per holding plus 2-3 macro items, max 20 total in "news". Insi
       // numbers per holding. Scale with holding count so each name actually gets a shot at a real,
       // specific insider-activity source instead of returning vague "signal noticed but unconfirmed" rows.
       const newsMaxSearches = Math.min(30, Math.max(6, holdings.length + 4));
-      const parsed = await callClaude(sys, `Find latest news for portfolio: ${tickers}`, { maxTokens: newsMaxTokens, maxSearches: newsMaxSearches });
+      const parsed = await callClaude(sys, `Find latest news for portfolio: ${tickers}`, { maxTokens: newsMaxTokens, maxSearches: newsMaxSearches, fast: true });
       setNewsItems(parsed?.news || []);
       setNewsInsiderActivity(cleanInsiderActivity(parsed?.insiderActivity));
     } catch (e) {
@@ -2222,7 +2227,7 @@ Return ONLY this JSON, nothing else:
 {"marketPulse":"","items":[{"headline":"","source":"","date":"","url":"","category":"","summary":"","impact":"","relatedTicker":null}]}
 Aim for 6-8 items, most important first.`;
     try {
-      const parsed = await callClaude(sys, "What's moving markets right now?", { maxTokens: 3800, maxSearches: 4 });
+      const parsed = await callClaude(sys, "What's moving markets right now?", { maxTokens: 3800, maxSearches: 4, fast: true });
       setMarketNews(parsed);
     } catch (e) {
       setMarketNewsError(e.message || "Could not fetch market news.");
