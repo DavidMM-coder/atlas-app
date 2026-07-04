@@ -565,25 +565,35 @@ function extractJSON(text) {
 // The AI proxy requires a signed-in user when Firebase is configured (it verifies this token
 // server-side before spending the Anthropic API key). getIdToken() is cached by the SDK and
 // auto-refreshes, so this is cheap to call per request.
-async function aiAuthHeaders() {
+async function aiAuthHeaders(forceRefresh = false) {
   try {
+    // Wait for Firebase to finish restoring the persisted session before reading currentUser, so a
+    // call fired right after load doesn't go out tokenless. forceRefresh mints a fresh ID token
+    // (used to recover from a stale/expired cached token that the server would 401).
+    if (auth?.authStateReady) await auth.authStateReady();
     const u = auth?.currentUser;
     if (!u) return {};
-    return { Authorization: `Bearer ${await u.getIdToken()}` };
+    return { Authorization: `Bearer ${await u.getIdToken(forceRefresh)}` };
   } catch { return {}; }
 }
 
 const AI_MODEL = "claude-sonnet-5";
 
 async function callClaudeOnce(system, user, maxTokens, maxSearches) {
-  const resp = await fetch(`${API_BASE}/api/messages`, {
-    method: "POST", headers: { "Content-Type": "application/json", ...(await aiAuthHeaders()) },
-    body: JSON.stringify({
-      model: AI_MODEL, max_tokens: maxTokens, system,
-      messages: [{ role: "user", content: user }],
-      tools: [{ type: "web_search_20260209", name: "web_search", max_uses: maxSearches }],
-    }),
+  const body = JSON.stringify({
+    model: AI_MODEL, max_tokens: maxTokens, system,
+    messages: [{ role: "user", content: user }],
+    tools: [{ type: "web_search_20260209", name: "web_search", max_uses: maxSearches }],
   });
+  const doFetch = async (forceRefresh) => fetch(`${API_BASE}/api/messages`, {
+    method: "POST", headers: { "Content-Type": "application/json", ...(await aiAuthHeaders(forceRefresh)) },
+    body,
+  });
+  let resp = await doFetch(false);
+  // A 401 when we DO have a signed-in user almost always means the cached Firebase ID token went
+  // stale (they expire ~hourly). Force-refresh the token and retry once before surfacing "sign in"
+  // — this self-heals a session that's still valid but whose cached token lapsed.
+  if (resp.status === 401 && auth?.currentUser) resp = await doFetch(true);
   const data = await resp.json();
   if (data.error) throw new Error(data.error.message || "API error");
   const text = (data.content || []).filter((b) => b.type === "text").map((b) => b.text).join("\n");
@@ -1482,12 +1492,15 @@ function HelpChat() {
       const history = next
         .filter((m, i) => !(i === 0 && m.role === "assistant"))
         .map(m => ({ role: m.role === "assistant" ? "assistant" : "user", content: m.text }));
-      const resp = await fetch(`${API_BASE}/api/messages`, {
-        method: "POST", headers: { "Content-Type": "application/json", ...(await aiAuthHeaders()) },
-        // Thinking disabled on purpose: this is a snappy help chat, not analysis — adaptive
-        // thinking would add seconds of silence before short answers.
-        body: JSON.stringify({ model: AI_MODEL, max_tokens: 800, system: HELP_SYSTEM, messages: history, thinking: { type: "disabled" } }),
+      // Thinking disabled on purpose: this is a snappy help chat, not analysis — adaptive
+      // thinking would add seconds of silence before short answers.
+      const chatBody = JSON.stringify({ model: AI_MODEL, max_tokens: 800, system: HELP_SYSTEM, messages: history, thinking: { type: "disabled" } });
+      const doSend = async (forceRefresh) => fetch(`${API_BASE}/api/messages`, {
+        method: "POST", headers: { "Content-Type": "application/json", ...(await aiAuthHeaders(forceRefresh)) },
+        body: chatBody,
       });
+      let resp = await doSend(false);
+      if (resp.status === 401 && auth?.currentUser) resp = await doSend(true);   // recover from a stale ID token
       const data = await resp.json();
       if (data.error) throw new Error(data.error.message);
       const text = (data.content || []).filter(b => b.type === "text").map(b => b.text).join("").trim();
