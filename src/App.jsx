@@ -1737,7 +1737,18 @@ export default function VerdictApp() {
         if (cash != null) setSpareCash(String(cash));
         if (cashCur) setSpareCashCurrency(cashCur);
         if (Array.isArray(rh)) setResearchHistory(rh);
-        if (p && p.name) { setProfile(p); setPhase("app"); setAutoDiscover(true); }
+        // Instant-on-revisit: rehydrate the last market news + top picks from cache so the Today
+        // screen shows them immediately instead of re-running a 20–40s live search every visit.
+        // Only within a freshness window, so genuinely stale results aren't shown as current — the
+        // Refresh/Load buttons re-scan on demand, and a fresh top-picks cache also skips the
+        // auto-scan (the previous behavior triggered a full Discover scan on EVERY page load).
+        const FRESH_MS = 8 * 3600 * 1000;
+        const mn = await kvGet("atlas_market_news");
+        if (mn?.data && mn.at && Date.now() - mn.at < FRESH_MS) setMarketNews(mn.data);
+        const rc = await kvGet("atlas_recs");
+        const recsFresh = !!(rc?.data && rc.at && Date.now() - rc.at < FRESH_MS);
+        if (recsFresh) setRecs(rc.data);
+        if (p && p.name) { setProfile(p); setPhase("app"); if (!recsFresh) setAutoDiscover(true); }
       } catch {}
     })();
   }, []);
@@ -2152,6 +2163,7 @@ Schema:
       if (!Array.isArray(parsed.picks)) throw new Error("Couldn't build the shortlist. Tap Scan again.");
       parsed.picks.sort((a, b) => (b.fitScore || 0) - (a.fitScore || 0));
       setRecs(parsed);
+      kvSet("atlas_recs", { data: parsed, at: Date.now() });   // cache for instant revisit
     } catch (err) { if (seq === discoverSeq.current) setRecsError(err.message || "Something went wrong."); }
     finally { if (seq === discoverSeq.current) setRecsLoading(false); }
   }
@@ -2236,6 +2248,7 @@ Aim for 6-8 items, most important first.`;
     try {
       const parsed = await callClaude(sys, "What's moving markets right now?", { maxTokens: 3800, maxSearches: 2, fast: true });
       setMarketNews(parsed);
+      kvSet("atlas_market_news", { data: parsed, at: Date.now() });   // cache for instant revisit
     } catch (e) {
       setMarketNewsError(e.message || "Could not fetch market news.");
     } finally { setMarketNewsLoading(false); }
@@ -2452,7 +2465,7 @@ Schema:
       setResearchHistory([]); setRecs(null); setReview(null); setResult(null); setError(null); setQuery("");
       setNewsItems(null); setNewsInsiderActivity(null); setMarketNews(null); setLivePrices({});
       setPhase("onboarding"); setNav("home");
-      ["atlas_profile", "atlas_holdings", "atlas_spare_cash", "atlas_spare_cash_currency", "atlas_research_history"].forEach(kvDel);
+      ["atlas_profile", "atlas_holdings", "atlas_spare_cash", "atlas_spare_cash_currency", "atlas_research_history", "atlas_market_news", "atlas_recs"].forEach(kvDel);
     }).catch(() => {});
   }
 
