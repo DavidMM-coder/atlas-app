@@ -1,0 +1,26 @@
+rules_version = '2';
+
+// Atlas / Verdict Firestore security rules.
+//
+// The whole client design leans on these rules as its ONLY authorization boundary: the browser
+// talks straight to Firestore with the signed-in user's token, and saveUserData()/loadUserData()
+// (src/firebase.js) read and write users/{uid}. Without a rule scoping that to the caller's own
+// uid, any signed-in user could read or overwrite anyone else's profile, holdings and email.
+//
+// Deploy with:  firebase deploy --only firestore:rules
+// (run `firebase login` and `firebase use <your-project-id>` first)
+
+service cloud.firestore {
+  match /databases/{database}/documents {
+
+    // A user may read and write ONLY their own profile document.
+    match /users/{userId} {
+      allow read, write: if request.auth != null && request.auth.uid == userId;
+    }
+
+    // Everything else is denied by default — no other collections are used by the app.
+    match /{document=**} {
+      allow read, write: if false;
+    }
+  }
+}

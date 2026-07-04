@@ -161,7 +161,34 @@ const DOSSIER_TABS = ["Fundamentals", "Technicals", "Risk", "News", "Catalysts",
 const LOADING_MSGS = ["Searching Yahoo Finance & Stockanalysis…", "Pulling live financials and balance sheet…", "Reading price action and technicals…", "Scanning recent news and sentiment…", "Checking analyst ratings and targets…", "Matching everything to your profile…", "Writing the full dossier…"];
 
 // ---------- helpers (unchanged) ----------
-function parseNum(x) { const n = parseFloat(String(x ?? "").replace(/[^0-9.\-]/g, "")); return isNaN(n) ? null : n; }
+// Locale-aware numeric parse for spreadsheet imports. The old version stripped everything except
+// digits/dot/minus, which silently corrupted European-formatted numbers: "1.234,56" (€1,234.56)
+// became 1.23456. Detect the decimal separator instead of assuming it's always ".".
+function parseNum(x) {
+  if (x == null) return null;
+  let s = String(x).trim().replace(/[^0-9.,\-]/g, "");
+  if (!s || !/\d/.test(s)) return null;
+  const neg = s.startsWith("-");
+  s = s.replace(/-/g, "");
+  const lastDot = s.lastIndexOf("."), lastComma = s.lastIndexOf(",");
+  let cleaned;
+  if (lastDot >= 0 && lastComma >= 0) {
+    // Both present: the later separator is the decimal point, the earlier one is grouping.
+    cleaned = lastComma > lastDot
+      ? s.replace(/\./g, "").replace(",", ".")   // European: 1.234,56 -> 1234.56
+      : s.replace(/,/g, "");                       // US:       1,234.56 -> 1234.56
+  } else if (lastComma >= 0) {
+    const groups = s.split(",");
+    // Multiple commas, or a single comma with exactly 3 trailing digits -> thousands grouping.
+    cleaned = (groups.length > 2 || groups[groups.length - 1].length === 3) ? s.replace(/,/g, "") : s.replace(",", ".");
+  } else {
+    // Multiple dots -> grouping (1.234.567). A single dot stays a decimal point (US default), so
+    // genuine 3-decimal prices like 12.345 are preserved rather than read as twelve thousand.
+    cleaned = s.split(".").length > 2 ? s.replace(/\./g, "") : s;
+  }
+  const n = parseFloat(cleaned);
+  return isNaN(n) ? null : (neg ? -n : n);
+}
 // The LSE quotes in pence, not pounds — Yahoo Finance returns "GBp" (lowercase p) as the currency for
 // .L tickers, and spreadsheets/brokers commonly label the same 1/100-of-a-pound unit "GBX". Both must map
 // to one internal code. NOTE: this check must NOT be case-insensitive on the third letter — "GBP" (real
@@ -278,8 +305,9 @@ function looksLikeCashRow(row, mapping) {
 // Sums any cash-like rows into a single amount so it can be routed into Spare Cash instead of vanishing —
 // these rows have no shares/price (there's nothing to buy), so they'd otherwise just get dropped as invalid.
 function detectCashAmount(rawRows, mapping) {
-  const { valueColumn, totalCostColumn, costColumn, currencyColumn, sheetCurrency } = mapping;
-  let total = 0, currency = null, found = false;
+  const { valueColumn, totalCostColumn, costColumn, currencyColumn, sheetCurrency, tickerColumn, nameColumn } = mapping;
+  const byCurrency = new Map(); // currency -> summed amount, kept separate so mixed units aren't blindly added
+  let found = false;
   for (const row of rawRows) {
     if (!looksLikeCashRow(row, mapping)) continue;
     let amt = valueColumn ? parseNum(row[valueColumn]) : null;
@@ -288,12 +316,24 @@ function detectCashAmount(rawRows, mapping) {
     if (amt == null) continue;
     let cur = null;
     if (currencyColumn) { const raw = normalizeCurrencyCode(row[currencyColumn]); if (isKnownCurrency(raw)) cur = raw; }
+    // Currency spelled inside the cash row's own label, e.g. "Free cash (GBP)" — recover it before
+    // falling back to the sheet-wide (cost-header-derived) currency or USD, which would otherwise
+    // record a GBP cash line in a USD sheet as dollars.
+    if (!cur) { const fromLabel = detectCurrencyInText([tickerColumn && row[tickerColumn], nameColumn && row[nameColumn]].filter(Boolean).join(" ")); if (fromLabel && isKnownCurrency(fromLabel)) cur = normalizeCurrencyCode(fromLabel); }
     if (!cur && sheetCurrency) cur = sheetCurrency;
-    total += amt;
-    currency = currency || cur || "USD";
+    cur = cur || "USD";
+    byCurrency.set(cur, (byCurrency.get(cur) || 0) + amt);
     found = true;
   }
-  return found ? { amount: total, currency } : null;
+  if (!found) return null;
+  // If every cash row shares a currency, return the clean total. If they DON'T, summing mixed
+  // units would produce a materially wrong figure (£1,000 + $500 is not "1,500"), so surface the
+  // largest single-currency subtotal and flag it so the UI can tell the user to add the rest manually.
+  const entries = [...byCurrency.entries()].sort((a, b) => b[1] - a[1]);
+  const [currency, amount] = entries[0];
+  return entries.length > 1
+    ? { amount, currency, multiCurrency: true, breakdown: entries.map(([c, a]) => ({ currency: c, amount: a })) }
+    : { amount, currency };
 }
 
 // Currency symbol/code that may be embedded in a header itself (e.g. "Avg Cost (€)") rather than a
@@ -505,6 +545,11 @@ function closeJSON(raw) {
   for (let i = 0; i < s.length; i++) { const ch = s[i]; if (inStr) { if (esc) esc = false; else if (ch === "\\") esc = true; else if (ch === '"') inStr = false; } else if (ch === '"') inStr = true; }
   if (inStr) s += '"';
   s = s.replace(/[\s,]*$/, "").replace(/"[^"]*"\s*:\s*$/, "").replace(/[\s,]*$/, "");
+  // Drop a trailing key whose value was cut off mid-token (a bare number or a partial
+  // true/false/null with no closing delimiter). closeJSON only runs on already-unparseable text,
+  // so a dangling number here is almost certainly truncated — omitting the field is safer than
+  // parsing "…\"fitScore\":8" as 8 when the real value was 85.
+  s = s.replace(/,?\s*"[^"]*"\s*:\s*(-?\d[\d.eE+\-]*|t(?:r(?:u(?:e)?)?)?|f(?:a(?:l(?:s(?:e)?)?)?)?|n(?:u(?:l(?:l)?)?)?)$/, "").replace(/[\s,]*$/, "");
   const st = []; inStr = false; esc = false;
   for (let i = 0; i < s.length; i++) { const ch = s[i]; if (inStr) { if (esc) esc = false; else if (ch === "\\") esc = true; else if (ch === '"') inStr = false; } else { if (ch === '"') inStr = true; else if (ch === "{") st.push("}"); else if (ch === "[") st.push("]"); else if (ch === "}" || ch === "]") st.pop(); } }
   while (st.length) s += st.pop();
@@ -551,8 +596,14 @@ async function callClaudeOnce(system, user, maxTokens, maxSearches) {
 // user with an error they'd have to act on themselves.
 async function callClaudeAttempt(system, user, maxTokens, maxSearches) {
   let { parsed, stopReason, text } = await callClaudeOnce(system, user, maxTokens, maxSearches);
-  if (!parsed && stopReason === "max_tokens") {
-    ({ parsed, stopReason, text } = await callClaudeOnce(system, user, Math.round(maxTokens * 1.8) + 1500, maxSearches));
+  // Retry on truncation even when the truncated payload still PARSED. A response cut off inside a
+  // number (e.g. a fitScore of 85 truncated to "8", or a currentPrice of 182.40 to "18") parses
+  // to a valid-but-wrong value, so "parsed && max_tokens" isn't safe to trust — only "parsed &&
+  // NOT truncated" is. Retrying with more room gets a complete, uncorrupted response.
+  if (stopReason === "max_tokens") {
+    const retry = await callClaudeOnce(system, user, Math.round(maxTokens * 1.8) + 1500, maxSearches);
+    // Keep the retry unless it somehow came back worse (unparseable when the first parsed).
+    if (retry.parsed || !parsed) ({ parsed, stopReason, text } = retry);
   }
   return { parsed, stopReason, text };
 }
@@ -1324,7 +1375,7 @@ function HoldingRow({ h, livePrice, fxRates, review, onOpen, onRemove }) {
           </div>
           <div style={{ display: "flex", gap: 10, alignItems: "center" }}>
             {value != null && <span style={{ ...type.data, color: c.text }}>{fmtCurrency(value, rowCurrency)}</span>}
-            {plPct != null && <span style={{ ...type.data, color: isUp ? c.positive : c.negative }}>{isUp ? "+" : ""}{plPct.toFixed(1)}%</span>}
+            {plPct != null && <span style={{ ...type.data, color: isUp ? c.positive : c.negative }}>{isUp ? "+" : ""}{plPct.toFixed(2)}%</span>}
           </div>
         </button>
         <div style={{ textAlign: "right" }}>
@@ -1709,6 +1760,7 @@ export default function VerdictApp() {
         if (Array.isArray(cloud.holdings)) { setHoldings(cloud.holdings); kvSet("atlas_holdings", cloud.holdings); }
         if (cloud.spareCash != null) { setSpareCash(String(cloud.spareCash)); kvSet("atlas_spare_cash", String(cloud.spareCash)); }
         if (cloud.spareCashCurrency) { setSpareCashCurrency(cloud.spareCashCurrency); kvSet("atlas_spare_cash_currency", cloud.spareCashCurrency); }
+        if (Array.isArray(cloud.researchHistory) && cloud.researchHistory.length) { setResearchHistory(cloud.researchHistory); kvSet("atlas_research_history", cloud.researchHistory); }
         setPhase("app");
         if (!hadLocalProfile) setAutoDiscover(true); // fresh device — kick off the first scan
       } else {
@@ -1717,19 +1769,27 @@ export default function VerdictApp() {
         const h = await kvGet("atlas_holdings");
         const cash = await kvGet("atlas_spare_cash");
         const cur = await kvGet("atlas_spare_cash_currency");
+        const rh = await kvGet("atlas_research_history");
         const seed = {};
         if (p?.name) seed.profile = p;
         if (Array.isArray(h)) seed.holdings = h;
         if (cash != null) seed.spareCash = String(cash);
         if (cur) seed.spareCashCurrency = cur;
+        if (Array.isArray(rh) && rh.length) seed.researchHistory = rh.slice(0, 12);
         if (Object.keys(seed).length) saveUserData(firebaseUser.uid, seed);
       }
     })();
   }, [firebaseUser]);
 
+  const priceFetchSeq = useRef(0);
+  // Monotonic id for "which dossier is currently being shown" — evaluate() and openResearchHistory()
+  // both bump it so a slower in-flight request can't overwrite a newer one's result/snapshot.
+  const evalSeq = useRef(0);
+  const discoverSeq = useRef(0);   // same idea for the Discover scan, so switching universe mid-scan wins
   const tickersKey = holdings.map(h => h.ticker).join(",");
   const fetchLivePrices = useCallback(async (background) => {
     if (!holdings.length) { setLivePrices({}); return; }
+    const seq = ++priceFetchSeq.current;
     if (!background) setLivePricesLoading(true);
     const results = await Promise.all(holdings.map(async h => {
       try {
@@ -1742,6 +1802,10 @@ export default function VerdictApp() {
       } catch (_) {}
       return [h.ticker, null];
     }));
+    // If the holdings changed again while this fetch was in flight, a newer fetch has started;
+    // discard this stale call's results so its older `held` set can't drop a just-added ticker's
+    // price, and so it doesn't clear the loading flag while the newer fetch is still running.
+    if (seq !== priceFetchSeq.current) return;
     // Merge instead of replace: a transient failure for one ticker keeps its last known price
     // on screen rather than blanking it to "—" while the "Live · updated just now" label claims
     // everything is fresh. Tickers no longer held are dropped.
@@ -1793,6 +1857,7 @@ export default function VerdictApp() {
     cloudSave({ spareCash: v, ...(currency ? { spareCashCurrency: currency } : {}) }, 900);
   }
   function cycleMessages() {
+    if (timerRef.current) clearInterval(timerRef.current);   // don't leak a prior run's interval
     let k = 0; setMsgIdx(0); setElapsedSec(0);
     const start = Date.now();
     timerRef.current = setInterval(() => {
@@ -1805,7 +1870,11 @@ export default function VerdictApp() {
   // ---- deep dossier ----
   async function evaluate(symbolArg) {
     const name = ((typeof symbolArg === "string" && symbolArg) ? symbolArg : query).trim();
-    if (!name || loading) return;
+    if (!name) return;
+    // Don't silently no-op when a dossier is already loading — tapping a second pick used to do
+    // nothing (no nav, no feedback). Instead navigate and supersede: the newest requested ticker
+    // wins, and a slower earlier request bails at its guards below instead of clobbering the result.
+    const seq = ++evalSeq.current;
     setNav("research"); setLoading(true); setError(null); setResult(null); setBacktestSnapshot(null); cycleMessages();
     // Ground-truth technicals/performance computed directly from real price history via Atlas's own
     // backtest engine (src/lib/marketStats.js) — not searched for or estimated by the model. Only
@@ -1817,6 +1886,7 @@ export default function VerdictApp() {
     // model should guess at, so it's rendered straight from marketStats.js rather than routed
     // through the dossier prompt/schema at all. Tagged with its ticker so it can never be rendered
     // against a different company's dossier (e.g. after opening a saved entry for another stock).
+    if (seq !== evalSeq.current) return;   // a newer evaluate/open superseded this one
     if (histStats?.prices) {
       const snap = backtestSmaCrossover(histStats.prices);
       setBacktestSnapshot(snap ? { ...snap, ticker: (histStats.ticker || name).toUpperCase() } : null);
@@ -1951,6 +2021,7 @@ FULL JSON SCHEMA:
       // Sonnet 5 tokenizer (~30% more tokens for the same text than 4.6) and its adaptive
       // thinking, which shares the max_tokens budget with the answer itself.
       const parsed = await callClaude(sys, `Evaluate: ${name}`, { maxTokens: 14000, maxSearches: 4 });
+      if (seq !== evalSeq.current) return;   // superseded while the AI call was in flight
       if (parsed.error === "not_found") throw new Error(`Couldn't find a public company matching "${name}". Try a ticker or exact name.`);
       if (!parsed.pillars && !parsed.fundamentals) throw new Error("The dossier came back incomplete. Tap Retry.");
       if (parsed.news?.insiderActivity) parsed.news.insiderActivity = cleanInsiderActivity(parsed.news.insiderActivity);
@@ -1959,8 +2030,10 @@ FULL JSON SCHEMA:
       setBacktestSnapshot(s => s && parsed.ticker && s.ticker !== String(parsed.ticker).toUpperCase() ? null : s);
       setResult(parsed);
       saveResearchHistory(parsed);
-    } catch (err) { setError(err.message || "Something went wrong."); }
-    finally { setLoading(false); if (timerRef.current) clearInterval(timerRef.current); }
+    } catch (err) { if (seq === evalSeq.current) setError(err.message || "Something went wrong."); }
+    // Only the request that's still current owns the loading flag / spinner timer — a superseded
+    // older request must not clear the newer one's loading state.
+    finally { if (seq === evalSeq.current) { setLoading(false); if (timerRef.current) clearInterval(timerRef.current); } }
   }
   function openTicker(t) { setQuery(t); evaluate(t); }
 
@@ -1975,18 +2048,23 @@ FULL JSON SCHEMA:
       const entry = { ticker, company: parsed.company || ticker, asOf: parsed.asOf || "", savedAt: new Date().toISOString(), result: parsed };
       const next = [entry, ...prev.filter((e) => e.ticker !== ticker)].slice(0, 25);
       kvSet("atlas_research_history", next);
+      // Sync a trimmed copy to the cloud so past research survives across devices and sign-out
+      // (localStorage keeps the full 25; cap the cloud copy to stay well under Firestore's 1MB doc).
+      cloudSave({ researchHistory: next.slice(0, 12) });
       return next;
     });
   }
   function openResearchHistory(entry) {
+    const seq = ++evalSeq.current;   // this open now owns the shown dossier
     setQuery(entry.ticker);
     // _savedAt lets the dossier flag itself as a saved copy (prices/news are as of that time).
     setResult({ ...entry.result, _savedAt: entry.savedAt });
-    setError(null);
+    setError(null); setLoading(false);
     // The snapshot on screen belongs to whatever was researched last — recompute it for THIS
     // ticker (cheap: one price-history fetch) instead of leaking another stock's numbers.
     setBacktestSnapshot(null);
     fetchHistoricalStats(entry.ticker).then((hs) => {
+      if (seq !== evalSeq.current) return;   // a newer open/evaluate started — don't render this one's snapshot
       if (!hs?.prices) return;
       const snap = backtestSmaCrossover(hs.prices);
       if (snap) setBacktestSnapshot({ ...snap, ticker: entry.ticker });
@@ -1994,7 +2072,7 @@ FULL JSON SCHEMA:
   }
   function updateResearchHistory(ticker) { setQuery(ticker); evaluate(ticker); }
   function removeResearchHistory(ticker) {
-    setResearchHistory((prev) => { const next = prev.filter((e) => e.ticker !== ticker); kvSet("atlas_research_history", next); return next; });
+    setResearchHistory((prev) => { const next = prev.filter((e) => e.ticker !== ticker); kvSet("atlas_research_history", next); cloudSave({ researchHistory: next.slice(0, 12) }); return next; });
   }
 
   // ---- discovery ----
@@ -2008,8 +2086,10 @@ FULL JSON SCHEMA:
     "My interest sectors": "HARD FILTER: only stocks in the investor's stated sectors of interest from the profile above (if none are listed, treat as all sectors). Any market worldwide is fine.",
   };
   async function discover(universeArg) {
-    if (recsLoading) return;
+    // Don't hard-bail when a scan is already running: switching the universe mid-scan must be able
+    // to supersede it, or the old universe's picks land under the newly-selected filter label.
     const uni = typeof universeArg === "string" ? universeArg : universe;
+    const seq = ++discoverSeq.current;
     setRecsLoading(true); setRecsError(null); setRecs(null);
     const sys = `You are a brutally honest equity research analyst — your own independent investment bank, not a mouthpiece for Wall Street consensus. Your only job is to find the BEST stocks for this specific investor RIGHT NOW, based on YOUR OWN read of the hard evidence (fundamentals, valuation, technicals, real factual news events) — not on analyst ratings, price-target chasing, or crowd sentiment. If a name is popular/hyped but the numbers don't back it, leave it out; if a name is out of favor but the numbers are genuinely strong, include it anyway. Use web_search to get current prices, valuations, and recent news. Return ONE JSON object only — no prose, no fences.
 
@@ -2043,11 +2123,12 @@ Schema:
 {"asOf":"","marketContext":"one sentence on current market conditions","picks":[{"ticker":"","company":"","sector":"","fitScore":0,"reason":"","concern":"","tags":[""],"snapshot":[{"label":"","value":""}]}]}`;
     try {
       const parsed = await callClaude(sys, "Find the best stocks for me right now.", { maxTokens: 2800, maxSearches: 2 });
+      if (seq !== discoverSeq.current) return;   // a newer scan (e.g. universe switch) superseded this
       if (!Array.isArray(parsed.picks)) throw new Error("Couldn't build the shortlist. Tap Scan again.");
       parsed.picks.sort((a, b) => (b.fitScore || 0) - (a.fitScore || 0));
       setRecs(parsed);
-    } catch (err) { setRecsError(err.message || "Something went wrong."); }
-    finally { setRecsLoading(false); }
+    } catch (err) { if (seq === discoverSeq.current) setRecsError(err.message || "Something went wrong."); }
+    finally { if (seq === discoverSeq.current) setRecsLoading(false); }
   }
 
   // ---- portfolio news ----
@@ -2533,7 +2614,7 @@ Schema:
         <div style={{ marginTop: 14, overflowX: "auto" }}>
           {/* Picking a universe re-runs the scan immediately (only once a first scan exists —
               otherwise it just sets the filter for the upcoming one). */}
-          <SegmentedControl value={universe} onChange={(v) => { setUniverse(v); if (recs || recsError) discover(v); }} options={["Global all-markets", "US markets", "Europe", "Asia-Pacific", "My interest sectors"]} size="sm" />
+          <SegmentedControl value={universe} onChange={(v) => { setUniverse(v); if (recs || recsError || recsLoading) discover(v); }} options={["Global all-markets", "US markets", "Europe", "Asia-Pacific", "My interest sectors"]} size="sm" />
         </div>
       </Card>
       {recsLoading && <Card><LoadingBlock title="Finding your best picks…" sub="verifying current data · usually 15–20s" /></Card>}
@@ -2727,7 +2808,7 @@ Schema:
                   <Card key={i} pad={16} accentEdge style={{ borderLeftColor: sentColor }}>
                     <div style={{ display: "flex", alignItems: "center", gap: 8, marginBottom: 8, flexWrap: "wrap" }}>
                       <Badge tone={isMacro ? "warning" : "accent"}>{isMacro ? "MACRO" : item.ticker}</Badge>
-                      {item.category && <Badge tone={item.category === "Insider Trading" ? "positive" : "neutral"}>{item.category}</Badge>}
+                      {item.category && <Badge tone={item.category === "Insider Trading" ? "accent" : "neutral"}>{item.category}</Badge>}
                       {item.source && <span style={{ ...type.caption, color: c.text3 }}>{item.source}</span>}
                       {item.date && <span style={{ ...type.caption, color: c.text3 }}>{item.date}</span>}
                       <span style={{ ...type.overline, color: sentColor, marginLeft: "auto" }}>{item.sentiment}</span>
@@ -2862,17 +2943,31 @@ Schema:
                 </div>
               </div>
 
-              {importPreview.cashDetected && (
-                <div style={{ display: "flex", alignItems: "center", justifyContent: "space-between", gap: 12, background: c.accentSoft, border: `1px solid ${c.accentBorder}`, borderRadius: radius.sm, padding: "12px 14px", flexWrap: "wrap" }}>
-                  <span style={{ ...type.small, color: c.text2 }}>
-                    Found <b style={{ color: c.accent }}>{fmtCurrency(importPreview.cashDetected.amount, importPreview.cashDetected.currency)}</b> of uninvested cash — not a security, so it's kept separate and set as your Spare Cash (replacing any current value).
-                  </span>
-                  <label style={{ display: "flex", alignItems: "center", gap: 7, ...type.caption, color: c.text3, cursor: "pointer", flexShrink: 0 }}>
-                    <input type="checkbox" checked={importPreview.includeCash} onChange={e => setImportPreview(prev => ({ ...prev, includeCash: e.target.checked }))} />
-                    Include it
-                  </label>
+              {importPreview.cashDetected && (() => {
+                const cd = importPreview.cashDetected;
+                const converted = fxConvert(cd.amount, cd.currency, portfolioCurrency, fxRates);
+                const showConverted = converted != null && normalizeCurrencyCode(cd.currency) !== normalizeCurrencyCode(portfolioCurrency);
+                return (
+                <div style={{ display: "flex", flexDirection: "column", gap: 8, background: c.accentSoft, border: `1px solid ${c.accentBorder}`, borderRadius: radius.sm, padding: "12px 14px" }}>
+                  <div style={{ display: "flex", alignItems: "center", justifyContent: "space-between", gap: 12, flexWrap: "wrap" }}>
+                    <span style={{ ...type.small, color: c.text2 }}>
+                      {/* Show the converted portfolio-currency figure too, so the previewed amount matches the
+                          "Cash available" tile shown after import (which displays in the portfolio currency). */}
+                      Found <b style={{ color: c.accent }}>{fmtCurrency(cd.amount, cd.currency)}</b>{showConverted ? <> (≈ <b style={{ color: c.accent }}>{fmtCurrency(converted, portfolioCurrency)}</b> in your portfolio currency)</> : null} of uninvested cash — not a security, so it's kept separate and set as your Spare Cash (replacing any current value).
+                    </span>
+                    <label style={{ display: "flex", alignItems: "center", gap: 7, ...type.caption, color: c.text3, cursor: "pointer", flexShrink: 0 }}>
+                      <input type="checkbox" checked={importPreview.includeCash} onChange={e => setImportPreview(prev => ({ ...prev, includeCash: e.target.checked }))} />
+                      Include it
+                    </label>
+                  </div>
+                  {cd.multiCurrency && (
+                    <div style={{ ...type.caption, color: c.warning }}>
+                      Cash was found in multiple currencies ({cd.breakdown.map(b => fmtCurrency(b.amount, b.currency)).join(", ")}). Only the largest is set automatically — add the rest to Spare Cash manually.
+                    </div>
+                  )}
                 </div>
-              )}
+                );
+              })()}
 
               <div style={{ overflowY: "auto", maxHeight: "42vh", border: `1px solid ${c.hairline}`, borderRadius: radius.sm }}>
                 <div style={{ display: "grid", gridTemplateColumns: "1fr 80px 100px 60px", ...type.overline, color: c.text3, padding: "8px 14px", borderBottom: `1px solid ${c.hairline}`, background: c.surface2 }}>

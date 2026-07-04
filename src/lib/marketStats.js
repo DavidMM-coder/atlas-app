@@ -25,13 +25,18 @@ export function rsiCalc(prices, period = 14) {
     const d = prices[i] - prices[i - 1];
     if (d > 0) gains += d; else losses -= d;
   }
+  // Wilder's RSI. The zero-loss guard must be RELATIVE, not a fixed 0.0001 floor: with an
+  // absolute floor, a low-priced stock whose average gain is itself ~1e-4 in price units gets
+  // ag/0.0001 ≈ 1, collapsing RSI toward 50 during a clean uptrend that should read ~100. Handle
+  // the no-loss / no-gain cases directly so the result is price-scale-independent.
+  const rsiFrom = (ag, al) => (al === 0 ? (ag === 0 ? 50 : 100) : 100 - 100 / (1 + ag / al));
   let ag = gains / period, al = losses / period;
-  result[period] = 100 - 100 / (1 + ag / (al || 0.0001));
+  result[period] = rsiFrom(ag, al);
   for (let i = period + 1; i < prices.length; i++) {
     const d = prices[i] - prices[i - 1];
     ag = (ag * (period - 1) + Math.max(d, 0)) / period;
     al = (al * (period - 1) + Math.max(-d, 0)) / period;
-    result[i] = 100 - 100 / (1 + ag / (al || 0.0001));
+    result[i] = rsiFrom(ag, al);
   }
   return result;
 }
@@ -89,7 +94,14 @@ export async function fetchHistoricalStats(tickerGuess, { range = "2y" } = {}) {
     const lastSma50 = sma50Arr[sma50Arr.length - 1], lastSma200 = sma200Arr[sma200Arr.length - 1];
     const rsiArr = rsiCalc(closes, 14);
     const lastRsi = rsiArr[rsiArr.length - 1];
-    const oneYear = prices.slice(-252);
+    // Use an actual 1-calendar-year window, not the last 252 rows: the "252 rows == 1 year"
+    // assumption silently breaks whenever Yahoo returns non-daily candles (the same failure mode
+    // calcStats guards against for CAGR). Fall back to the full series if a year of dates isn't
+    // available.
+    const lastDateMs = new Date(prices[prices.length - 1].date).getTime();
+    const yearAgoMs = lastDateMs - 365 * 86400000;
+    const oneYearWin = prices.filter(p => new Date(p.date).getTime() >= yearAgoMs);
+    const oneYear = oneYearWin.length ? oneYearWin : prices;
     const high52w = Math.max(...oneYear.map(p => p.high ?? p.close));
     const low52w = Math.min(...oneYear.map(p => p.low ?? p.close));
     const retOver = (n) => { const idx = closes.length - 1 - n; return idx >= 0 ? ((lastClose - closes[idx]) / closes[idx]) * 100 : null; };
@@ -102,7 +114,7 @@ export async function fetchHistoricalStats(tickerGuess, { range = "2y" } = {}) {
       high52w, low52w,
       ret1m: retOver(21), ret3m: retOver(63), ret6m: retOver(126),
       retYtd: ytdIdx >= 0 ? ((lastClose - closes[ytdIdx]) / closes[ytdIdx]) * 100 : null,
-      periodYears: (prices.length / 252).toFixed(1),
+      periodYears: (Math.max(lastDateMs - new Date(prices[0].date).getTime(), 0) / (365.25 * 86400000)).toFixed(1),
       cagr: stats.cagr, maxDrawdown: stats.maxDrawdown, sharpe: stats.sharpe, volatility: stats.volatility,
       prices, // raw series, so callers (e.g. the research dossier's backtest snapshot) don't need a second fetch
     };
@@ -173,10 +185,20 @@ function xirr(cashflows) {
   const day0 = new Date(cashflows[0].date).getTime();
   const t = cashflows.map((cf) => (new Date(cf.date).getTime() - day0) / (365.25 * 86400000));
   const npv = (r) => cashflows.reduce((s, cf, i) => s + cf.amount / Math.pow(1 + r, t[i]), 0);
-  let lo = -0.9999, hi = 100;
+  // Floor is just above -1 (not -0.9999) so genuine roots between -100% and -99.99% are actually
+  // bracketed and found by bisection rather than falling through to the sentinel below.
+  let lo = -0.999999, hi = 100;
   let fLo = npv(lo), fHi = npv(hi);
-  while (fLo * fHi > 0 && hi < 1e6) { hi *= 10; fHi = npv(hi); }
-  if (fLo * fHi > 0) return 0;
+  while (fLo * fHi > 0 && hi < 1e9) { hi *= 10; fHi = npv(hi); }
+  if (fLo * fHi > 0) {
+    // No sign change bracketable across (-1, hi]. For a near-total-loss DCA (final value tiny
+    // versus everything contributed) NPV stays negative across the whole domain, so there's no
+    // root and the money-weighted return is effectively -100%. Returning 0 here (the old
+    // behavior) told a user who lost almost everything that their strategy broke even — the exact
+    // opposite of the truth. Report ~-100% for that case; the positive-sign case means a gain
+    // beyond our bracket, so report the high bound.
+    return fLo < 0 ? -100 : hi * 100;
+  }
   for (let i = 0; i < 200; i++) {
     const mid = (lo + hi) / 2;
     const fMid = npv(mid);

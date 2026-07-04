@@ -19,6 +19,15 @@ function anthropicProxy(apiKey) {
         req.on("data", (c) => (body += c));
         req.on("end", async () => {
           try {
+            // Mirror the production handler's shape validation so dev can't spend the key on an
+            // arbitrary model / unbounded max_tokens even locally.
+            let parsedBody;
+            try { parsedBody = JSON.parse(body || "{}"); } catch { parsedBody = null; }
+            if (!parsedBody || !ALLOWED_MODELS.has(parsedBody.model) || !Number.isFinite(parsedBody.max_tokens) || parsedBody.max_tokens < 1 || parsedBody.max_tokens > MAX_TOKENS_CAP) {
+              res.statusCode = 400;
+              res.setHeader("content-type", "application/json");
+              return res.end(JSON.stringify({ error: { message: "Invalid model or max_tokens." } }));
+            }
             const r = await fetch("https://api.anthropic.com/v1/messages", {
               method: "POST",
               headers: {
@@ -48,6 +57,16 @@ const YF_HEADERS = {
   "Accept": "application/json, text/plain, */*",
   "Accept-Language": "en-US,en;q=0.9",
 };
+
+// Same input allowlists the production api/* handlers enforce. The dev proxies used to
+// interpolate range/interval straight into the upstream Yahoo URL, letting arbitrary query
+// params be smuggled onto the request; mirror prod so dev behaves identically and can't be
+// abused by anything that can reach the dev server.
+const TICKER_RE = /^[A-Za-z0-9^=][A-Za-z0-9.\-^=]{0,14}$/;
+const RANGES = new Set(["1d", "5d", "1mo", "3mo", "6mo", "1y", "2y", "5y", "10y", "ytd", "max"]);
+const INTERVALS = new Set(["1m", "5m", "15m", "30m", "1h", "1d", "1wk", "1mo"]);
+const ALLOWED_MODELS = new Set(["claude-sonnet-5", "claude-sonnet-4-6", "claude-haiku-4-5"]);
+const MAX_TOKENS_CAP = 32000;
 
 async function getYahooCrumb() {
   const cookieResp = await fetch("https://fc.yahoo.com", { headers: YF_HEADERS, redirect: "follow" });
@@ -126,10 +145,10 @@ function fundamentalsProxy() {
       server.middlewares.use("/api/fundamentals", (req, res) => {
         const url = new URL(req.url, "http://localhost");
         const ticker = url.searchParams.get("ticker");
-        if (!ticker) {
+        if (!ticker || !TICKER_RE.test(ticker)) {
           res.statusCode = 400;
           res.setHeader("content-type", "application/json");
-          return res.end(JSON.stringify({ error: "ticker required" }));
+          return res.end(JSON.stringify({ error: "valid ticker required" }));
         }
         (async () => {
           const [{ crumb, cookieStr }, secQuarterlyFinancials] = await Promise.all([getYahooCrumb(), fetchSecQuarterlyFinancials(ticker)]);
@@ -181,12 +200,12 @@ function historyProxy() {
         const ticker = url.searchParams.get("ticker");
         const range = url.searchParams.get("range") || "5y";
         const interval = url.searchParams.get("interval") || "1d";
-        if (!ticker) {
+        if (!ticker || !TICKER_RE.test(ticker) || !RANGES.has(range) || !INTERVALS.has(interval)) {
           res.statusCode = 400;
           res.setHeader("content-type", "application/json");
-          return res.end(JSON.stringify({ error: "ticker required" }));
+          return res.end(JSON.stringify({ error: "valid ticker, range and interval required" }));
         }
-        const yhUrl = `https://query1.finance.yahoo.com/v8/finance/chart/${encodeURIComponent(ticker)}?interval=${interval}&range=${range}`;
+        const yhUrl = `https://query1.finance.yahoo.com/v8/finance/chart/${encodeURIComponent(ticker)}?interval=${encodeURIComponent(interval)}&range=${encodeURIComponent(range)}`;
         fetch(yhUrl, { headers: { "User-Agent": "Mozilla/5.0" } })
           .then(r => r.json())
           .then(data => {

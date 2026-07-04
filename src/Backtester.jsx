@@ -20,6 +20,25 @@ function BtTip({ term }) {
   return <InfoTip title={term} body={def}><span>{term}</span></InfoTip>;
 }
 
+// ── Currency display ────────────────────────────────────────────────────────────
+const CCY_SYMBOL = { USD: "$", EUR: "€", GBP: "£", JPY: "¥", CNY: "¥", CHF: "CHF ", CAD: "C$", AUD: "A$", NZD: "NZ$", HKD: "HK$", SGD: "S$", INR: "₹", KRW: "₩", TWD: "NT$", BRL: "R$", ZAR: "R", SEK: "kr ", NOK: "kr ", DKK: "kr ", MXN: "MX$", PLN: "zł " };
+// Yahoo quotes some markets in a minor unit (GBp/GBX = pence). Normalize the whole price series
+// to the major unit up front so cash, equity and trade prices are all in one coherent unit — and
+// so a London ticker's results aren't rendered as pence prefixed with "$".
+function normalizePriceData(data) {
+  const raw = String(data.currency || "USD");
+  if (/^gb[px]$/i.test(raw)) {
+    return { ...data, currency: "GBP", prices: (data.prices || []).map(p => ({ ...p, close: p.close / 100, high: p.high != null ? p.high / 100 : p.high, low: p.low != null ? p.low / 100 : p.low })) };
+  }
+  return data;
+}
+function ccySymbol(code) { return CCY_SYMBOL[String(code || "USD").toUpperCase()] || ""; }
+function fmtMoney(v, code, digits = 2) {
+  const sym = ccySymbol(code);
+  const body = Number(v).toLocaleString(undefined, { minimumFractionDigits: digits, maximumFractionDigits: digits });
+  return sym ? `${sym}${body}` : `${body} ${String(code || "USD").toUpperCase()}`;
+}
+
 // ── Helpers ───────────────────────────────────────────────────────────────────
 function daysBetween(dateA, dateB) {
   return Math.round((new Date(dateB) - new Date(dateA)) / 86400000);
@@ -124,12 +143,15 @@ function runFundamentalStrategy(prices, strategy, params, cash, costPct, fundame
   } else if (strategy === "pe_threshold") {
     const { buyPE, sellPE } = params;
     const qf = (fundamentals.quarterlyFinancials || []).filter(q => q.eps != null);
+    // `known` advances forward with priceDate (both monotonic) instead of re-filtering qf every
+    // row — same "quarters public by this date" set, computed once per new quarter.
+    let known = 0;
     for (let i = 1; i < prices.length; i++) {
       const priceDate = prices[i].date;
       // Only quarters whose filing was public by this date — not merely ended by it.
-      const knownQ = qf.filter(q => quarterKnownDate(q) <= priceDate);
-      if (knownQ.length >= 4) {
-        const trailingEPS = knownQ.slice(-4).reduce((s, q) => s + q.eps, 0);
+      while (known < qf.length && quarterKnownDate(qf[known]) <= priceDate) known++;
+      if (known >= 4) {
+        const trailingEPS = qf[known - 1].eps + qf[known - 2].eps + qf[known - 3].eps + qf[known - 4].eps;
         if (trailingEPS > 0) {
           const pe = prices[i].close / trailingEPS;
           if (pe < buyPE && position === 0 && cashHeld > 0) {
@@ -155,12 +177,14 @@ function runFundamentalStrategy(prices, strategy, params, cash, costPct, fundame
       if (curr && yearAgo && yearAgo > 0) growthRates.push({ date: qf[i].date, known: quarterKnownDate(qf[i]), yoy: (curr - yearAgo) / yearAgo * 100 });
     }
     let lastSignalDate = null;
+    // `knownN` advances forward with priceDate instead of re-filtering growthRates every row.
+    let knownN = 0;
     for (let i = 1; i < prices.length; i++) {
       const priceDate = prices[i].date;
-      const knownRates = growthRates.filter(r => r.known <= priceDate);
-      if (knownRates.length >= 2) {
-        const latest = knownRates[knownRates.length - 1];
-        const prev = knownRates[knownRates.length - 2];
+      while (knownN < growthRates.length && growthRates[knownN].known <= priceDate) knownN++;
+      if (knownN >= 2) {
+        const latest = growthRates[knownN - 1];
+        const prev = growthRates[knownN - 2];
         const accelerating = latest.yoy > prev.yoy && latest.yoy >= minGrowth;
         const daysFromReport = daysBetween(latest.known, priceDate);
         if (daysFromReport >= 0 && daysFromReport <= 10 && latest.known !== lastSignalDate) {
@@ -180,20 +204,25 @@ function runFundamentalStrategy(prices, strategy, params, cash, costPct, fundame
     }
   } else if (strategy === "dividend_reversion") {
     const { yieldPremium } = params;
-    const divs = fundamentals.dividends || [];
+    const divs = fundamentals.dividends || [];   // sorted ascending by date
     const yieldHistory = [];
+    // Maintain the trailing-12-month dividend total with two forward-only pointers into `divs`
+    // (window is date > yearAgoStr && date <= priceDate), and the trailing-252 yield average with
+    // a running sum + ring — instead of re-filtering `divs` and re-reducing a 252-slice every row.
+    let divHi = 0, divLo = 0, annualDiv = 0, yieldSum = 0;
     for (let i = 1; i < prices.length; i++) {
       const priceDate = prices[i].date;
       const yearAgo = new Date(priceDate); yearAgo.setFullYear(yearAgo.getFullYear() - 1);
       const yearAgoStr = yearAgo.toISOString().slice(0, 10);
-      const trailing = divs.filter(d => d.date > yearAgoStr && d.date <= priceDate);
-      const annualDiv = trailing.reduce((s, d) => s + d.amount, 0);
+      while (divHi < divs.length && divs[divHi].date <= priceDate) { annualDiv += divs[divHi].amount; divHi++; }
+      while (divLo < divHi && divs[divLo].date <= yearAgoStr) { annualDiv -= divs[divLo].amount; divLo++; }
       if (annualDiv > 0 && prices[i].close > 0) {
         const yld = annualDiv / prices[i].close;
-        yieldHistory.push(yld);
+        yieldHistory.push(yld); yieldSum += yld;
+        if (yieldHistory.length > 252) yieldSum -= yieldHistory[yieldHistory.length - 253];
         if (yieldHistory.length >= 60) {
-          const window = yieldHistory.slice(-252);
-          const avgYield = window.reduce((a, b) => a + b, 0) / window.length;
+          const winLen = Math.min(yieldHistory.length, 252);
+          const avgYield = yieldSum / winLen;
           const threshold = avgYield * (1 + yieldPremium / 100);
           if (yld >= threshold && position === 0 && cashHeld > 0) {
             const shares = (cashHeld * (1 - costPct)) / prices[i].close;
@@ -217,7 +246,7 @@ function runStrategy(prices, strategy, params, cash = 10000, costPct = 0.001, fu
   return runTechnicalStrategy(prices, strategy, params, cash, costPct);
 }
 // ── SVG Chart ─────────────────────────────────────────────────────────────────
-function EquityChart({ strategy, buyhold, trades = [], width = 760, height = 340 }) {
+function EquityChart({ strategy, buyhold, trades = [], currency = "USD", width = 760, height = 340 }) {
   const pad = { top: 20, right: 20, bottom: 40, left: 64 };
   const W = width - pad.left - pad.right;
   const H = height - pad.top - pad.bottom;
@@ -227,24 +256,39 @@ function EquityChart({ strategy, buyhold, trades = [], width = 760, height = 340
   const n = strategy.length;
   const x = i => (i / (n - 1)) * W;
   const y = v => H - ((v - minV) / (maxV - minV)) * H;
+  const sym = ccySymbol(currency);
   const toPath = arr => arr.map((e, i) => `${i === 0 ? "M" : "L"}${x(i).toFixed(1)},${y(e.value).toFixed(1)}`).join(" ");
   const yLabels = Array.from({ length: 5 }, (_, i) => { const v = minV + ((maxV - minV) * i) / 4; return { v, y: y(v) }; });
   const xLabels = Array.from({ length: 6 }, (_, i) => { const idx = Math.min(Math.floor(i * n / 6), n - 1); return { idx, date: strategy[idx]?.date?.slice(0, 7) }; });
-  const buyTrades = trades.filter(t => t.type === "BUY").map(t => { const idx = strategy.findIndex(e => e.date >= t.date); return idx >= 0 ? { idx, v: strategy[idx]?.value } : null; }).filter(Boolean);
-  const sellTrades = trades.filter(t => t.type === "SELL").map(t => { const idx = strategy.findIndex(e => e.date >= t.date); return idx >= 0 ? { idx, v: strategy[idx]?.value } : null; }).filter(Boolean);
+  // Both arrays are date-sorted, so map each trade to its equity index with a single advancing
+  // pointer instead of a full findIndex scan per trade (which was O(trades × equityLength) on
+  // every render, before the 300-cap even applied). Cap the marker count up front too.
+  const tradeMarkers = (type) => {
+    const out = [];
+    let k = 0;
+    for (const t of trades) {
+      if (t.type !== type) continue;
+      while (k < n && strategy[k].date < t.date) k++;
+      if (k < n) out.push({ idx: k, v: strategy[k]?.value });
+      if (out.length >= 300) break;
+    }
+    return out;
+  };
+  const buyTrades = tradeMarkers("BUY");
+  const sellTrades = tradeMarkers("SELL");
 
   return (
     <svg viewBox={`0 0 ${width} ${height}`} style={{ width: "100%", height: "auto", display: "block" }}>
       <g transform={`translate(${pad.left},${pad.top})`}>
         {yLabels.map((l, i) => <line key={i} x1={0} y1={l.y.toFixed(1)} x2={W} y2={l.y.toFixed(1)} stroke={c.grid} strokeWidth="1" />)}
-        {yLabels.map((l, i) => <text key={i} x={-10} y={l.y + 4} textAnchor="end" style={{ fontFamily: font.mono, fontSize: 10, fill: c.text3 }}>${(l.v / 1000).toFixed(1)}k</text>)}
+        {yLabels.map((l, i) => <text key={i} x={-10} y={l.y + 4} textAnchor="end" style={{ fontFamily: font.mono, fontSize: 10, fill: c.text3 }}>{sym}{(l.v / 1000).toFixed(1)}k</text>)}
         {xLabels.map((l, i) => <text key={i} x={x(l.idx)} y={H + 20} textAnchor="middle" style={{ fontFamily: font.mono, fontSize: 9, fill: c.text3 }}>{l.date}</text>)}
         <path d={toPath(buyhold)} fill="none" stroke={c.seriesAlt} strokeWidth="1.5" strokeDasharray="6,4" opacity="0.7" />
         <motion.path d={toPath(strategy)} fill="none" stroke={c.accent} strokeWidth="2.2"
           initial={{ pathLength: 0 }} animate={{ pathLength: 1 }} transition={{ duration: 0.6, ease: [0.16,1,0.3,1] }}
           style={{ filter: `drop-shadow(0 0 5px ${c.accentGlow})` }} />
-        {buyTrades.slice(0, 300).map((t, i) => <circle key={i} cx={x(t.idx).toFixed(1)} cy={y(t.v).toFixed(1)} r="3.5" fill={c.positive} />)}
-        {sellTrades.slice(0, 300).map((t, i) => <circle key={i} cx={x(t.idx).toFixed(1)} cy={y(t.v).toFixed(1)} r="3.5" fill={c.negative} />)}
+        {buyTrades.map((t, i) => <circle key={i} cx={x(t.idx).toFixed(1)} cy={y(t.v).toFixed(1)} r="3.5" fill={c.positive} />)}
+        {sellTrades.map((t, i) => <circle key={i} cx={x(t.idx).toFixed(1)} cy={y(t.v).toFixed(1)} r="3.5" fill={c.negative} />)}
       </g>
     </svg>
   );
@@ -356,7 +400,7 @@ const STRATEGIES = [
     params: [ { id: "yieldPremium", label: "Buy when yield above avg by (%)", default: 25, min: 10, max: 75 } ] },
   { id: "dca", name: "Dollar-Cost Averaging", type: "passive", origin: "Passive investing classic",
     desc: "Invest a fixed amount every month, regardless of price, instead of a lump sum on day one. Removes market-timing risk — you're always buying at the average price over time. The question most long-term investors actually have.",
-    params: [ { id: "monthlyAmount", label: "Monthly contribution ($)", default: 500, min: 50, max: 5000 } ] },
+    params: [ { id: "monthlyAmount", label: "Monthly contribution", default: 500, min: 50, max: 5000 } ] },
 ];
 const RANGES = [ { value: "1y", label: "1Y" }, { value: "2y", label: "2Y" }, { value: "5y", label: "5Y" }, { value: "10y", label: "10Y" } ];
 
@@ -404,7 +448,7 @@ export default function Backtester({ initialTicker } = {}) {
     const resp = await fetch(apiUrl(`/api/history?ticker=${encodeURIComponent(t)}&range=${r}`));
     const data = await resp.json();
     if (data.error) throw new Error(data.error);
-    return data;
+    return normalizePriceData(data);
   }
   async function fetchFundamentals(t) {
     const resp = await fetch(apiUrl(`/api/fundamentals?ticker=${encodeURIComponent(t)}`));
@@ -471,7 +515,7 @@ export default function Backtester({ initialTicker } = {}) {
       const stratCAGR = parseFloat(stratStats.cagr);
       const bhCAGR = parseFloat(bhStats.cagr);
       setResult({
-        ticker: priceData.ticker, name: priceData.name, equity, bh, trades, stratStats, bhStats,
+        ticker: priceData.ticker, name: priceData.name, currency: priceData.currency || "USD", equity, bh, trades, stratStats, bhStats,
         beats: stratCAGR > bhCAGR, margin: Math.abs(stratCAGR - bhCAGR).toFixed(2),
         totalTrades: trades.length, fundamentals, dataWindow, invested,
       });
@@ -562,7 +606,7 @@ export default function Backtester({ initialTicker } = {}) {
                 <SegmentedControl value={range} onChange={setRange} options={RANGES} size="sm" style={{ width: "100%", justifyContent: "stretch" }} />
               </Field>
               <div style={{ display: "grid", gridTemplateColumns: isDCA ? "1fr" : "1fr 1fr", gap: 10 }}>
-                {!isDCA && <Field label="Capital ($)"><Input mono value={cash} onChange={e => setCash(e.target.value)} inputMode="decimal" /></Field>}
+                {!isDCA && <Field label="Capital"><Input mono value={cash} onChange={e => setCash(e.target.value)} inputMode="decimal" /></Field>}
                 <Field label="Cost (%)"><Input mono value={costPct} onChange={e => setCostPct(e.target.value)} inputMode="decimal" placeholder="0.1" /></Field>
               </div>
               {isDCA && <p style={{ ...type.caption, color: c.text3, margin: 0 }}>DCA ignores the Capital field — it invests the monthly amount below on a recurring schedule instead of a lump sum.</p>}
@@ -618,15 +662,15 @@ export default function Backtester({ initialTicker } = {}) {
                 <p style={{ ...type.bodyL, fontWeight: 600, color: c.text, margin: "0 0 4px" }}>
                   {isDCA
                     ? (result.beats
-                      ? `Dollar-cost averaging $${getParam("monthlyAmount")}/month beat a lump sum of the same ${result.invested ? `$${Math.round(result.invested).toLocaleString()}` : "total"} by ${result.margin}% CAGR on ${result.ticker} over ${range}.`
-                      : `A lump sum of the same ${result.invested ? `$${Math.round(result.invested).toLocaleString()}` : "total"} beat dollar-cost averaging $${getParam("monthlyAmount")}/month by ${result.margin}% CAGR on ${result.ticker} over ${range}.`)
+                      ? `Dollar-cost averaging ${fmtMoney(getParam("monthlyAmount"), result.currency, 0)}/month beat a lump sum of the same ${result.invested ? fmtMoney(result.invested, result.currency, 0) : "total"} by ${result.margin}% CAGR on ${result.ticker} over ${range}.`
+                      : `A lump sum of the same ${result.invested ? fmtMoney(result.invested, result.currency, 0) : "total"} beat dollar-cost averaging ${fmtMoney(getParam("monthlyAmount"), result.currency, 0)}/month by ${result.margin}% CAGR on ${result.ticker} over ${range}.`)
                     : (result.beats
                       ? `${strat.name} beat buy-and-hold by ${result.margin}% CAGR on ${result.ticker} over ${range}.`
                       : `Buy-and-hold beat ${strat.name} by ${result.margin}% CAGR on ${result.ticker} over ${range}.`)}
                 </p>
                 <p style={{ ...type.small, color: c.text3, margin: 0 }}>
                   {isDCA
-                    ? `${result.totalTrades} monthly contributions · ${parseFloat(costPct)}% cost per buy · $${result.invested ? Math.round(result.invested).toLocaleString() : "0"} total invested`
+                    ? `${result.totalTrades} monthly contributions · ${parseFloat(costPct)}% cost per buy · ${result.invested ? fmtMoney(result.invested, result.currency, 0) : fmtMoney(0, result.currency, 0)} total invested`
                     : <>
                         {result.totalTrades} trades executed · {parseFloat(costPct)}% cost per trade
                         {result.totalTrades === 0 && " · No signals triggered — try adjusting parameters or a longer range"}
@@ -665,7 +709,7 @@ export default function Backtester({ initialTicker } = {}) {
                     {!isDCA && <span style={{ display: "flex", alignItems: "center", gap: 6 }}><span style={{ width: 7, height: 7, borderRadius: 99, background: c.negative, display: "inline-block" }} /> Sell</span>}
                   </div>
                 </div>
-                <EquityChart strategy={result.equity} buyhold={result.bh} trades={result.trades} />
+                <EquityChart strategy={result.equity} buyhold={result.bh} trades={result.trades} currency={result.currency} />
               </Card>
 
               {/* Trade log + fundamentals tabs */}
@@ -686,7 +730,7 @@ export default function Backtester({ initialTicker } = {}) {
                         <div key={i} style={{ display: "grid", gridTemplateColumns: "120px 60px 100px 80px 1fr", gap: 8, padding: "6px 0", borderBottom: `1px solid ${c.hairline}` }}>
                           <span style={{ fontFamily: font.mono, fontSize: 12, color: c.text3 }}>{t.date}</span>
                           <span style={{ ...type.bodyStrong, fontSize: 12, color: t.type === "BUY" ? c.positive : c.negative }}>{t.type}</span>
-                          <span style={{ fontFamily: font.mono, fontSize: 12, color: c.text }}>${t.price.toFixed(2)}</span>
+                          <span style={{ fontFamily: font.mono, fontSize: 12, color: c.text }}>{fmtMoney(t.price, result.currency)}</span>
                           <span style={{ fontFamily: font.mono, fontSize: 12, color: c.text3 }}>{t.shares.toFixed(4)}</span>
                           <span style={{ ...type.caption, color: c.text3 }}>{t.note || ""}</span>
                         </div>

@@ -44,8 +44,11 @@ function rateLimited(key, limit = 20, windowMs = 60_000) {
 
 async function verifyFirebaseToken(idToken) {
   const key = process.env.VITE_FIREBASE_API_KEY;
-  // Firebase not configured (e.g. a bare preview deployment) — nothing to verify against.
-  if (!key) return { ok: true, uid: null };
+  // Fail CLOSED when Firebase isn't configured. Returning { ok: true } here used to turn the
+  // endpoint into a fully unauthenticated Anthropic relay the moment this env var was missing or
+  // misnamed (e.g. a preview deploy, or a prod typo) — a missing gate silently removed the gate.
+  // If auth can't be enforced, no one gets in. AI features are unavailable rather than wide open.
+  if (!key) return { ok: false, unconfigured: true };
   if (!idToken) return { ok: false };
   try {
     const r = await fetch(`https://identitytoolkit.googleapis.com/v1/accounts:lookup?key=${encodeURIComponent(key)}`, {
@@ -89,9 +92,15 @@ export default async function handler(req, res) {
 
   const idToken = (req.headers.authorization || "").replace(/^Bearer\s+/i, "") || null;
   const auth = await verifyFirebaseToken(idToken);
-  if (!auth.ok) return res.status(401).json({ error: { message: "Sign in to use Atlas AI features." } });
+  if (!auth.ok) {
+    if (auth.unconfigured) return res.status(503).json({ error: { message: "AI features are unavailable: the server is not configured for authentication." } });
+    return res.status(401).json({ error: { message: "Sign in to use Atlas AI features." } });
+  }
 
-  const ip = String(req.headers["x-forwarded-for"] || "").split(",")[0].trim() || "unknown";
+  // For the rate-limit key prefer the authenticated uid; fall back to the platform-trusted client
+  // IP (Vercel's x-real-ip, the last hop we control) rather than raw x-forwarded-for, whose first
+  // element is fully attacker-supplied and rotatable per request to defeat the limiter.
+  const ip = String(req.headers["x-real-ip"] || String(req.headers["x-forwarded-for"] || "").split(",").pop() || "").trim() || "unknown";
   if (rateLimited(auth.uid || ip)) {
     return res.status(429).json({ error: { message: "Too many requests — wait a minute and try again." } });
   }
