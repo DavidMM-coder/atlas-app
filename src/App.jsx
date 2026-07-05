@@ -1724,6 +1724,8 @@ export default function VerdictApp() {
   const [marketNews, setMarketNews] = useState(null);
   const [marketNewsLoading, setMarketNewsLoading] = useState(false);
   const [marketNewsError, setMarketNewsError] = useState(null);
+  const marketNewsAtRef = useRef(0);   // when the shown briefing was fetched (for stale-while-revalidate)
+  const mnBgDone = useRef(false);      // one silent background refresh per session
 
   useEffect(() => {
     (async () => {
@@ -1744,7 +1746,7 @@ export default function VerdictApp() {
         // auto-scan (the previous behavior triggered a full Discover scan on EVERY page load).
         const FRESH_MS = 8 * 3600 * 1000;
         const mn = await kvGet("atlas_market_news");
-        if (mn?.data && mn.at && Date.now() - mn.at < FRESH_MS) setMarketNews(mn.data);
+        if (mn?.data && mn.at && Date.now() - mn.at < FRESH_MS) { setMarketNews(mn.data); marketNewsAtRef.current = mn.at; }
         const rc = await kvGet("atlas_recs");
         const recsFresh = !!(rc?.data && rc.at && Date.now() - rc.at < FRESH_MS);
         if (recsFresh) setRecs(rc.data);
@@ -1880,7 +1882,18 @@ export default function VerdictApp() {
   useEffect(() => { if (nav === "backtest") setBacktestMounted(true); }, [nav]);
   // Market news widget loads once per session the first time the Today screen is visited —
   // independent of holdings, so it's useful even before the user has added any positions.
-  useEffect(() => { if (nav === "home" && profile && !marketNews && !marketNewsLoading) fetchMarketNews(); }, [nav, profile]);
+  // Stale-while-revalidate for the Today market briefing: if nothing is cached, scan in the
+  // foreground (spinner) — this is the only case the user waits on. If a cached briefing is already
+  // showing, refresh it silently in the background (no spinner) at most once per session, and only
+  // when it's more than 30 min old — so returning to Today shows the last news instantly.
+  useEffect(() => {
+    if (nav !== "home" || !profile) return;
+    if (!marketNews) { if (!marketNewsLoading) fetchMarketNews(false); return; }
+    if (!mnBgDone.current && marketNewsAtRef.current && Date.now() - marketNewsAtRef.current > 30 * 60 * 1000) {
+      mnBgDone.current = true;
+      fetchMarketNews(true);
+    }
+  }, [nav, profile, marketNews]);
 
   function finishOnboarding(p) { setProfile(p); kvSet("atlas_profile", p); cloudSave({ profile: p }); setPhase("app"); setNav("home"); setAutoDiscover(true); }
   function saveProfile(p) { setProfile(p); kvSet("atlas_profile", p); cloudSave({ profile: p }); setShowProfileEditor(false); setRecs(null); setReview(null); }
@@ -2222,9 +2235,10 @@ Aim for 2-3 items per holding plus 2-3 macro items, max 20 total in "news". Insi
   }
 
   // ---- market-wide news (Today screen widget) ----
-  async function fetchMarketNews() {
+  async function fetchMarketNews(background) {
     if (marketNewsLoading) return;
-    setMarketNewsLoading(true); setMarketNewsError(null);
+    if (!background) setMarketNewsLoading(true);
+    setMarketNewsError(null);
     const sys = `You are a markets desk analyst. Find the most important general stock-market-moving news from the last 24-48 hours — this is NOT about any specific user's holdings, it's the general "what's moving markets" briefing any investor would want.
 
 Cover things like: Fed/central bank decisions and rate expectations, major macro data (inflation, jobs, GDP), big market-wide moves and why, geopolitical events affecting markets, and single-company news large enough to move the broader market (mega-cap earnings, major M&A). Use web_search to get real, current items — no invented headlines.
@@ -2246,12 +2260,14 @@ Return ONLY this JSON, nothing else:
 {"marketPulse":"","items":[{"headline":"","source":"","date":"","url":"","category":"","summary":"","impact":"","relatedTicker":null}]}
 Aim for 6-8 items, most important first.`;
     try {
-      const parsed = await callClaude(sys, "What's moving markets right now?", { maxTokens: 3800, maxSearches: 2, fast: true });
+      const parsed = await callClaude(sys, "What's moving markets right now?", { maxTokens: 3800, maxSearches: 1, fast: true });
       setMarketNews(parsed);
-      kvSet("atlas_market_news", { data: parsed, at: Date.now() });   // cache for instant revisit
+      marketNewsAtRef.current = Date.now();
+      kvSet("atlas_market_news", { data: parsed, at: marketNewsAtRef.current });   // cache for instant revisit
     } catch (e) {
-      setMarketNewsError(e.message || "Could not fetch market news.");
-    } finally { setMarketNewsLoading(false); }
+      // A background refresh that fails must NOT clobber the cached briefing already on screen.
+      if (!background) setMarketNewsError(e.message || "Could not fetch market news.");
+    } finally { if (!background) setMarketNewsLoading(false); }
   }
 
   // ---- portfolio review ----
@@ -2561,10 +2577,10 @@ Schema:
       <motion.div variants={{ initial: { opacity: 0, y: 10 }, animate: { opacity: 1, y: 0 } }}>
         <div style={{ display: "flex", alignItems: "center", justifyContent: "space-between", marginBottom: 10 }}>
           <Overline color={c.text3}>Today's market</Overline>
-          <Button variant="ghost" size="sm" onClick={fetchMarketNews} loading={marketNewsLoading}>{marketNews ? "Refresh" : "Load"}</Button>
+          <Button variant="ghost" size="sm" onClick={() => fetchMarketNews(false)} loading={marketNewsLoading}>{marketNews ? "Refresh" : "Load"}</Button>
         </div>
         {marketNewsLoading && <Card pad={14}><LoadingBlock title="Scanning today's market-moving news…" sub="Live search · usually 20–40s" /></Card>}
-        {marketNewsError && !marketNewsLoading && <ErrorBanner msg={marketNewsError} onRetry={fetchMarketNews} label="Try again" />}
+        {marketNewsError && !marketNewsLoading && <ErrorBanner msg={marketNewsError} onRetry={() => fetchMarketNews(false)} label="Try again" />}
         {marketNews && !marketNewsLoading && (
           <Card pad={14}>
             {marketNews.marketPulse && (
