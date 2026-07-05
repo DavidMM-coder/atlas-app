@@ -249,6 +249,45 @@ async function kvGet(k) { try { const v = localStorage.getItem(k); return v ? JS
 async function kvSet(k, v) { try { localStorage.setItem(k, JSON.stringify(v)); } catch {} }
 function kvDel(k) { try { localStorage.removeItem(k); } catch {} }
 
+// Append-only forward-return log for Discover picks. Distinct from atlas_recs (a "current picks"
+// cache each scan OVERWRITES): this records every pick, every scan — ticker, fit score, the time it
+// was recommended, and the price at that moment — so we can later check whether the AI's picks
+// actually went up. It NEVER overwrites or dedupes; a ticker recommended twice is logged twice on
+// purpose (that repetition is itself signal). No forward-return math is computed here — just logging.
+// ⚠ localStorage only: single browser, lost on cache-clear or device switch. No backend = fragile.
+const PICK_HISTORY_KEY = "atlas_pick_history";
+async function logPickHistory(picks, uni) {
+  if (!Array.isArray(picks) || !picks.length) return;
+  const at = new Date().toISOString();
+  const records = await Promise.all(picks.map(async (p) => {
+    const ticker = String(p.ticker || "").toUpperCase();
+    // The discover response carries no clean price field, so grab the latest close per pick — the
+    // recommendation price is the one field we most need and can't backfill later.
+    let price = null, currency = null;
+    try {
+      const r = await fetch(apiUrl(`/api/history?ticker=${encodeURIComponent(ticker)}&range=5d&interval=1d`));
+      if (r.ok) { const d = await r.json(); const last = d.prices?.[d.prices.length - 1]; if (last?.close != null) { price = last.close; currency = d.currency || null; } }
+    } catch (_) { /* price best-effort; still log the pick even if the fetch fails */ }
+    return { ticker, company: p.company || null, fitScore: p.fitScore ?? null, universe: uni || null, price, currency, at };
+  }));
+  const prev = await kvGet(PICK_HISTORY_KEY);
+  await kvSet(PICK_HISTORY_KEY, [...(Array.isArray(prev) ? prev : []), ...records]);
+}
+// Console helper to pull the log off this device (it lives only in localStorage). Run
+// `atlasExportPickHistory()` in the browser console to download atlas_pick_history.json.
+if (typeof window !== "undefined") {
+  window.atlasExportPickHistory = async () => {
+    const data = (await kvGet(PICK_HISTORY_KEY)) || [];
+    try {
+      const url = URL.createObjectURL(new Blob([JSON.stringify(data, null, 2)], { type: "application/json" }));
+      const a = document.createElement("a"); a.href = url; a.download = "atlas_pick_history.json"; a.click();
+      URL.revokeObjectURL(url);
+    } catch (_) {}
+    console.log(`atlas_pick_history: ${data.length} records`, data);
+    return data;
+  };
+}
+
 // ---------- spreadsheet import: column detection + currency inference ----------
 function looksLikeTicker(v) {
   const s = String(v ?? "").trim();
@@ -2261,6 +2300,7 @@ Schema:
       setRecs(parsed);
       recsAtRef.current = Date.now();
       kvSet("atlas_recs", { data: parsed, at: recsAtRef.current });   // cache for instant revisit
+      logPickHistory(parsed.picks, uni);   // append-only forward-return log (fire-and-forget)
     } catch (err) { if (seq === discoverSeq.current) setRecsError(err.message || "Something went wrong."); }
     finally { if (seq === discoverSeq.current) setRecsLoading(false); }
   }
