@@ -697,6 +697,27 @@ async function callClaude(system, user, { maxTokens = 4000, maxSearches = 4, fas
   }
 }
 
+// Lightweight analysis-only AI call: NO web_search tool, so it never touches the shared upstream
+// web-search rate limit (the fragile resource) and doesn't go through the search-serialization
+// pool. Thinking is disabled for speed — safe here precisely because there's no web search to
+// suppress. Used to add a "what this means" read on top of already-fetched news headlines.
+async function callClaudeAnalyze(system, user, maxTokens = 1600) {
+  const body = JSON.stringify({
+    model: AI_MODEL, max_tokens: maxTokens, system,
+    messages: [{ role: "user", content: user }],
+    thinking: { type: "disabled" },
+  });
+  const doFetch = async (forceRefresh) => fetch(`${API_BASE}/api/messages`, {
+    method: "POST", headers: { "Content-Type": "application/json", ...(await aiAuthHeaders(forceRefresh)) }, body,
+  });
+  let resp = await doFetch(false);
+  if (resp.status === 401 && auth?.currentUser) resp = await doFetch(true);   // self-heal a stale token
+  const data = await resp.json();
+  if (data.error) throw new Error(data.error.message || "API error");
+  const text = (data.content || []).filter((b) => b.type === "text").map((b) => b.text).join("\n");
+  return extractJSON(text);
+}
+
 // The model doesn't always obey the "no vague aggregate rows" prompt instruction (e.g. still
 // occasionally returns "Multiple open-market purchases" / "Undisclosed per-filing total" instead
 // of one clean dated filing). Prompting alone can't guarantee this, so every insider transaction
@@ -2235,32 +2256,53 @@ Aim for 2-3 items per holding plus 2-3 macro items, max 20 total in "news". Insi
   }
 
   // ---- market-wide news (Today screen widget) ----
+  // Real headlines + links come from /api/news (CNBC markets/economy feed) — fast, reliable, and
+  // independent of the shared AI web-search limit that used to make this widget hang. The AI then
+  // only adds a "what this means" read on top (no web search), and if that step fails we still
+  // show the real headlines. Categories the widget knows how to tint:
+  const NEWS_CATEGORIES = ["Fed & Rates", "Macro Data", "Geopolitical", "Earnings", "M&A", "Sector Move", "Other"];
   async function fetchMarketNews(background) {
     if (marketNewsLoading) return;
     if (!background) setMarketNewsLoading(true);
     setMarketNewsError(null);
-    const sys = `You are a markets desk analyst. Find the most important general stock-market-moving news from the last 24-48 hours — this is NOT about any specific user's holdings, it's the general "what's moving markets" briefing any investor would want.
-
-Cover things like: Fed/central bank decisions and rate expectations, major macro data (inflation, jobs, GDP), big market-wide moves and why, geopolitical events affecting markets, and single-company news large enough to move the broader market (mega-cap earnings, major M&A). Use web_search to get real, current items — no invented headlines.
-
-For each item give:
-- headline: actual headline text
-- source: publication name
-- date: approximate (e.g. "Jun 30, 2026")
-- url: real https URL to the article
-- category: one of "Fed & Rates", "Macro Data", "Geopolitical", "Earnings", "M&A", "Sector Move", "Other"
-- summary: 2 sentences on what happened
-- impact: one sentence — YOUR OWN read on what this means going forward, not just a restatement of the news
-- relatedTicker: if this centers on one specific public company, its ticker (e.g. "AAPL"), else null
-
-Also give:
-- marketPulse: one sentence capturing the overall market mood right now and why (bullish/cautious/bearish)
-
-Return ONLY this JSON, nothing else:
-{"marketPulse":"","items":[{"headline":"","source":"","date":"","url":"","category":"","summary":"","impact":"","relatedTicker":null}]}
-Aim for 6-8 items, most important first.`;
     try {
-      const parsed = await callClaude(sys, "What's moving markets right now?", { maxTokens: 3800, maxSearches: 1, fast: true });
+      // 1) Fetch real headlines from the news feed (no AI, no search limit).
+      const r = await fetch(apiUrl("/api/news"));
+      const d = await r.json();
+      if (d.error || !Array.isArray(d.items) || !d.items.length) throw new Error(d.error || "No market news available right now.");
+      const feed = d.items.slice(0, 18);
+
+      // 2) Add analysis WITHOUT web search — the model only reads the headlines we already have.
+      let enriched = null;
+      try {
+        const sys = `You are a markets desk analyst. Below are recent market-news headlines, each with an index, source, date and short summary. Select the most MARKET-MOVING ones for a general investor — things that actually move stock prices: Fed/central-bank & rates, macro data (jobs, inflation, GDP), major earnings or M&A, geopolitics that hits markets, big sector moves. Skip fluff, promotional/ETF-marketing pieces, and non-market human-interest stories.
+
+For each selected item return:
+- "i": its index number from the list
+- "category": exactly one of ${NEWS_CATEGORIES.map(c => `"${c}"`).join(", ")}
+- "impact": ONE sentence — your own read on what it means for markets going forward, not a restatement of the headline
+- "relatedTicker": a single stock ticker if the item centers on one public company (e.g. "NVDA"), else null
+
+Also return "marketPulse": one sentence on the overall market mood right now and why (bullish / cautious / bearish).
+
+Order the items array most-important first. Return ONLY this JSON:
+{"marketPulse":"","items":[{"i":0,"category":"","impact":"","relatedTicker":null}]}`;
+        const user = feed.map((it, i) => `[${i}] ${it.headline} (${it.source}, ${it.date || "recent"}) — ${it.summary || ""}`).join("\n");
+        enriched = await callClaudeAnalyze(sys, user);
+      } catch (_) { /* analysis is best-effort; headlines still render below */ }
+
+      // 3) Merge the AI read onto the REAL feed items (headline/url/source/date always come from the
+      //    feed, so links are never fabricated). Fall back to the newest headlines if analysis failed.
+      const picks = Array.isArray(enriched?.items)
+        ? enriched.items.map((p) => {
+            const src = feed[p.i];
+            if (!src) return null;
+            return { ...src, category: NEWS_CATEGORIES.includes(p.category) ? p.category : "Other", impact: typeof p.impact === "string" ? p.impact : "", relatedTicker: p.relatedTicker || null };
+          }).filter(Boolean).slice(0, 8)
+        : [];
+      const items = picks.length ? picks : feed.slice(0, 8).map((it) => ({ ...it, category: "Other", impact: "", relatedTicker: null }));
+      const parsed = { marketPulse: (enriched && typeof enriched.marketPulse === "string") ? enriched.marketPulse : "", items };
+
       setMarketNews(parsed);
       marketNewsAtRef.current = Date.now();
       kvSet("atlas_market_news", { data: parsed, at: marketNewsAtRef.current });   // cache for instant revisit
@@ -2579,29 +2621,33 @@ Schema:
           <Overline color={c.text3}>Today's market</Overline>
           <Button variant="ghost" size="sm" onClick={() => fetchMarketNews(false)} loading={marketNewsLoading}>{marketNews ? "Refresh" : "Load"}</Button>
         </div>
-        {marketNewsLoading && <Card pad={14}><LoadingBlock title="Scanning today's market-moving news…" sub="Live search · usually 20–40s" /></Card>}
+        {marketNewsLoading && <Card pad={14}><LoadingBlock title="Loading today's market news…" sub="Latest headlines + Atlas's read" /></Card>}
         {marketNewsError && !marketNewsLoading && <ErrorBanner msg={marketNewsError} onRetry={() => fetchMarketNews(false)} label="Try again" />}
         {marketNews && !marketNewsLoading && (
           <Card pad={14}>
             {marketNews.marketPulse && (
-              <div style={{ ...type.caption, color: c.text2, lineHeight: 1.5, paddingBottom: 10, marginBottom: 10, borderBottom: `1px solid ${c.hairline}`, display: "-webkit-box", WebkitLineClamp: 2, WebkitBoxOrient: "vertical", overflow: "hidden" }}>
+              <div style={{ ...type.caption, color: c.text2, lineHeight: 1.5, paddingBottom: 10, marginBottom: 6, borderBottom: `1px solid ${c.hairline}`, display: "-webkit-box", WebkitLineClamp: 2, WebkitBoxOrient: "vertical", overflow: "hidden" }}>
                 <b style={{ color: c.text }}>Pulse: </b>{marketNews.marketPulse}
               </div>
             )}
-            <div style={{ display: "flex", flexDirection: "column", gap: 2 }}>
-              {(marketNews.items || []).slice(0, 4).map((item, i) => {
+            <div style={{ display: "flex", flexDirection: "column" }}>
+              {(marketNews.items || []).slice(0, 5).map((item, i, arr) => {
                 const hasUrl = item.url && item.url.startsWith("http");
+                const sub = item.impact || item.summary || "";
                 return (
-                  <div key={i} style={{ display: "flex", alignItems: "center", gap: 8, padding: "8px 4px", borderBottom: i < 3 ? `1px solid ${c.hairline}` : "none" }}>
-                    {item.category && <Badge tone="accent" style={{ flexShrink: 0, fontSize: 10 }}>{item.category}</Badge>}
-                    <div style={{ minWidth: 0, flex: 1, ...type.small, color: c.text, fontWeight: 600, whiteSpace: "nowrap", overflow: "hidden", textOverflow: "ellipsis" }}>
-                      {hasUrl ? <a href={item.url} target="_blank" rel="noopener noreferrer" className="atlas-link">{item.headline}</a> : item.headline}
+                  <div key={i} style={{ padding: "9px 4px", borderBottom: i < arr.length - 1 ? `1px solid ${c.hairline}` : "none" }}>
+                    <div style={{ display: "flex", alignItems: "center", gap: 8 }}>
+                      {item.category && <Badge tone="accent" style={{ flexShrink: 0, fontSize: 10 }}>{item.category}</Badge>}
+                      <div style={{ minWidth: 0, flex: 1, ...type.small, color: c.text, fontWeight: 600, whiteSpace: "nowrap", overflow: "hidden", textOverflow: "ellipsis" }}>
+                        {hasUrl ? <a href={item.url} target="_blank" rel="noopener noreferrer" className="atlas-link">{item.headline}</a> : item.headline}
+                      </div>
+                      {item.relatedTicker && (
+                        <button onClick={() => openTicker(item.relatedTicker)} style={{ flexShrink: 0, background: "none", border: "none", cursor: "pointer", ...type.caption, color: c.accent, fontWeight: 600 }}>
+                          {item.relatedTicker} →
+                        </button>
+                      )}
                     </div>
-                    {item.relatedTicker && (
-                      <button onClick={() => openTicker(item.relatedTicker)} style={{ flexShrink: 0, background: "none", border: "none", cursor: "pointer", ...type.caption, color: c.accent, fontWeight: 600 }}>
-                        {item.relatedTicker} →
-                      </button>
-                    )}
+                    {sub && <div style={{ ...type.caption, color: c.text3, lineHeight: 1.45, marginTop: 3, marginLeft: 2, display: "-webkit-box", WebkitLineClamp: 2, WebkitBoxOrient: "vertical", overflow: "hidden" }}>{sub}</div>}
                   </div>
                 );
               })}

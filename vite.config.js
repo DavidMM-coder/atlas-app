@@ -235,6 +235,31 @@ function historyProxy() {
   };
 }
 
+function newsProxy() {
+  const dec = (s) => String(s || "").replace(/<!\[CDATA\[|\]\]>/g, "").replace(/<[^>]+>/g, "").replace(/&amp;/g, "&").replace(/&lt;/g, "<").replace(/&gt;/g, ">").replace(/&#0*39;|&apos;/g, "'").replace(/&quot;/g, '"').replace(/&nbsp;/g, " ").replace(/\s+/g, " ").trim();
+  const tg = (it, n) => { const m = it.match(new RegExp(`<${n}[^>]*>([\\s\\S]*?)</${n}>`, "i")); return m ? dec(m[1]) : ""; };
+  const parse = (xml) => (xml.match(/<item>[\s\S]*?<\/item>/gi) || []).map((it) => { const d = new Date(tg(it, "pubDate")); return { headline: tg(it, "title"), url: tg(it, "link"), source: "CNBC", date: isNaN(d.getTime()) ? "" : d.toISOString().slice(0, 10), dateMs: isNaN(d.getTime()) ? 0 : d.getTime(), summary: tg(it, "description").slice(0, 400) }; }).filter((x) => x.headline && /^https?:\/\//.test(x.url));
+  const FEEDS = ["https://www.cnbc.com/id/10000664/device/rss/rss.html", "https://www.cnbc.com/id/20910258/device/rss/rss.html"];
+  return {
+    name: "news-proxy",
+    configureServer(server) {
+      server.middlewares.use("/api/news", (req, res) => {
+        (async () => {
+          const results = await Promise.all(FEEDS.map(async (u) => { try { const r = await fetch(u, { headers: { "User-Agent": "Mozilla/5.0 (compatible; AtlasNews/1.0)" } }); return r.ok ? parse(await r.text()) : []; } catch { return []; } }));
+          let items = results.flat();
+          const seen = new Set();
+          items = items.filter((x) => { const k = x.headline.toLowerCase(); if (seen.has(k)) return false; seen.add(k); return true; });
+          items.sort((a, b) => b.dateMs - a.dateMs);
+          items = items.slice(0, 24).map(({ dateMs, ...rest }) => rest);
+          res.statusCode = items.length ? 200 : 502;
+          res.setHeader("content-type", "application/json");
+          res.end(JSON.stringify(items.length ? { items } : { error: "No market news available right now." }));
+        })().catch((e) => { res.statusCode = 500; res.setHeader("content-type", "application/json"); res.end(JSON.stringify({ error: String(e) })); });
+      });
+    },
+  };
+}
+
 function fxProxy() {
   return {
     name: "fx-proxy",
@@ -262,7 +287,7 @@ export default defineConfig(({ mode }) => {
   const env = loadEnv(mode, process.cwd(), "");
   const apiKey = env.ANTHROPIC_API_KEY || process.env.ANTHROPIC_API_KEY || "";
   return {
-    plugins: [react(), anthropicProxy(apiKey), historyProxy(), fundamentalsProxy(), fxProxy()],
+    plugins: [react(), anthropicProxy(apiKey), historyProxy(), fundamentalsProxy(), fxProxy(), newsProxy()],
     server: { port: Number(process.env.PORT) || 5173, host: true },
     build: {
       rollupOptions: {
