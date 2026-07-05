@@ -240,11 +240,20 @@ function newsProxy() {
   const tg = (it, n) => { const m = it.match(new RegExp(`<${n}[^>]*>([\\s\\S]*?)</${n}>`, "i")); return m ? dec(m[1]) : ""; };
   const parse = (xml) => (xml.match(/<item>[\s\S]*?<\/item>/gi) || []).map((it) => { const d = new Date(tg(it, "pubDate")); return { headline: tg(it, "title"), url: tg(it, "link"), source: "CNBC", date: isNaN(d.getTime()) ? "" : d.toISOString().slice(0, 10), dateMs: isNaN(d.getTime()) ? 0 : d.getTime(), summary: tg(it, "description").slice(0, 400) }; }).filter((x) => x.headline && /^https?:\/\//.test(x.url));
   const FEEDS = ["https://www.cnbc.com/id/10000664/device/rss/rss.html", "https://www.cnbc.com/id/20910258/device/rss/rss.html"];
+  const yahooNews = async (q) => { try { const r = await fetch(`https://query1.finance.yahoo.com/v1/finance/search?q=${encodeURIComponent(q)}&newsCount=15&quotesCount=0`, { headers: { "User-Agent": "Mozilla/5.0" } }); if (!r.ok) return []; const d = await r.json(); return (d.news || []).map((n) => ({ headline: n.title, url: n.link, source: n.publisher || "Yahoo Finance", date: n.providerPublishTime ? new Date(n.providerPublishTime * 1000).toISOString().slice(0, 10) : "", dateMs: n.providerPublishTime ? n.providerPublishTime * 1000 : 0, summary: "" })).filter((x) => x.headline && /^https?:\/\//.test(x.url)); } catch { return []; } };
   return {
     name: "news-proxy",
     configureServer(server) {
       server.middlewares.use("/api/news", (req, res) => {
         (async () => {
+          const ticker = (new URL(req.url, "http://localhost").searchParams.get("ticker") || "").trim();
+          if (ticker) {
+            let items = await yahooNews(ticker);
+            items.sort((a, b) => b.dateMs - a.dateMs);
+            items = items.slice(0, 12).map(({ dateMs, ...rest }) => rest);
+            res.statusCode = 200; res.setHeader("content-type", "application/json");
+            return res.end(JSON.stringify({ items }));
+          }
           const results = await Promise.all(FEEDS.map(async (u) => { try { const r = await fetch(u, { headers: { "User-Agent": "Mozilla/5.0 (compatible; AtlasNews/1.0)" } }); return r.ok ? parse(await r.text()) : []; } catch { return []; } }));
           let items = results.flat();
           const seen = new Set();

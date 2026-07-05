@@ -586,6 +586,22 @@ function currentDateStr() {
   return new Date().toLocaleDateString("en-US", { year: "numeric", month: "long", day: "numeric" });
 }
 
+// Read a response as JSON, but tolerate a non-JSON body. A serverless function that times out or
+// crashes returns a plain-text/HTML platform error (e.g. "An error occurred…"), and blindly calling
+// resp.json() on that throws a cryptic "Unexpected token 'A'… is not valid JSON". Surface a clean,
+// actionable message keyed to the status instead.
+async function readAIResponse(resp) {
+  const raw = await resp.text();
+  try { return JSON.parse(raw); }
+  catch {
+    if (resp.status === 504 || resp.status === 408 || /timeout|timed out|FUNCTION_INVOCATION_TIMEOUT/i.test(raw)) {
+      throw new Error("That took too long and the server timed out — try again.");
+    }
+    if (resp.status >= 500) throw new Error("The server hit an error — give it a moment and try again.");
+    throw new Error("The server returned an unexpected response. Try again.");
+  }
+}
+
 async function callClaudeOnce(system, user, maxTokens, maxSearches, fast) {
   const body = JSON.stringify({
     model: AI_MODEL, max_tokens: maxTokens, system,
@@ -606,7 +622,7 @@ async function callClaudeOnce(system, user, maxTokens, maxSearches, fast) {
   // stale (they expire ~hourly). Force-refresh the token and retry once before surfacing "sign in"
   // — this self-heals a session that's still valid but whose cached token lapsed.
   if (resp.status === 401 && auth?.currentUser) resp = await doFetch(true);
-  const data = await resp.json();
+  const data = await readAIResponse(resp);
   if (data.error) throw new Error(data.error.message || "API error");
   const text = (data.content || []).filter((b) => b.type === "text").map((b) => b.text).join("\n");
   return { parsed: extractJSON(text), stopReason: data.stop_reason, text };
@@ -704,22 +720,24 @@ async function callClaude(system, user, { maxTokens = 4000, maxSearches = 4, fas
   }
 }
 
-// Lightweight analysis-only AI call: NO web_search tool, so it never touches the shared upstream
-// web-search rate limit (the fragile resource) and doesn't go through the search-serialization
-// pool. Thinking is disabled for speed — safe here precisely because there's no web search to
-// suppress. Used to add a "what this means" read on top of already-fetched news headlines.
-async function callClaudeAnalyze(system, user, maxTokens = 1600) {
+// Analysis-only AI call: NO web_search tool, so it never touches the shared upstream web-search
+// rate limit (the fragile resource that times out) and doesn't go through the search pool. Used to
+// reason over data we've ALREADY fetched from our own endpoints (news headlines, or a full dossier's
+// price/fundamentals/news). `think` keeps adaptive thinking on for depth (dossier); default off for
+// speed (news blurbs). Because there's no web search, disabling thinking here is safe.
+async function callClaudeAnalyze(system, user, { maxTokens = 1600, think = false } = {}) {
   const body = JSON.stringify({
     model: AI_MODEL, max_tokens: maxTokens, system,
     messages: [{ role: "user", content: user }],
-    thinking: { type: "disabled" },
+    thinking: think ? { type: "adaptive" } : { type: "disabled" },
+    ...(think ? { output_config: { effort: "medium" } } : {}),
   });
   const doFetch = async (forceRefresh) => fetch(`${API_BASE}/api/messages`, {
     method: "POST", headers: { "Content-Type": "application/json", ...(await aiAuthHeaders(forceRefresh)) }, body,
   });
   let resp = await doFetch(false);
   if (resp.status === 401 && auth?.currentUser) resp = await doFetch(true);   // self-heal a stale token
-  const data = await resp.json();
+  const data = await readAIResponse(resp);
   if (data.error) throw new Error(data.error.message || "API error");
   const text = (data.content || []).filter((b) => b.type === "text").map((b) => b.text).join("\n");
   return extractJSON(text);
@@ -1976,19 +1994,50 @@ ${historicalStatsText(histStats)}
 Use these exact numbers for the corresponding technicals/price-history metrics below — do not re-estimate, round differently, or contradict them with a search-derived guess. This is what makes your technicals/risk read objective and independent of any outside source.
 IMPORTANT: this block describes ticker ${histStats.ticker}${histStats.name ? ` (${histStats.name})` : ""}. The user's query ("${name}") was interpreted as that ticker — if the company you are actually evaluating is a DIFFERENT one (e.g. the query was a company name that coincidentally matches an unrelated ticker), IGNORE this entire block and rely on your own searches instead.
 ═══════════════════════════════════════` : "";
+    const upTicker = looksLikeTicker(name) ? name.toUpperCase() : null;
+    // Real fundamentals + recent news from our own endpoints, so the dossier reasons over live data
+    // WITHOUT web search — which timed out on Vercel (returning a non-JSON error the client choked
+    // on) and shared the fragile upstream search limit.
+    let fundBlock = "", newsBlock = "";
+    if (upTicker) {
+      const [fund, news] = await Promise.all([
+        fetch(apiUrl(`/api/fundamentals?ticker=${encodeURIComponent(upTicker)}`)).then(r => r.ok ? r.json() : null).catch(() => null),
+        fetch(apiUrl(`/api/news?ticker=${encodeURIComponent(upTicker)}`)).then(r => r.ok ? r.json() : null).catch(() => null),
+      ]);
+      if (seq !== evalSeq.current) return;
+      if (fund && !fund.error) {
+        const q = (fund.quarterlyFinancials || []).slice(-6).map(x => `  ${x.date}: revenue ${x.totalRevenue != null ? "$" + (x.totalRevenue / 1e9).toFixed(2) + "B" : "N/A"} · net income ${x.netIncome != null ? "$" + (x.netIncome / 1e9).toFixed(2) + "B" : "N/A"} · EPS ${x.eps ?? "N/A"}`).join("\n");
+        const surp = (fund.earnings || []).slice(-4).map(e => `${e.date}${e.surprisePct != null ? " " + (e.surprisePct >= 0 ? "+" : "") + e.surprisePct.toFixed(1) + "%" : ""}`).join(", ");
+        fundBlock = `
+REAL FUNDAMENTALS for ${upTicker} (Yahoo Finance + SEC filings via Atlas — use these directly, don't re-estimate):
+Trailing P/E ${fund.trailingPE ?? "N/A"} | Forward P/E ${fund.forwardPE ?? "N/A"} | Price/Book ${fund.pb ?? "N/A"} | Dividend yield ${fund.dividendYield != null ? (fund.dividendYield * 100).toFixed(2) + "%" : "N/A"}
+Revenue growth YoY ${fund.revenueGrowth != null ? (fund.revenueGrowth * 100).toFixed(1) + "%" : "N/A"} | Earnings growth YoY ${fund.earningsGrowth != null ? (fund.earningsGrowth * 100).toFixed(1) + "%" : "N/A"}
+Recent quarters:
+${q || "  N/A"}
+Earnings surprises: ${surp || "N/A"}
+Dividends on record: ${fund.dividends?.length || 0}${fund.dividends?.length ? ` · latest $${fund.dividends[fund.dividends.length - 1].amount} on ${fund.dividends[fund.dividends.length - 1].date}` : ""}`;
+      }
+      if (news?.items?.length) {
+        newsBlock = `
+RECENT NEWS for ${upTicker} (real headlines + links — build the news section from THESE, do not invent headlines or URLs):
+${news.items.slice(0, 10).map((n, i) => `[${i}] ${n.headline} — ${n.source}, ${n.date || "recent"} — ${n.url}`).join("\n")}`;
+      }
+    }
     const sys = `Today's date is ${currentDateStr()}. Treat this as the current date for all recency, prices, valuations and news.
 
-You are a brutally honest, no-nonsense senior equity research analyst — effectively your own independent investment bank. Your job is to produce a complete, institutional-grade stock dossier using REAL data — your own computed price history plus live web searches for financials/news — and to form YOUR OWN judgment from that evidence. You have NO opinion of your own until the data speaks — if a stock is bad, say it is bad. Do not sugarcoat. Do not be a cheerleader. Scores below 40 are common when warranted.
+You are a brutally honest, no-nonsense senior equity research analyst — effectively your own independent investment bank. Your job is to produce a complete, institutional-grade stock dossier using the REAL data PROVIDED BELOW — your own computed price history, real fundamentals, and recent news headlines — and to form YOUR OWN judgment from that evidence. Do NOT search the web or call any tools; reason only from the provided data plus your own analytical knowledge. You have NO opinion of your own until the data speaks — if a stock is bad, say it is bad. Do not sugarcoat. Do not be a cheerleader. Scores below 40 are common when warranted.
 
 INDEPENDENT JUDGMENT — non-negotiable:
 - Every pillar score, the overall score, and the action are YOUR conclusions, derived only from hard evidence: the actual financials, your own computed price-history statistics (CAGR, max drawdown, volatility, moving averages, RSI — from Atlas's backtest engine, see below), and actual factual news events (earnings beats/misses, guidance changes, litigation, contracts, management changes, downgrades of the BUSINESS not the stock). Reason from first principles like your own desk's analyst, not by adopting someone else's take.
 - Wall Street analyst ratings/price targets and aggregate market/news sentiment are reported ONLY as separate reference context for the user (sections 6 and 9 below) — they must NEVER be used as an input to any pillar score, the overall score, or the action. Do not average toward consensus, and do not let a stock's hype or crowd mood inflate a score the fundamentals/technicals/risk don't support — or let a beaten-down mood deflate one they do support.
 - If your own fact-based read disagrees with the analyst consensus or the prevailing sentiment, that's fine and expected — say so plainly in the thesis rather than softening your call to match theirs.
-${histBlock}
-SEARCH STRATEGY — maximum 4 searches, make each one count:
-1. "[TICKER] stock financials price PE ratio revenue margins balance sheet 2025 2026" — Yahoo Finance or Stockanalysis — get price, valuation, fundamentals, technicals in one go
-2. "[TICKER] stock news analyst rating price target 2025 2026" — get recent news AND analyst consensus together
-3. Only if data is missing: one targeted follow-up search
+${histBlock}${fundBlock}${newsBlock}
+
+DATA USAGE — you do NOT have web search; work from what's provided:
+- Use the REAL COMPUTED PRICE HISTORY block for every price/technical/risk metric it covers (price, SMAs, RSI, 52w range, returns, CAGR, drawdown, volatility) — those are exact, do not contradict them.
+- Use the REAL FUNDAMENTALS block for valuation multiples, growth, quarterly revenue/earnings, dividends. Derive what you can (e.g. net margin = net income / revenue). For any fundamental metric not provided, use your best knowledge and mark clearly "N/A (est.)" if uncertain — never fabricate precise figures.
+- Build the NEWS section ONLY from the RECENT NEWS block: use those exact headlines, sources, dates and URLs. Do not invent headlines or links. If no news block is present, return an empty news items array and say so in the summary.
+- Analyst consensus and catalysts: give your best estimate from general knowledge and clearly flag it as approximate in the flags section (it is not live).
 
 Return ONE valid JSON object, nothing else. No markdown fences. No prose outside the JSON. If no real public company matches, return {"error":"not_found"}.
 
@@ -2054,15 +2103,15 @@ REQUIRED OUTPUT — all sections mandatory, all data from live searches:
    - "Portfolio Impact for ${profile.name}": Sector already held (%), correlation to existing positions, what this does to overall portfolio risk, concentration warning if relevant
    conclusion: 3 sentences — what are the top 2 risks that could blow up this investment for THIS specific investor
 
-6. NEWS & SENTIMENT (from actual recent searches — this is critical):
+6. NEWS & SENTIMENT (build ONLY from the RECENT NEWS provided above):
    - overallSentiment: "Very Bullish" / "Bullish" / "Neutral" / "Bearish" / "Very Bearish"
    - sentimentScore: -100 to +100 (negative = bad news dominating)
    - summary: 2 sentences on what the news flow says about this stock RIGHT NOW
-   - insiderActivity: ALWAYS search for recent insider buying/selling (SEC Form 4 filings, last 90 days — try openinsider.com/screener?s=TICKER or SEC EDGAR full-text search first) before writing this section — one of the most objective, actionable signals there is (an insider spending their own money to buy is a strong tell; heavy concentrated selling can be a red flag). Give: {"summary":"one sentence on what insiders have done recently, or \"No notable insider activity in the last 90 days\" if genuinely none found","transactions":[{"insider":"name/title e.g. CEO Jane Doe","type":"Buy or Sell","shares":"12,000","value":"$1.8M","date":"Jun 2026"}]} — transactions can be an empty array if none found, but the search must actually happen.
+   - insiderActivity: you do NOT have live SEC/Form-4 access here. If any of the provided news items are about insider buying/selling, summarize them; otherwise set {"summary":"No insider-trading data available in the provided sources","transactions":[]}. NEVER fabricate insider names, share counts, values or dates. When you do report a transaction from the provided news, each object is exactly ONE discrete dated filing.
      Each transaction is exactly ONE discrete, dated filing: "insider" names one specific individual (never a group like "multiple insiders"); "shares" is a bare number only, no descriptions or parentheticals tacked on (wrong: "99,000 (Intent to Sell filing)", right: "99,000"); "value" is a single bare dollar amount, never "undisclosed"/"aggregate"; "date" is one specific date/month, never "multiple dates" or a range. If an insider made several separate filings in the window, add up to 2-3 separate transaction objects (one per actual filing) rather than collapsing them into one vague row — and if you can only confirm a pattern or total but no single filing's specifics, leave it out of "transactions" and mention it only in the "summary" prose instead.
    - items: 5–8 recent news items, each with:
      * headline: actual headline text (not paraphrased)
-     * url: direct link to the article (full https URL — required, search for the real URL)
+     * url: the real https URL from the provided RECENT NEWS block (do not invent one)
      * source: publication name (Reuters, Bloomberg, WSJ, Yahoo Finance, etc.)
      * date: approximate date (e.g. "Jun 2026", "May 2026")
      * sentiment: "Positive" / "Negative" / "Neutral"
@@ -2088,7 +2137,7 @@ REQUIRED OUTPUT — all sections mandatory, all data from live searches:
 ═══════════════════════════════════════
 FORMAT RULES:
 - Metric values terse: "28.4x", "$3.2T", "+12.3% YoY", "85.2%", "$182.40"
-- Use "N/A" only when genuinely unavailable after searching
+- Use "N/A" only when genuinely unavailable in the provided data or your knowledge
 - JSON must be complete and syntactically valid — always close every bracket and brace
 - If data is unavailable for any metric use "N/A" — never omit a field or leave JSON incomplete
 - For small/obscure companies with limited data, still return the full schema with "N/A" values
@@ -2097,10 +2146,11 @@ FORMAT RULES:
 FULL JSON SCHEMA:
 {"company":"","ticker":"","asOf":"","pillars":{"fundamentals":0,"valuation":0,"technicals":0,"risk":0},"overall":{"score":0,"action":"","thesis":""},"fundamentals":{"groups":[{"title":"","items":[{"label":"","value":""}]}],"conclusion":""},"technicals":{"groups":[{"title":"","items":[{"label":"","value":""}]}],"conclusion":""},"risk":{"groups":[{"title":"","items":[{"label":"","value":""}]}],"conclusion":""},"news":{"overallSentiment":"","sentimentScore":0,"summary":"","insiderActivity":{"summary":"","transactions":[{"insider":"","type":"","shares":"","value":"","date":""}]},"items":[{"headline":"","url":"","source":"","date":"","sentiment":"","category":"","impact":""}]},"fit":{"score":0,"summary":"","action":"","positionSizing":"","watchouts":[""]},"catalysts":[{"label":"","description":"","timeframe":"","direction":""}],"analystConsensus":{"rating":"","targetPrice":"","upside":"","numAnalysts":0,"highTarget":"","lowTarget":"","recentRevisions":""},"dataSources":[""],"flags":[""]}`;
     try {
-      // Sized for the full dossier plus insider-activity section, with headroom for the
-      // Sonnet 5 tokenizer (~30% more tokens for the same text than 4.6) and its adaptive
-      // thinking, which shares the max_tokens budget with the answer itself.
-      const parsed = await callClaude(sys, `Evaluate: ${name}`, { maxTokens: 14000, maxSearches: 4 });
+      // No web search: the dossier reasons over the real price/fundamentals/news we already fetched
+      // and passed into the prompt. This can't time out on the upstream search loop and doesn't
+      // touch the shared search limit. Adaptive thinking stays on for analytical depth.
+      const parsed = await callClaudeAnalyze(sys, `Evaluate: ${name}`, { maxTokens: 20000, think: true });
+      if (!parsed) throw new Error("The dossier came back unreadable. Tap Retry.");
       if (seq !== evalSeq.current) return;   // superseded while the AI call was in flight
       if (parsed.error === "not_found") throw new Error(`Couldn't find a public company matching "${name}". Try a ticker or exact name.`);
       if (!parsed.pillars && !parsed.fundamentals) throw new Error("The dossier came back incomplete. Tap Retry.");

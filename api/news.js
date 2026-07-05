@@ -38,9 +38,12 @@ function parseRss(xml, source) {
   }).filter((x) => x.headline && /^https?:\/\//.test(x.url));
 }
 
-async function fetchYahooFallback() {
+const TICKER_RE = /^[A-Za-z0-9^=.\-]{1,15}$/;
+// Yahoo's JSON news-search — used both as the general-market fallback (q=SPY) and, with an explicit
+// query, for ticker-specific news that feeds the research dossier.
+async function fetchYahooNews(query) {
   try {
-    const r = await fetch("https://query1.finance.yahoo.com/v1/finance/search?q=SPY&newsCount=15&quotesCount=0", {
+    const r = await fetch(`https://query1.finance.yahoo.com/v1/finance/search?q=${encodeURIComponent(query)}&newsCount=15&quotesCount=0`, {
       headers: { "User-Agent": "Mozilla/5.0" },
     });
     if (!r.ok) return [];
@@ -62,6 +65,17 @@ export default async function handler(req, res) {
   res.setHeader("Access-Control-Allow-Origin", "*");
   if (req.method === "OPTIONS") return res.status(200).end();
 
+  // Ticker mode: news for one stock (research dossier). Falls through to the general feed otherwise.
+  const ticker = String(req.query?.ticker || "").trim();
+  if (ticker) {
+    if (!TICKER_RE.test(ticker)) return res.status(400).json({ error: "invalid ticker" });
+    let items = await fetchYahooNews(ticker);
+    items.sort((a, b) => b.dateMs - a.dateMs);
+    items = items.slice(0, 12).map(({ dateMs, ...rest }) => rest);
+    res.setHeader("Cache-Control", "s-maxage=300, stale-while-revalidate=900");
+    return res.status(200).json({ items });
+  }
+
   try {
     const results = await Promise.all(FEEDS.map(async (f) => {
       try {
@@ -73,7 +87,7 @@ export default async function handler(req, res) {
       }
     }));
     let items = results.flat();
-    if (!items.length) items = await fetchYahooFallback();
+    if (!items.length) items = await fetchYahooNews("SPY");
 
     // Dedupe by headline (case-insensitive), newest first, cap the payload.
     const seen = new Set();
