@@ -634,6 +634,7 @@ export default function Backtester({ initialTicker } = {}) {
             <p style={{ ...type.small, color: c.text3, margin: "0 0 6px" }}>{strat.desc}</p>
             {strat.dataNote && <p style={{ ...type.caption, color: c.text3, margin: "0 0 8px", fontStyle: "italic" }}>{strat.dataNote}</p>}
             {isFundamental && <p style={{ ...type.caption, color: c.warning, margin: "0 0 12px" }}>Fundamental data availability varies by ticker and strategy (see the note above) — the backtest is automatically clipped to the period where data actually exists, so your selected range is a maximum, not a guarantee.</p>}
+            {isFundamental && <p style={{ ...type.caption, color: c.text3, margin: "0 0 12px" }}>Point-in-time: signals fire on the SEC filing date each quarter became public, using first-reported values (not later restatements). Earnings Surprise Momentum uses approximate report dating due to limited data depth.</p>}
             {strat.params.length > 0 && (
               <div style={{ display: "grid", gridTemplateColumns: "repeat(auto-fill, minmax(170px, 1fr))", gap: 10, marginTop: 12 }}>
                 {strat.params.map(p => (

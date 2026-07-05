@@ -47,11 +47,15 @@ async function getCikMap() {
 // moved from "Revenues" to "RevenueFromContractWithCustomerExcludingAssessedTax" after the 2018
 // ASC 606 accounting change — using only one tag silently truncates history at that boundary,
 // which is exactly what capped NVDA at 12 quarters before this fix). Keeps only ~3-month-span
-// entries (quarterly, not annual/YTD) and dedupes by period-end date, preferring the latest filing.
-// Stores {val, filed} — the filed date is what lets the backtester avoid look-ahead bias (a
-// quarter that ENDED Mar 31 wasn't public knowledge until the 10-Q was FILED ~May). The previous
-// version stored the bare value, which broke the latest-filing comparison (val.filed is undefined
-// on a number, so restatements never won) and treated legitimate 0 values as "missing".
+// entries (quarterly, not annual/YTD) and dedupes by period-end date.
+//
+// RESTATEMENT BIAS FIX: for a period with multiple filings (original 10-Q + later 10-K/A or
+// comparative re-statements), keep the FIRST-filed value — the number the market actually saw and
+// traded on at the time — not the latest (hindsight) restatement. SEC companyfacts cleanly exposes
+// filing sequence via each entry's `filed` date (ISO yyyy-mm-dd), so the earliest `filed` is the
+// original filing; later ones are restatements/amendments. This preserves the point-in-time
+// discipline quarterKnownDate() enforces downstream. Entries missing a `filed` date sort last so a
+// real filing always wins. Stores {val, filed}; 0 is a legitimate value, not "missing".
 function extractQuarterly(usgaap, concepts, unitKey) {
   const byEnd = {};
   for (const concept of concepts) {
@@ -62,7 +66,7 @@ function extractQuarterly(usgaap, concepts, unitKey) {
       const days = (new Date(e.end) - new Date(e.start)) / 86400000;
       if (days <= 80 || days >= 100) continue;
       const prev = byEnd[e.end];
-      if (!prev || String(e.filed || "") > String(prev.filed || "")) byEnd[e.end] = { val: e.val, filed: e.filed || null };
+      if (!prev || (e.filed || "9999-99-99") < (prev.filed || "9999-99-99")) byEnd[e.end] = { val: e.val, filed: e.filed || null };
     }
   }
   return byEnd;
