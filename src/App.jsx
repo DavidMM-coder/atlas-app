@@ -158,7 +158,7 @@ const CHAPTERS = [
 ];
 
 const DOSSIER_TABS = ["Fundamentals", "Technicals", "Risk", "News", "Catalysts", "Your fit"];
-const LOADING_MSGS = ["Searching Yahoo Finance & Stockanalysis…", "Pulling live financials and balance sheet…", "Reading price action and technicals…", "Scanning recent news and sentiment…", "Checking analyst ratings and targets…", "Matching everything to your profile…", "Writing the full dossier…"];
+const LOADING_MSGS = ["Pulling real financials and balance sheet…", "Reading your computed price history & technicals…", "Reviewing recent news and sentiment…", "Weighing valuation and risk…", "Matching everything to your profile…", "Writing the full dossier…"];
 
 // ---------- helpers (unchanged) ----------
 // Locale-aware numeric parse for spreadsheet imports. The old version stripped everything except
@@ -3031,8 +3031,8 @@ Schema:
           <LoadingBlock
             title={LOADING_MSGS[msgIdx]}
             sub={elapsedSec < 45
-              ? "Searching live sources · usually 30–90s"
-              : `Still working — ${elapsedSec}s so far. Full dossiers with live search can take a few minutes, especially for less common tickers.`}
+              ? "Analyzing real fundamentals, price history & news · usually 30–90s"
+              : `Still working — ${elapsedSec}s so far. A full institutional dossier is a lot to write out.`}
           />
         </Card>
       )}
