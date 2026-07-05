@@ -579,6 +579,13 @@ async function aiAuthHeaders(forceRefresh = false) {
 
 const AI_MODEL = "claude-sonnet-5";
 
+// The model has no idea what today's date is unless we tell it — left to itself it stamps its
+// training-era year (e.g. "2025") on things like a dossier/scan "asOf". Prepend the real current
+// date to every prompt that reasons about "now" so recency, valuations and news are grounded.
+function currentDateStr() {
+  return new Date().toLocaleDateString("en-US", { year: "numeric", month: "long", day: "numeric" });
+}
+
 async function callClaudeOnce(system, user, maxTokens, maxSearches, fast) {
   const body = JSON.stringify({
     model: AI_MODEL, max_tokens: maxTokens, system,
@@ -1770,7 +1777,7 @@ export default function VerdictApp() {
         if (mn?.data && mn.at && Date.now() - mn.at < FRESH_MS) { setMarketNews(mn.data); marketNewsAtRef.current = mn.at; }
         const rc = await kvGet("atlas_recs");
         const recsFresh = !!(rc?.data && rc.at && Date.now() - rc.at < FRESH_MS);
-        if (recsFresh) setRecs(rc.data);
+        if (recsFresh) { setRecs(rc.data); recsAtRef.current = rc.at; }
         if (p && p.name) { setProfile(p); setPhase("app"); if (!recsFresh) setAutoDiscover(true); }
       } catch {}
     })();
@@ -1845,6 +1852,7 @@ export default function VerdictApp() {
   // both bump it so a slower in-flight request can't overwrite a newer one's result/snapshot.
   const evalSeq = useRef(0);
   const discoverSeq = useRef(0);   // same idea for the Discover scan, so switching universe mid-scan wins
+  const recsAtRef = useRef(0);     // real time the shown picks were scanned (the model's own "asOf" is unreliable)
   const tickersKey = holdings.map(h => h.ticker).join(",");
   const fetchLivePrices = useCallback(async (background) => {
     if (!holdings.length) { setLivePrices({}); return; }
@@ -1968,7 +1976,9 @@ ${historicalStatsText(histStats)}
 Use these exact numbers for the corresponding technicals/price-history metrics below — do not re-estimate, round differently, or contradict them with a search-derived guess. This is what makes your technicals/risk read objective and independent of any outside source.
 IMPORTANT: this block describes ticker ${histStats.ticker}${histStats.name ? ` (${histStats.name})` : ""}. The user's query ("${name}") was interpreted as that ticker — if the company you are actually evaluating is a DIFFERENT one (e.g. the query was a company name that coincidentally matches an unrelated ticker), IGNORE this entire block and rely on your own searches instead.
 ═══════════════════════════════════════` : "";
-    const sys = `You are a brutally honest, no-nonsense senior equity research analyst — effectively your own independent investment bank. Your job is to produce a complete, institutional-grade stock dossier using REAL data — your own computed price history plus live web searches for financials/news — and to form YOUR OWN judgment from that evidence. You have NO opinion of your own until the data speaks — if a stock is bad, say it is bad. Do not sugarcoat. Do not be a cheerleader. Scores below 40 are common when warranted.
+    const sys = `Today's date is ${currentDateStr()}. Treat this as the current date for all recency, prices, valuations and news.
+
+You are a brutally honest, no-nonsense senior equity research analyst — effectively your own independent investment bank. Your job is to produce a complete, institutional-grade stock dossier using REAL data — your own computed price history plus live web searches for financials/news — and to form YOUR OWN judgment from that evidence. You have NO opinion of your own until the data speaks — if a stock is bad, say it is bad. Do not sugarcoat. Do not be a cheerleader. Scores below 40 are common when warranted.
 
 INDEPENDENT JUDGMENT — non-negotiable:
 - Every pillar score, the overall score, and the action are YOUR conclusions, derived only from hard evidence: the actual financials, your own computed price-history statistics (CAGR, max drawdown, volatility, moving averages, RSI — from Atlas's backtest engine, see below), and actual factual news events (earnings beats/misses, guidance changes, litigation, contracts, management changes, downgrades of the BUSINESS not the stock). Reason from first principles like your own desk's analyst, not by adopting someone else's take.
@@ -2161,7 +2171,9 @@ FULL JSON SCHEMA:
     const uni = typeof universeArg === "string" ? universeArg : universe;
     const seq = ++discoverSeq.current;
     setRecsLoading(true); setRecsError(null); setRecs(null);
-    const sys = `You are a brutally honest equity research analyst — your own independent investment bank, not a mouthpiece for Wall Street consensus. Your only job is to find the BEST stocks for this specific investor RIGHT NOW, based on YOUR OWN read of the hard evidence (fundamentals, valuation, technicals, real factual news events) — not on analyst ratings, price-target chasing, or crowd sentiment. If a name is popular/hyped but the numbers don't back it, leave it out; if a name is out of favor but the numbers are genuinely strong, include it anyway. Use web_search to get current prices, valuations, and recent news. Return ONE JSON object only — no prose, no fences.
+    const sys = `Today's date is ${currentDateStr()}. Treat this as the current date; set "asOf" to it and base every pick on the most recent data available as of now.
+
+You are a brutally honest equity research analyst — your own independent investment bank, not a mouthpiece for Wall Street consensus. Your only job is to find the BEST stocks for this specific investor RIGHT NOW, based on YOUR OWN read of the hard evidence (fundamentals, valuation, technicals, real factual news events) — not on analyst ratings, price-target chasing, or crowd sentiment. If a name is popular/hyped but the numbers don't back it, leave it out; if a name is out of favor but the numbers are genuinely strong, include it anyway. Use web_search to get current prices, valuations, and recent news. Return ONE JSON object only — no prose, no fences.
 
 INVESTOR PROFILE:
 ${profileText(profile)}
@@ -2197,7 +2209,8 @@ Schema:
       if (!Array.isArray(parsed.picks)) throw new Error("Couldn't build the shortlist. Tap Scan again.");
       parsed.picks.sort((a, b) => (b.fitScore || 0) - (a.fitScore || 0));
       setRecs(parsed);
-      kvSet("atlas_recs", { data: parsed, at: Date.now() });   // cache for instant revisit
+      recsAtRef.current = Date.now();
+      kvSet("atlas_recs", { data: parsed, at: recsAtRef.current });   // cache for instant revisit
     } catch (err) { if (seq === discoverSeq.current) setRecsError(err.message || "Something went wrong."); }
     finally { if (seq === discoverSeq.current) setRecsLoading(false); }
   }
@@ -2207,7 +2220,9 @@ Schema:
     if (newsLoading || !holdings.length) return;
     setNewsLoading(true); setNewsError(null);
     const tickers = holdings.map(h => h.ticker).join(", ");
-    const sys = `You are a financial news analyst. The user holds these stocks: ${tickers}.
+    const sys = `Today's date is ${currentDateStr()}. Treat this as the current date for all recency and "last N days" windows.
+
+You are a financial news analyst. The user holds these stocks: ${tickers}.
 Search for the latest news relevant to these holdings — go beyond generic headlines and prioritize the news types that actually move a decision to buy/hold/sell:
 - Insider buying/selling (SEC Form 4 filings) in the last 90 days, per holding — this is one of the most objective, actionable signals available (insiders committing their own money is meaningfully different from a headline opinion). For EVERY holding, check a real primary source for exact figures — openinsider.com/screener?s=TICKER (best single source, gives insider name, transaction type, share count, price, and total value directly), or SEC EDGAR full-text search (efts.sec.gov), or secform4.com. Do not rely on a secondary article that merely mentions "an executive sold shares" without the actual filing numbers.
 - Earnings results, guidance changes, product launches, management changes, lawsuits/regulatory action, M&A, partnerships (last 7 days)
@@ -2275,7 +2290,9 @@ Aim for 2-3 items per holding plus 2-3 macro items, max 20 total in "news". Insi
       // 2) Add analysis WITHOUT web search — the model only reads the headlines we already have.
       let enriched = null;
       try {
-        const sys = `You are a markets desk analyst. Below are recent market-news headlines, each with an index, source, date and short summary. Select the most MARKET-MOVING ones for a general investor — things that actually move stock prices: Fed/central-bank & rates, macro data (jobs, inflation, GDP), major earnings or M&A, geopolitics that hits markets, big sector moves. Skip fluff, promotional/ETF-marketing pieces, and non-market human-interest stories.
+        const sys = `Today's date is ${currentDateStr()}.
+
+You are a markets desk analyst. Below are recent market-news headlines, each with an index, source, date and short summary. Select the most MARKET-MOVING ones for a general investor — things that actually move stock prices: Fed/central-bank & rates, macro data (jobs, inflation, GDP), major earnings or M&A, geopolitics that hits markets, big sector moves. Skip fluff, promotional/ETF-marketing pieces, and non-market human-interest stories.
 
 For each selected item return:
 - "i": its index number from the list
@@ -2349,7 +2366,9 @@ Order the items array most-important first. Return ONLY this JSON:
         return `${h.ticker}: ${h.shares} shares @ ${costLabel} avg cost · current price unavailable`;
       }).join("\n");
 
-      const sys = `You are a portfolio analyst giving brutally honest, hands-on advice — your own independent call on each position, not a summary of what other analysts or the market mood currently think. Base every action and score strictly on the hard facts: this investor's cost basis, the live price, each holding's own real computed trailing performance (CAGR/drawdown/volatility, from Atlas's backtest engine — provided below), the underlying business's real fundamentals/trajectory, and factual recent news — never on analyst ratings or crowd sentiment. Current prices and performance stats are already provided below — do NOT search for prices, they are live and accurate. Return ONE JSON object only.
+      const sys = `Today's date is ${currentDateStr()}. Treat this as the current date for all recency, prices and news.
+
+You are a portfolio analyst giving brutally honest, hands-on advice — your own independent call on each position, not a summary of what other analysts or the market mood currently think. Base every action and score strictly on the hard facts: this investor's cost basis, the live price, each holding's own real computed trailing performance (CAGR/drawdown/volatility, from Atlas's backtest engine — provided below), the underlying business's real fundamentals/trajectory, and factual recent news — never on analyst ratings or crowd sentiment. Current prices and performance stats are already provided below — do NOT search for prices, they are live and accurate. Return ONE JSON object only.
 
 INVESTOR PROFILE:
 ${profileText(profile)}
@@ -2734,7 +2753,7 @@ Schema:
               </motion.div>
             ))}
           </motion.div>
-          {recs.asOf && <div style={{ ...type.caption, color: c.text3, marginTop: 12, textAlign: "center" }}>Updated {recs.asOf}</div>}
+          {recsAtRef.current > 0 && <div style={{ ...type.caption, color: c.text3, marginTop: 12, textAlign: "center" }}>Scanned {fmtHistoryDate(new Date(recsAtRef.current).toISOString())}</div>}
         </div>
       )}
       {/* Honest idle state — the old copy claimed "Scanning…" while nothing was running. */}
