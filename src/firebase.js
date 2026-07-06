@@ -5,7 +5,7 @@ import {
   signInWithPhoneNumber, RecaptchaVerifier, signOut, onAuthStateChanged,
   sendPasswordResetEmail,
 } from "firebase/auth";
-import { getFirestore, doc, setDoc, getDoc, serverTimestamp } from "firebase/firestore";
+import { getFirestore, doc, setDoc, getDoc, collection, addDoc, getDocs, serverTimestamp } from "firebase/firestore";
 
 const configured = !!(
   import.meta.env.VITE_FIREBASE_API_KEY &&
@@ -65,6 +65,35 @@ export async function saveUserData(uid, partial) {
     await setDoc(doc(db, "users", uid), { ...partial, dataUpdatedAt: serverTimestamp() }, { merge: true });
   } catch (e) {
     console.error("Failed to save cloud data:", e);
+  }
+}
+
+// Cloud copy of the append-only Discover pick log — one document per pick under
+// users/{uid}/pick_history, so the log survives cache clears and device switches. A
+// subcollection rather than an array field on users/{uid}: the log grows forever, and a
+// growing array would eventually hit Firestore's 1 MiB per-document cap. Requires its own
+// owner-only security rule (see firestore.rules) — the parent doc's rule does not cascade.
+export async function savePickHistory(uid, records) {
+  if (!db || !uid || !Array.isArray(records) || !records.length) return;
+  try {
+    await Promise.all(records.map((r) => addDoc(collection(db, "users", uid, "pick_history"), r)));
+  } catch (e) {
+    console.error("Failed to save pick history to cloud:", e);
+  }
+}
+
+export async function loadPickHistory(uid) {
+  if (!db || !uid) return null;
+  try {
+    const snap = await getDocs(collection(db, "users", uid, "pick_history"));
+    // Sort client-side on the ISO `at` field rather than orderBy(), so a doc missing `at`
+    // (which orderBy silently drops) still comes back and is visible in the analysis.
+    return snap.docs
+      .map((d) => ({ id: d.id, ...d.data() }))
+      .sort((a, b) => String(a.at || "").localeCompare(String(b.at || "")));
+  } catch (e) {
+    console.error("Failed to load pick history from cloud:", e);
+    return null;
   }
 }
 

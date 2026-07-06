@@ -16,6 +16,13 @@ service cloud.firestore {
     // A user may read and write ONLY their own profile document.
     match /users/{userId} {
       allow read, write: if request.auth != null && request.auth.uid == userId;
+
+      // Append-only Discover pick log (savePickHistory/loadPickHistory in src/firebase.js),
+      // one doc per pick. Owner-only, same as the parent doc — parent rules do NOT cascade
+      // to subcollections, so without this match the deny-all below would block it.
+      match /pick_history/{pickId} {
+        allow read, write: if request.auth != null && request.auth.uid == userId;
+      }
     }
 
     // Everything else is denied by default — no other collections are used by the app.

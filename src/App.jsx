@@ -1,6 +1,6 @@
 import React, { useState, useEffect, useRef, useCallback, Suspense, lazy } from "react";
 import AuthScreen from "./Auth.jsx";
-import { auth, onAuthStateChanged, signOut, saveUserToFirestore, loadUserData, saveUserData } from "./firebase.js";
+import { auth, onAuthStateChanged, signOut, saveUserToFirestore, loadUserData, saveUserData, savePickHistory, loadPickHistory } from "./firebase.js";
 import { API_BASE, apiUrl } from "./lib/api.js";
 import { color as c, font, type, radius, shadow, space, scoreColor, grade, actionColor } from "./ui/tokens.js";
 
@@ -254,7 +254,9 @@ function kvDel(k) { try { localStorage.removeItem(k); } catch {} }
 // was recommended, and the price at that moment — so we can later check whether the AI's picks
 // actually went up. It NEVER overwrites or dedupes; a ticker recommended twice is logged twice on
 // purpose (that repetition is itself signal). No forward-return math is computed here — just logging.
-// ⚠ localStorage only: single browser, lost on cache-clear or device switch. No backend = fragile.
+// Storage: localStorage always (local cache + signed-out fallback); when signed in, each record is
+// also written as its own doc to users/{uid}/pick_history, so the log survives cache clears and
+// device switches. The cloud write is best-effort — a failure never blocks the local log.
 const PICK_HISTORY_KEY = "atlas_pick_history";
 async function logPickHistory(picks, uni) {
   if (!Array.isArray(picks) || !picks.length) return;
@@ -272,9 +274,12 @@ async function logPickHistory(picks, uni) {
   }));
   const prev = await kvGet(PICK_HISTORY_KEY);
   await kvSet(PICK_HISTORY_KEY, [...(Array.isArray(prev) ? prev : []), ...records]);
+  const uid = auth?.currentUser?.uid;
+  if (uid) savePickHistory(uid, records);
 }
-// Console helper to pull the log off this device (it lives only in localStorage). Run
+// Console helper to pull this device's local copy of the log. Run
 // `atlasExportPickHistory()` in the browser console to download atlas_pick_history.json.
+// Kept as the fallback for signed-out/local-only data even now that a cloud copy exists.
 if (typeof window !== "undefined") {
   window.atlasExportPickHistory = async () => {
     const data = (await kvGet(PICK_HISTORY_KEY)) || [];
@@ -284,6 +289,15 @@ if (typeof window !== "undefined") {
       URL.revokeObjectURL(url);
     } catch (_) {}
     console.log(`atlas_pick_history: ${data.length} records`, data);
+    return data;
+  };
+  // Cloud counterpart: fetches every pick doc from users/{uid}/pick_history (all devices,
+  // survives cache clears). Requires being signed in. Run `atlasLoadCloudPickHistory()`.
+  window.atlasLoadCloudPickHistory = async () => {
+    const uid = auth?.currentUser?.uid;
+    if (!uid) { console.log("Not signed in — cloud pick history unavailable."); return null; }
+    const data = await loadPickHistory(uid);
+    console.log(`cloud pick_history: ${data ? data.length : 0} records`, data);
     return data;
   };
 }
@@ -2623,7 +2637,8 @@ Schema:
 
   // Signing out wipes this device's copy — the durable copy lives in Firestore, so the same
   // account restores on next sign-in, and a different account never sees the previous user's
-  // portfolio on a shared device.
+  // data on a shared device. That includes the pick-history log: only the localStorage copy is
+  // wiped; the cloud docs under users/{uid}/pick_history persist for that account.
   function handleSignOut() {
     signOut(auth).then(() => {
       syncedUid.current = null;
@@ -2632,7 +2647,7 @@ Schema:
       setResearchHistory([]); setRecs(null); setReview(null); setResult(null); setError(null); setQuery("");
       setNewsItems(null); setNewsInsiderActivity(null); setMarketNews(null); setLivePrices({});
       setPhase("onboarding"); setNav("home");
-      ["atlas_profile", "atlas_holdings", "atlas_spare_cash", "atlas_spare_cash_currency", "atlas_research_history", "atlas_market_news", "atlas_recs"].forEach(kvDel);
+      ["atlas_profile", "atlas_holdings", "atlas_spare_cash", "atlas_spare_cash_currency", "atlas_research_history", "atlas_market_news", "atlas_recs", PICK_HISTORY_KEY].forEach(kvDel);
     }).catch(() => {});
   }
 
