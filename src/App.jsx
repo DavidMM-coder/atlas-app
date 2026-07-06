@@ -1,5 +1,6 @@
 import React, { useState, useEffect, useRef, useCallback, Suspense, lazy } from "react";
 import AuthScreen from "./Auth.jsx";
+import TrackRecord from "./TrackRecord.jsx";
 import { auth, onAuthStateChanged, signOut, saveUserToFirestore, loadUserData, saveUserData, savePickHistory, loadPickHistory } from "./firebase.js";
 import { API_BASE, apiUrl } from "./lib/api.js";
 import { color as c, font, type, radius, shadow, space, scoreColor, grade, actionColor } from "./ui/tokens.js";
@@ -2863,6 +2864,8 @@ Schema:
       )}
       {/* Honest idle state — the old copy claimed "Scanning…" while nothing was running. */}
       {!recs && !recsLoading && !recsError && <Card><EmptyState title="No scan yet" hint="Atlas scans global markets and ranks stocks by fit to your profile and portfolio." action={<Button glow onClick={() => discover()}>Scan markets</Button>} /></Card>}
+      {/* Scoreboard over the append-only pick log — how past Discover picks actually did vs the market. */}
+      <TrackRecord />
     </div>
   ));
 
