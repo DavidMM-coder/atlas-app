@@ -58,6 +58,32 @@ function fmtMoney(v, code, digits = 2) {
 function daysBetween(dateA, dateB) {
   return Math.round((new Date(dateB) - new Date(dateA)) / 86400000);
 }
+// Post-hoc capital-gains estimate over the trade log. The engines are strictly all-in/all-out,
+// so BUY/SELL alternate and each SELL closes exactly the previous BUY. Basis is the full cash
+// outlay (including the entry fee), proceeds are net of the exit fee — matching what the equity
+// curve actually did. Each closed trade is classified short-/long-term by the standard US
+// < 1 year / >= 1 year convention; only GAINS are taxed (no loss offsetting — disclosed in the
+// UI). Applied after the fact rather than re-simulated, so the strategy engines stay untouched;
+// this slightly understates real drag (mid-stream tax payments would also shrink later
+// position sizes). Positions still open at the end are NOT taxed — same as buy-and-hold's
+// terminal value, which the backtester has never liquidated: deferral is B&H's genuine edge.
+function computeTaxDrag(trades, costPct, stRate, ltRate) {
+  let tax = 0, shortCount = 0, longCount = 0, taxedCount = 0, closedCount = 0, lastBuy = null;
+  for (const t of trades) {
+    if (t.type === "BUY") lastBuy = t;
+    else if (t.type === "SELL" && lastBuy) {
+      const basis = (lastBuy.shares * lastBuy.price) / (1 - costPct);
+      const proceeds = t.shares * t.price * (1 - costPct);
+      const gain = proceeds - basis;
+      const isShort = daysBetween(lastBuy.date, t.date) < 365;
+      closedCount++;
+      if (isShort) shortCount++; else longCount++;
+      if (gain > 0) { tax += gain * (isShort ? stRate : ltRate); taxedCount++; }
+      lastBuy = null;
+    }
+  }
+  return { tax, shortCount, longCount, taxedCount, closedCount };
+}
 function addDays(dateStr, days) {
   const d = new Date(dateStr);
   d.setDate(d.getDate() + days);
@@ -446,6 +472,11 @@ export default function Backtester({ initialTicker } = {}) {
   const [stratId, setStratId] = useState("sma_crossover");
   const [costPct, setCostPct] = useState("0.1");
   const [cash, setCash] = useState("10000");
+  // After-tax comparison — opt-in so the default pre-tax experience is unchanged; rates are
+  // editable (US-centric defaults, but no assumption about the user's actual bracket).
+  const [afterTax, setAfterTax] = useState(false);
+  const [stRate, setStRate] = useState("30");
+  const [ltRate, setLtRate] = useState("15");
   const [paramVals, setParamVals] = useState({});
   const [loading, setLoading] = useState(false);
   const [error, setError] = useState(null);
@@ -582,6 +613,7 @@ export default function Backtester({ initialTicker } = {}) {
         beats: vStrat > vBh, margin: Math.abs(vStrat - vBh).toFixed(2),
         totalTrades: trades.length, fundamentals, dataWindow, invested,
         ci, lowSample: !isDCA && vTrades < MIN_TRADES, split,
+        costUsed: cost,   // the cost the run actually used — the input field may change after the run
       });
       setResTab(fundamentals ? "fundamentals" : "trades");
     } catch (e) { setError(e.message || "Something went wrong."); }
@@ -679,6 +711,24 @@ export default function Backtester({ initialTicker } = {}) {
                 <Field label="Cost (%)"><Input mono value={costPct} onChange={e => setCostPct(e.target.value)} inputMode="decimal" placeholder="0.1" /></Field>
               </div>
               {isDCA && <p style={{ ...type.caption, color: c.text3, margin: 0 }}>DCA ignores the Capital field — it invests the monthly amount below on a recurring schedule instead of a lump sum.</p>}
+              {/* After-tax comparison toggle — DCA never sells during the period, so there's nothing to tax there */}
+              {!isDCA && (
+                <>
+                  <button onClick={() => setAfterTax(v => !v)} className="atlas-btn" aria-pressed={afterTax}
+                    style={{ display: "flex", alignItems: "center", gap: 8, background: "none", border: "none", padding: 0, cursor: "pointer", textAlign: "left" }}>
+                    <span style={{ width: 30, height: 17, borderRadius: 99, background: afterTax ? c.accent : c.surface2, border: `1px solid ${afterTax ? c.accent : c.hairline}`, position: "relative", flexShrink: 0, transition: "background .15s ease" }}>
+                      <span style={{ position: "absolute", top: 1.5, left: afterTax ? 14 : 2, width: 12, height: 12, borderRadius: 99, background: afterTax ? "#0B0B10" : c.text3, transition: "left .15s ease" }} />
+                    </span>
+                    <span style={{ ...type.small, color: afterTax ? c.text : c.text3 }}>Show after-tax comparison</span>
+                  </button>
+                  {afterTax && (
+                    <div style={{ display: "grid", gridTemplateColumns: "1fr 1fr", gap: 10 }}>
+                      <Field label="Short-term rate (%)"><Input mono value={stRate} onChange={e => setStRate(e.target.value)} inputMode="decimal" placeholder="30" /></Field>
+                      <Field label="Long-term rate (%)"><Input mono value={ltRate} onChange={e => setLtRate(e.target.value)} inputMode="decimal" placeholder="15" /></Field>
+                    </div>
+                  )}
+                </>
+              )}
             </div>
           </Card>
 
@@ -772,6 +822,38 @@ export default function Backtester({ initialTicker } = {}) {
                     {result.ci.lo < 0 && result.ci.hi > 0 ? <span style={{ color: c.warning }}> — it spans zero, so this result is not statistically distinguishable from no edge</span> : ""}.
                   </p>
                 )}
+                {/* After-tax comparison — full-range scope (that's where the closed-trade log lives), shown
+                    ALONGSIDE the pre-tax number so the tax drag is explicit, never silently baked in. */}
+                {afterTax && !isDCA && (() => {
+                  const cost = result.costUsed ?? parseFloat(costPct) / 100;
+                  const d = computeTaxDrag(result.trades, cost, (parseFloat(stRate) || 0) / 100, (parseFloat(ltRate) || 0) / 100);
+                  const start = result.equity[0].value;
+                  const years = Math.max((new Date(result.equity[result.equity.length - 1].date) - new Date(result.equity[0].date)) / (365.25 * 86400000), 1 / 365.25);
+                  const preCagr = parseFloat(result.stratStats.cagr);
+                  const bhCagr = parseFloat(result.bhStats.cagr);
+                  const atCagr = (Math.pow((parseFloat(result.stratStats.finalValue) - d.tax) / start, 1 / years) - 1) * 100;
+                  const gap = (s) => `${s > bhCagr ? "beats" : "trails"} B&H by ${Math.abs(s - bhCagr).toFixed(2)}pp`;
+                  return (
+                    <div style={{ marginTop: 12, paddingTop: 12, borderTop: `1px solid ${c.hairline}` }}>
+                      <Overline color={c.text3} style={{ marginBottom: 6 }}>After-tax comparison — full range</Overline>
+                      <p style={{ fontFamily: font.mono, fontSize: 12.5, color: c.text3, margin: "0 0 3px" }}>
+                        Pre-tax: {preCagr.toFixed(2)}% vs B&H {bhCagr.toFixed(2)}% CAGR — {gap(preCagr)}
+                      </p>
+                      <p style={{ fontFamily: font.mono, fontSize: 12.5, fontWeight: 600, color: c.text, margin: "0 0 8px" }}>
+                        After-tax: {atCagr.toFixed(2)}% vs B&H {bhCagr.toFixed(2)}% CAGR — {gap(atCagr)}
+                      </p>
+                      <p style={{ ...type.caption, color: c.text3, margin: 0, lineHeight: 1.6 }}>
+                        {d.closedCount === 0
+                          ? "No closed trades — nothing realized, so after-tax equals pre-tax here."
+                          : `${d.closedCount} closed trade${d.closedCount === 1 ? "" : "s"}: ${d.shortCount} short-term (<1y), ${d.longCount} long-term · ${d.taxedCount} had gains taxed, ${fmtMoney(d.tax, result.currency, 0)} total · losses aren't offset in this estimate.`}
+                        {" "}Buy-and-hold's gain stays unrealized to the end (the backtester never liquidates it), so it pays no tax here — deferral is its genuine real-world advantage.
+                      </p>
+                      <p style={{ ...type.caption, color: c.warning, margin: "6px 0 0" }}>
+                        Simplified estimate — doesn't account for loss harvesting, wash sales, state taxes, or your specific tax situation. Consult a tax professional for real decisions.
+                      </p>
+                    </div>
+                  );
+                })()}
               </Card>
 
               {/* Walk-forward split — per-segment stats, in-sample deliberately dimmed */}
