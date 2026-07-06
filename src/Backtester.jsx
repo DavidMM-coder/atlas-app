@@ -261,7 +261,7 @@ function runStrategy(prices, strategy, params, cash = 10000, costPct = 0.001, fu
   return runTechnicalStrategy(prices, strategy, params, cash, costPct);
 }
 // ── SVG Chart ─────────────────────────────────────────────────────────────────
-function EquityChart({ strategy, buyhold, trades = [], currency = "USD", width = 760, height = 340 }) {
+function EquityChart({ strategy, buyhold, trades = [], currency = "USD", width = 760, height = 340, splitIdx = null }) {
   const pad = { top: 20, right: 20, bottom: 40, left: 64 };
   const W = width - pad.left - pad.right;
   const H = height - pad.top - pad.bottom;
@@ -304,6 +304,13 @@ function EquityChart({ strategy, buyhold, trades = [], currency = "USD", width =
           style={{ filter: `drop-shadow(0 0 5px ${c.accentGlow})` }} />
         {buyTrades.map((t, i) => <circle key={i} cx={x(t.idx).toFixed(1)} cy={y(t.v).toFixed(1)} r="3.5" fill={c.positive} />)}
         {sellTrades.map((t, i) => <circle key={i} cx={x(t.idx).toFixed(1)} cy={y(t.v).toFixed(1)} r="3.5" fill={c.negative} />)}
+        {/* walk-forward boundary: everything right of this line is the held-out segment the verdict is scored on */}
+        {splitIdx != null && splitIdx > 0 && splitIdx < n - 1 && (
+          <g>
+            <line x1={x(splitIdx).toFixed(1)} y1={0} x2={x(splitIdx).toFixed(1)} y2={H} stroke={c.warning} strokeWidth="1.2" strokeDasharray="5,4" opacity="0.85" />
+            <text x={x(splitIdx) + 6} y={12} style={{ fontFamily: font.mono, fontSize: 9, fill: c.warning }}>out-of-sample begins →</text>
+          </g>
+        )}
       </g>
     </svg>
   );
@@ -529,12 +536,52 @@ export default function Backtester({ initialTicker } = {}) {
       const bhStats = calcStats(bh);
       const stratCAGR = parseFloat(stratStats.cagr);
       const bhCAGR = parseFloat(bhStats.cagr);
-      const ci = isDCA ? bootstrapDcaCagrDiffCI(prices, params.monthlyAmount, cost) : bootstrapCagrDiffCI(equity, bh);
+
+      // ── Walk-forward split (signal-driven strategies only) ──
+      // Retuning fast/slow/thresholds against the visible range until the result looks good is
+      // implicit in-sample fitting even without an optimizer, so the verdict is scored on a
+      // held-out segment: the first ~70% of the DATE range is in-sample, the most recent ~30%
+      // out-of-sample. The strategy runs ONCE over the full range exactly as before (signals only
+      // ever see past prices, so there's no look-ahead) and the equity/benchmark curves are
+      // sliced at the split for per-segment stats — the OOS numbers measure the strategy's
+      // decisions from the split onward, with a position open at the boundary carrying across the
+      // way a live adopter would take the system's current state. A fresh flat start with
+      // in-segment-only indicators was rejected: a 200-day SMA would spend most of a short OOS
+      // segment warming up and could never trade, reporting "no data" for the flagship strategy.
+      // DCA is exempt: a monthly contribution amount can't be curve-fit to history, and its
+      // money-weighted XIRR verdict has no meaningful segment decomposition.
+      let split = null;
+      if (!isDCA && prices.length >= 8) {
+        const t0 = new Date(prices[0].date).getTime();
+        const t1 = new Date(prices[prices.length - 1].date).getTime();
+        const splitMs = t0 + (t1 - t0) * 0.7;
+        const splitIdx = prices.findIndex(p => new Date(p.date).getTime() >= splitMs);
+        if (splitIdx >= 2 && splitIdx <= prices.length - 3) {
+          const splitDate = prices[splitIdx].date;
+          // Segments share the boundary row so the OOS slice's returns start from the split-day value.
+          const oosTrades = trades.filter(t => t.date >= splitDate).length;
+          split = {
+            idx: splitIdx, date: splitDate, from: prices[0].date, to: prices[prices.length - 1].date,
+            isStats: calcStats(equity.slice(0, splitIdx + 1)), isBhStats: calcStats(bh.slice(0, splitIdx + 1)),
+            oosStats: calcStats(equity.slice(splitIdx)), oosBhStats: calcStats(bh.slice(splitIdx)),
+            isTrades: trades.length - oosTrades, oosTrades,
+          };
+        }
+      }
+      // Verdict (beats / margin / CI / low-trade gate) is scored on the out-of-sample segment when
+      // a split exists — the only part the user's parameter fiddling couldn't have been tuned to.
+      // Full-range stats stay on screen below as the clearly-labeled combined view.
+      const vStrat = split ? parseFloat(split.oosStats.cagr) : stratCAGR;
+      const vBh = split ? parseFloat(split.oosBhStats.cagr) : bhCAGR;
+      const vTrades = split ? split.oosTrades : trades.length;
+      const ci = isDCA ? bootstrapDcaCagrDiffCI(prices, params.monthlyAmount, cost)
+        : split ? bootstrapCagrDiffCI(equity.slice(split.idx), bh.slice(split.idx))
+        : bootstrapCagrDiffCI(equity, bh);
       setResult({
         ticker: priceData.ticker, name: priceData.name, currency: priceData.currency || "USD", equity, bh, trades, stratStats, bhStats,
-        beats: stratCAGR > bhCAGR, margin: Math.abs(stratCAGR - bhCAGR).toFixed(2),
+        beats: vStrat > vBh, margin: Math.abs(vStrat - vBh).toFixed(2),
         totalTrades: trades.length, fundamentals, dataWindow, invested,
-        ci, lowSample: !isDCA && trades.length < MIN_TRADES,
+        ci, lowSample: !isDCA && vTrades < MIN_TRADES, split,
       });
       setResTab(fundamentals ? "fundamentals" : "trades");
     } catch (e) { setError(e.message || "Something went wrong."); }
@@ -682,15 +729,18 @@ export default function Backtester({ initialTicker } = {}) {
               {/* Verdict — a low-sample run gets a warning card instead of a confident call */}
               <Card accentEdge pad={18} style={{ borderLeftColor: result.lowSample ? c.warning : result.beats ? c.positive : c.negative, background: result.lowSample ? c.warningSoft : result.beats ? c.positiveSoft : c.negativeSoft }}>
                 <Overline color={result.lowSample ? c.warning : result.beats ? c.positive : c.negative} style={{ marginBottom: 6 }}>
-                  {result.lowSample ? "Not enough trades for a verdict" : "Honest verdict"}
+                  {result.lowSample ? "Not enough trades for a verdict" : result.split ? "Honest verdict — out-of-sample" : "Honest verdict"}
                 </Overline>
                 {result.lowSample ? (
                   <>
                     <p style={{ ...type.bodyL, fontWeight: 600, color: c.text, margin: "0 0 4px" }}>
-                      Only {result.totalTrades} trade{result.totalTrades === 1 ? "" : "s"} on {result.ticker} over {range} — not enough data to draw a reliable conclusion.
+                      {result.split
+                        ? `Only ${result.split.oosTrades} out-of-sample trade${result.split.oosTrades === 1 ? "" : "s"} on ${result.ticker} — not enough held-out data to draw a reliable conclusion.`
+                        : `Only ${result.totalTrades} trade${result.totalTrades === 1 ? "" : "s"} on ${result.ticker} over ${range} — not enough data to draw a reliable conclusion.`}
                     </p>
                     <p style={{ ...type.small, color: c.text3, margin: 0 }}>
-                      Point estimate: {result.beats ? `${strat.name} beat buy-and-hold` : `buy-and-hold beat ${strat.name}`} by {result.margin}% CAGR{result.ci ? ` (${ciInHeadlineDirection(result.ci, result.beats)})` : ""} — but below {MIN_TRADES} trades that gap rides on a handful of entries and exits, i.e. mostly luck.
+                      Point estimate{result.split ? " (out-of-sample)" : ""}: {result.beats ? `${strat.name} beat buy-and-hold` : `buy-and-hold beat ${strat.name}`} by {result.margin}% CAGR{result.ci ? ` (${ciInHeadlineDirection(result.ci, result.beats)})` : ""} — but below {MIN_TRADES} trades that gap rides on a handful of entries and exits, i.e. mostly luck.
+                      {result.split && result.totalTrades >= MIN_TRADES && ` The full range ran ${result.totalTrades} trades, but in-sample trades can't validate a verdict — only the held-out segment counts.`}
                       {result.totalTrades === 0 && " No signals triggered at all."} Try a longer range or looser parameters before trusting it.
                     </p>
                   </>
@@ -702,14 +752,14 @@ export default function Backtester({ initialTicker } = {}) {
                           ? `Dollar-cost averaging ${fmtMoney(getParam("monthlyAmount"), result.currency, 0)}/month beat a lump sum of the same ${result.invested ? fmtMoney(result.invested, result.currency, 0) : "total"} by ${result.margin}% CAGR${result.ci ? ` (${ciInHeadlineDirection(result.ci, result.beats)})` : ""} on ${result.ticker} over ${range}.`
                           : `A lump sum of the same ${result.invested ? fmtMoney(result.invested, result.currency, 0) : "total"} beat dollar-cost averaging ${fmtMoney(getParam("monthlyAmount"), result.currency, 0)}/month by ${result.margin}% CAGR${result.ci ? ` (${ciInHeadlineDirection(result.ci, result.beats)})` : ""} on ${result.ticker} over ${range}.`)
                         : (result.beats
-                          ? `${strat.name} beat buy-and-hold by ${result.margin}% CAGR${result.ci ? ` (${ciInHeadlineDirection(result.ci, result.beats)})` : ""} on ${result.ticker} over ${range}.`
-                          : `Buy-and-hold beat ${strat.name} by ${result.margin}% CAGR${result.ci ? ` (${ciInHeadlineDirection(result.ci, result.beats)})` : ""} on ${result.ticker} over ${range}.`)}
+                          ? `${strat.name} beat buy-and-hold by ${result.margin}% CAGR${result.ci ? ` (${ciInHeadlineDirection(result.ci, result.beats)})` : ""} on ${result.ticker} ${result.split ? `out-of-sample (${result.split.date} → ${result.split.to})` : `over ${range}`}.`
+                          : `Buy-and-hold beat ${strat.name} by ${result.margin}% CAGR${result.ci ? ` (${ciInHeadlineDirection(result.ci, result.beats)})` : ""} on ${result.ticker} ${result.split ? `out-of-sample (${result.split.date} → ${result.split.to})` : `over ${range}`}.`)}
                     </p>
                     <p style={{ ...type.small, color: c.text3, margin: 0 }}>
                       {isDCA
                         ? `${result.totalTrades} monthly contributions · ${parseFloat(costPct)}% cost per buy · ${result.invested ? fmtMoney(result.invested, result.currency, 0) : fmtMoney(0, result.currency, 0)} total invested`
                         : <>
-                            {result.totalTrades} trades executed · {parseFloat(costPct)}% cost per trade
+                            {result.split ? `${result.split.oosTrades} out-of-sample trades (${result.totalTrades} across the full range)` : `${result.totalTrades} trades executed`} · {parseFloat(costPct)}% cost per trade
                             {result.totalTrades === 0 && " · No signals triggered — try adjusting parameters or a longer range"}
                             {!result.beats && result.totalTrades > 0 && " · Most active strategies underperform simple buy-and-hold after costs"}
                           </>}
@@ -718,16 +768,64 @@ export default function Backtester({ initialTicker } = {}) {
                 )}
                 {result.ci && (
                   <p style={{ ...type.caption, color: c.text3, margin: "8px 0 0" }}>
-                    90% CI = middle 90% of the CAGR gap across {result.ci.iterations} block-bootstrap resamples of this run's daily returns
+                    90% CI = middle 90% of the CAGR gap across {result.ci.iterations} block-bootstrap resamples of {result.split ? "the out-of-sample segment's" : "this run's"} daily returns
                     {result.ci.lo < 0 && result.ci.hi > 0 ? <span style={{ color: c.warning }}> — it spans zero, so this result is not statistically distinguishable from no edge</span> : ""}.
                   </p>
                 )}
               </Card>
 
+              {/* Walk-forward split — per-segment stats, in-sample deliberately dimmed */}
+              {result.split && (
+                <Card pad={18}>
+                  <div style={{ display: "flex", alignItems: "baseline", justifyContent: "space-between", flexWrap: "wrap", gap: 8, marginBottom: 8 }}>
+                    <Overline color={c.accent}>Walk-forward split</Overline>
+                    <span style={{ ...type.caption, color: c.text3, fontFamily: font.mono }}>{result.split.from} → <span style={{ color: c.warning }}>{result.split.date}</span> → {result.split.to}</span>
+                  </div>
+                  <p style={{ ...type.caption, color: c.text3, margin: "0 0 14px", lineHeight: 1.6 }}>
+                    Parameters were effectively "seen" during the in-sample period even if you didn't formally optimize them — every tweak-and-rerun tunes them to that window. Only the out-of-sample result says whether the strategy actually works.
+                  </p>
+                  <div style={{ display: "grid", gridTemplateColumns: "minmax(90px, 120px) 1fr 1fr", gap: "8px 12px", alignItems: "baseline" }}>
+                    <span />
+                    <div>
+                      <div style={{ ...type.overline, color: c.text3 }}>In-sample — first ~70%</div>
+                      <div style={{ ...type.caption, color: c.warning, marginTop: 2 }}>Don't trust this if you tuned parameters to fit this period</div>
+                    </div>
+                    <div>
+                      <div style={{ ...type.overline, color: c.accent }}>Out-of-sample — last ~30%</div>
+                      <div style={{ ...type.caption, color: c.text3, marginTop: 2 }}>The verdict above is scored on this segment only</div>
+                    </div>
+                    {[
+                      ["CAGR", "cagr", "%"],
+                      ["Sharpe", "sharpe", ""],
+                      ["Max Drawdown", "maxDrawdown", "%"],
+                      ["Volatility", "volatility", "%"],
+                    ].map(([label, key, unit]) => (
+                      <React.Fragment key={key}>
+                        <span style={{ ...type.caption, color: c.text3 }}>{label}</span>
+                        <span style={{ fontFamily: font.mono, fontSize: 13, color: c.text3 }}>
+                          {result.split.isStats[key]}{unit} <span style={{ ...type.caption }}>· B&H {result.split.isBhStats[key]}{unit}</span>
+                        </span>
+                        <span style={{ fontFamily: font.mono, fontSize: 13, fontWeight: 600, color: c.text }}>
+                          {result.split.oosStats[key]}{unit} <span style={{ ...type.caption, color: c.text3, fontWeight: 400 }}>· B&H {result.split.oosBhStats[key]}{unit}</span>
+                        </span>
+                      </React.Fragment>
+                    ))}
+                    <span style={{ ...type.caption, color: c.text3 }}>Trades</span>
+                    <span style={{ fontFamily: font.mono, fontSize: 13, color: c.text3 }}>{result.split.isTrades}</span>
+                    <span style={{ fontFamily: font.mono, fontSize: 13, fontWeight: 600, color: result.split.oosTrades < MIN_TRADES ? c.warning : c.text }}>
+                      {result.split.oosTrades}{result.split.oosTrades < MIN_TRADES ? ` — below the ${MIN_TRADES}-trade bar` : ""}
+                    </span>
+                  </div>
+                </Card>
+              )}
+
               {/* Stats — greyed down on low-sample runs so precise-looking numbers don't oversell 2 trades */}
+              {result.split && (
+                <Overline color={c.text3} style={{ margin: "4px 0 -6px" }}>Full range — in-sample + out-of-sample combined</Overline>
+              )}
               {result.lowSample && (
                 <div style={{ ...type.caption, color: c.warning, margin: "2px 0 -4px" }}>
-                  Stats greyed out — {result.totalTrades} trade{result.totalTrades === 1 ? "" : "s"} is too few to separate skill from noise.
+                  Stats greyed out — {result.split ? `only ${result.split.oosTrades} out-of-sample trade${result.split.oosTrades === 1 ? "" : "s"}` : `${result.totalTrades} trade${result.totalTrades === 1 ? "" : "s"}`} is too few to separate skill from noise.
                 </div>
               )}
               <div style={{ display: "flex", gap: 10, flexWrap: "wrap", ...(result.lowSample ? { opacity: 0.45, filter: "saturate(0.35)" } : {}) }}>
@@ -757,9 +855,10 @@ export default function Backtester({ initialTicker } = {}) {
                     <span style={{ display: "flex", alignItems: "center", gap: 6 }}><span style={{ width: 12, height: 2, background: c.seriesAlt, display: "inline-block" }} /> {isDCA ? "Lump sum (same total)" : "Buy & hold"}</span>
                     <span style={{ display: "flex", alignItems: "center", gap: 6 }}><span style={{ width: 7, height: 7, borderRadius: 99, background: c.positive, display: "inline-block" }} /> {isDCA ? "Monthly buy" : "Buy"}</span>
                     {!isDCA && <span style={{ display: "flex", alignItems: "center", gap: 6 }}><span style={{ width: 7, height: 7, borderRadius: 99, background: c.negative, display: "inline-block" }} /> Sell</span>}
+                    {result.split && <span style={{ display: "flex", alignItems: "center", gap: 6 }}><span style={{ width: 12, height: 0, borderTop: `2px dashed ${c.warning}`, display: "inline-block" }} /> OOS split</span>}
                   </div>
                 </div>
-                <EquityChart strategy={result.equity} buyhold={result.bh} trades={result.trades} currency={result.currency} />
+                <EquityChart strategy={result.equity} buyhold={result.bh} trades={result.trades} currency={result.currency} splitIdx={result.split ? result.split.idx : null} />
               </Card>
 
               {/* Trade log + fundamentals tabs */}
