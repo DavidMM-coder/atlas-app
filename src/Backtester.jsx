@@ -4,8 +4,23 @@ import {
   Card, Button, Input, Field, Overline, SegmentedControl, Tabs, Badge,
   InfoTip, ErrorBanner, LoadingBlock, EmptyState, motion,
 } from "./ui/primitives.jsx";
-import { sma, rsiCalc, calcStats, runBuyAndHold, runDCA, calcDCAStats } from "./lib/marketStats.js";
+import { sma, rsiCalc, calcStats, runBuyAndHold, runDCA, calcDCAStats, bootstrapCagrDiffCI, bootstrapDcaCagrDiffCI } from "./lib/marketStats.js";
 import { apiUrl } from "./lib/api.js";
+
+// Below this many trades, a strategy-vs-benchmark gap is dominated by a handful of entry/exit
+// rolls of the dice, so the verdict is presented as "not enough data" and the stats are
+// visually de-emphasized instead of shown with full confidence. DCA is exempt: its "trades"
+// are deterministic monthly contributions, not signal-driven bets, so trade count doesn't
+// measure sample size there.
+const MIN_TRADES = 10;
+
+// The bootstrap CI is computed on the (strategy − benchmark) gap; headlines phrase the gap in
+// whichever direction won ("X beat Y by …"), so flip the interval to match that direction.
+function ciInHeadlineDirection(ci, beats) {
+  const lo = beats ? ci.lo : -ci.hi;
+  const hi = beats ? ci.hi : -ci.lo;
+  return `90% CI: ${lo.toFixed(2)}% to ${hi.toFixed(2)}%`;
+}
 
 const GLOSSARY = {
   "CAGR": "Compound Annual Growth Rate. The smoothed yearly return if your investment grew at a steady pace. $10,000 becoming $16,000 in 5 years = 9.9% CAGR.",
@@ -514,10 +529,12 @@ export default function Backtester({ initialTicker } = {}) {
       const bhStats = calcStats(bh);
       const stratCAGR = parseFloat(stratStats.cagr);
       const bhCAGR = parseFloat(bhStats.cagr);
+      const ci = isDCA ? bootstrapDcaCagrDiffCI(prices, params.monthlyAmount, cost) : bootstrapCagrDiffCI(equity, bh);
       setResult({
         ticker: priceData.ticker, name: priceData.name, currency: priceData.currency || "USD", equity, bh, trades, stratStats, bhStats,
         beats: stratCAGR > bhCAGR, margin: Math.abs(stratCAGR - bhCAGR).toFixed(2),
         totalTrades: trades.length, fundamentals, dataWindow, invested,
+        ci, lowSample: !isDCA && trades.length < MIN_TRADES,
       });
       setResTab(fundamentals ? "fundamentals" : "trades");
     } catch (e) { setError(e.message || "Something went wrong."); }
@@ -561,20 +578,25 @@ export default function Backtester({ initialTicker } = {}) {
         const params = {};
         strat.params.forEach(p => { params[p.id] = getParam(p.id); });
         const cost = parseFloat(costPct) / 100;
-        let bh, equity, ss;
+        let bh, equity, ss, tradeList, ci;
         if (isDCA) {
           const dca = runDCA(prices, params.monthlyAmount, cost);
-          equity = dca.equity;
+          equity = dca.equity; tradeList = dca.trades;
           bh = runBuyAndHold(prices, dca.invested, cost);
           ss = calcDCAStats(dca);
+          ci = bootstrapDcaCagrDiffCI(prices, params.monthlyAmount, cost);
         } else {
           const initialCash = parseFloat(cash) || 10000;
           bh = runBuyAndHold(prices, initialCash, cost);
-          ({ equity } = runStrategy(prices, stratId, params, initialCash, cost, fundamentals));
+          ({ equity, trades: tradeList } = runStrategy(prices, stratId, params, initialCash, cost, fundamentals));
           ss = calcStats(equity);
+          ci = bootstrapCagrDiffCI(equity, bh);
         }
         const bs = calcStats(bh);
-        return { ticker: t, name: priceData.name, stratCAGR: parseFloat(ss.cagr), bhCAGR: parseFloat(bs.cagr), beats: parseFloat(ss.cagr) > parseFloat(bs.cagr), sharpe: ss.sharpe, maxDD: ss.maxDrawdown };
+        return {
+          ticker: t, name: priceData.name, stratCAGR: parseFloat(ss.cagr), bhCAGR: parseFloat(bs.cagr), beats: parseFloat(ss.cagr) > parseFloat(bs.cagr), sharpe: ss.sharpe, maxDD: ss.maxDrawdown,
+          trades: tradeList.length, ci, lowSample: !isDCA && tradeList.length < MIN_TRADES,
+        };
       } catch (e) { return { ticker: t, error: e.message }; }
     }));
     setMultiResult(results);
@@ -657,31 +679,58 @@ export default function Backtester({ initialTicker } = {}) {
 
           {result && (
             <>
-              {/* Verdict */}
-              <Card accentEdge pad={18} style={{ borderLeftColor: result.beats ? c.positive : c.negative, background: result.beats ? c.positiveSoft : c.negativeSoft }}>
-                <Overline color={result.beats ? c.positive : c.negative} style={{ marginBottom: 6 }}>Honest verdict</Overline>
-                <p style={{ ...type.bodyL, fontWeight: 600, color: c.text, margin: "0 0 4px" }}>
-                  {isDCA
-                    ? (result.beats
-                      ? `Dollar-cost averaging ${fmtMoney(getParam("monthlyAmount"), result.currency, 0)}/month beat a lump sum of the same ${result.invested ? fmtMoney(result.invested, result.currency, 0) : "total"} by ${result.margin}% CAGR on ${result.ticker} over ${range}.`
-                      : `A lump sum of the same ${result.invested ? fmtMoney(result.invested, result.currency, 0) : "total"} beat dollar-cost averaging ${fmtMoney(getParam("monthlyAmount"), result.currency, 0)}/month by ${result.margin}% CAGR on ${result.ticker} over ${range}.`)
-                    : (result.beats
-                      ? `${strat.name} beat buy-and-hold by ${result.margin}% CAGR on ${result.ticker} over ${range}.`
-                      : `Buy-and-hold beat ${strat.name} by ${result.margin}% CAGR on ${result.ticker} over ${range}.`)}
-                </p>
-                <p style={{ ...type.small, color: c.text3, margin: 0 }}>
-                  {isDCA
-                    ? `${result.totalTrades} monthly contributions · ${parseFloat(costPct)}% cost per buy · ${result.invested ? fmtMoney(result.invested, result.currency, 0) : fmtMoney(0, result.currency, 0)} total invested`
-                    : <>
-                        {result.totalTrades} trades executed · {parseFloat(costPct)}% cost per trade
-                        {result.totalTrades === 0 && " · No signals triggered — try adjusting parameters or a longer range"}
-                        {!result.beats && result.totalTrades > 0 && " · Most active strategies underperform simple buy-and-hold after costs"}
-                      </>}
-                </p>
+              {/* Verdict — a low-sample run gets a warning card instead of a confident call */}
+              <Card accentEdge pad={18} style={{ borderLeftColor: result.lowSample ? c.warning : result.beats ? c.positive : c.negative, background: result.lowSample ? c.warningSoft : result.beats ? c.positiveSoft : c.negativeSoft }}>
+                <Overline color={result.lowSample ? c.warning : result.beats ? c.positive : c.negative} style={{ marginBottom: 6 }}>
+                  {result.lowSample ? "Not enough trades for a verdict" : "Honest verdict"}
+                </Overline>
+                {result.lowSample ? (
+                  <>
+                    <p style={{ ...type.bodyL, fontWeight: 600, color: c.text, margin: "0 0 4px" }}>
+                      Only {result.totalTrades} trade{result.totalTrades === 1 ? "" : "s"} on {result.ticker} over {range} — not enough data to draw a reliable conclusion.
+                    </p>
+                    <p style={{ ...type.small, color: c.text3, margin: 0 }}>
+                      Point estimate: {result.beats ? `${strat.name} beat buy-and-hold` : `buy-and-hold beat ${strat.name}`} by {result.margin}% CAGR{result.ci ? ` (${ciInHeadlineDirection(result.ci, result.beats)})` : ""} — but below {MIN_TRADES} trades that gap rides on a handful of entries and exits, i.e. mostly luck.
+                      {result.totalTrades === 0 && " No signals triggered at all."} Try a longer range or looser parameters before trusting it.
+                    </p>
+                  </>
+                ) : (
+                  <>
+                    <p style={{ ...type.bodyL, fontWeight: 600, color: c.text, margin: "0 0 4px" }}>
+                      {isDCA
+                        ? (result.beats
+                          ? `Dollar-cost averaging ${fmtMoney(getParam("monthlyAmount"), result.currency, 0)}/month beat a lump sum of the same ${result.invested ? fmtMoney(result.invested, result.currency, 0) : "total"} by ${result.margin}% CAGR${result.ci ? ` (${ciInHeadlineDirection(result.ci, result.beats)})` : ""} on ${result.ticker} over ${range}.`
+                          : `A lump sum of the same ${result.invested ? fmtMoney(result.invested, result.currency, 0) : "total"} beat dollar-cost averaging ${fmtMoney(getParam("monthlyAmount"), result.currency, 0)}/month by ${result.margin}% CAGR${result.ci ? ` (${ciInHeadlineDirection(result.ci, result.beats)})` : ""} on ${result.ticker} over ${range}.`)
+                        : (result.beats
+                          ? `${strat.name} beat buy-and-hold by ${result.margin}% CAGR${result.ci ? ` (${ciInHeadlineDirection(result.ci, result.beats)})` : ""} on ${result.ticker} over ${range}.`
+                          : `Buy-and-hold beat ${strat.name} by ${result.margin}% CAGR${result.ci ? ` (${ciInHeadlineDirection(result.ci, result.beats)})` : ""} on ${result.ticker} over ${range}.`)}
+                    </p>
+                    <p style={{ ...type.small, color: c.text3, margin: 0 }}>
+                      {isDCA
+                        ? `${result.totalTrades} monthly contributions · ${parseFloat(costPct)}% cost per buy · ${result.invested ? fmtMoney(result.invested, result.currency, 0) : fmtMoney(0, result.currency, 0)} total invested`
+                        : <>
+                            {result.totalTrades} trades executed · {parseFloat(costPct)}% cost per trade
+                            {result.totalTrades === 0 && " · No signals triggered — try adjusting parameters or a longer range"}
+                            {!result.beats && result.totalTrades > 0 && " · Most active strategies underperform simple buy-and-hold after costs"}
+                          </>}
+                    </p>
+                  </>
+                )}
+                {result.ci && (
+                  <p style={{ ...type.caption, color: c.text3, margin: "8px 0 0" }}>
+                    90% CI = middle 90% of the CAGR gap across {result.ci.iterations} block-bootstrap resamples of this run's daily returns
+                    {result.ci.lo < 0 && result.ci.hi > 0 ? <span style={{ color: c.warning }}> — it spans zero, so this result is not statistically distinguishable from no edge</span> : ""}.
+                  </p>
+                )}
               </Card>
 
-              {/* Stats */}
-              <div style={{ display: "flex", gap: 10, flexWrap: "wrap" }}>
+              {/* Stats — greyed down on low-sample runs so precise-looking numbers don't oversell 2 trades */}
+              {result.lowSample && (
+                <div style={{ ...type.caption, color: c.warning, margin: "2px 0 -4px" }}>
+                  Stats greyed out — {result.totalTrades} trade{result.totalTrades === 1 ? "" : "s"} is too few to separate skill from noise.
+                </div>
+              )}
+              <div style={{ display: "flex", gap: 10, flexWrap: "wrap", ...(result.lowSample ? { opacity: 0.45, filter: "saturate(0.35)" } : {}) }}>
                 <StatCard label="CAGR" strategy={result.stratStats.cagr} buyhold={result.bhStats.cagr} baseLabel={isDCA ? "Lump" : "B&H"} />
                 <StatCard label="Total Return" strategy={result.stratStats.totalReturn} buyhold={result.bhStats.totalReturn} baseLabel={isDCA ? "Lump" : "B&H"} />
                 <StatCard label="Max Drawdown" strategy={result.stratStats.maxDrawdown} buyhold={result.bhStats.maxDrawdown} good="low" baseLabel={isDCA ? "Lump" : "B&H"} />
@@ -758,28 +807,36 @@ export default function Backtester({ initialTicker } = {}) {
             </div>
             {multiResult && (
               <div style={{ marginTop: 16, overflowX: "auto" }}>
-                <div style={{ display: "grid", gridTemplateColumns: "70px 1fr 86px 86px 70px 80px 76px", gap: 8, padding: "6px 0", borderBottom: `1px solid ${c.hairline}`, minWidth: 540 }}>
-                  {["Ticker", "Name", "Strat CAGR", "B&H CAGR", "Sharpe", "Max DD", "Result"].map(h => <span key={h} style={{ ...type.overline, color: c.text3 }}>{h}</span>)}
+                <div style={{ display: "grid", gridTemplateColumns: "70px 1fr 86px 86px 118px 62px 70px 80px 82px", gap: 8, padding: "6px 0", borderBottom: `1px solid ${c.hairline}`, minWidth: 720 }}>
+                  {["Ticker", "Name", "Strat CAGR", "B&H CAGR", "Δ 90% CI", "Trades", "Sharpe", "Max DD", "Result"].map(h => <span key={h} style={{ ...type.overline, color: c.text3 }}>{h}</span>)}
                 </div>
                 {multiResult.map((r, i) => r.error ? (
-                  <div key={i} style={{ display: "grid", gridTemplateColumns: "70px 1fr", gap: 8, padding: "8px 0", borderBottom: `1px solid ${c.hairline}`, minWidth: 540 }}>
+                  <div key={i} style={{ display: "grid", gridTemplateColumns: "70px 1fr", gap: 8, padding: "8px 0", borderBottom: `1px solid ${c.hairline}`, minWidth: 720 }}>
                     <span style={{ fontFamily: font.mono, fontSize: 12, color: c.accent }}>{r.ticker}</span>
                     <span style={{ ...type.caption, color: c.negative }}>{r.error}</span>
                   </div>
                 ) : (
-                  <div key={i} style={{ display: "grid", gridTemplateColumns: "70px 1fr 86px 86px 70px 80px 76px", gap: 8, padding: "8px 0", borderBottom: `1px solid ${c.hairline}`, minWidth: 540, alignItems: "center" }}>
+                  <div key={i} style={{ display: "grid", gridTemplateColumns: "70px 1fr 86px 86px 118px 62px 70px 80px 82px", gap: 8, padding: "8px 0", borderBottom: `1px solid ${c.hairline}`, minWidth: 720, alignItems: "center" }}>
                     <span style={{ fontFamily: font.mono, fontWeight: 700, fontSize: 12, color: c.accent }}>{r.ticker}</span>
                     <span style={{ ...type.caption, color: c.text3, overflow: "hidden", textOverflow: "ellipsis", whiteSpace: "nowrap" }}>{r.name}</span>
-                    <span style={{ fontFamily: font.mono, fontSize: 12, color: r.stratCAGR >= 0 ? c.positive : c.negative }}>{r.stratCAGR.toFixed(1)}%</span>
-                    <span style={{ fontFamily: font.mono, fontSize: 12, color: c.text2 }}>{r.bhCAGR.toFixed(1)}%</span>
-                    <span style={{ fontFamily: font.mono, fontSize: 12, color: c.text3 }}>{r.sharpe}</span>
-                    <span style={{ fontFamily: font.mono, fontSize: 12, color: c.warning }}>{r.maxDD}%</span>
-                    <span style={{ ...type.bodyStrong, fontSize: 11, color: r.beats ? c.positive : c.negative }}>{r.beats ? "Beats" : "Loses"}</span>
+                    {/* Low-sample rows keep their numbers but faded, with the Result cell flagging why */}
+                    <span style={{ fontFamily: font.mono, fontSize: 12, color: r.stratCAGR >= 0 ? c.positive : c.negative, opacity: r.lowSample ? 0.5 : 1 }}>{r.stratCAGR.toFixed(1)}%</span>
+                    <span style={{ fontFamily: font.mono, fontSize: 12, color: c.text2, opacity: r.lowSample ? 0.5 : 1 }}>{r.bhCAGR.toFixed(1)}%</span>
+                    <span style={{ fontFamily: font.mono, fontSize: 11, color: r.ci && r.ci.lo < 0 && r.ci.hi > 0 ? c.text3 : c.text2, opacity: r.lowSample ? 0.5 : 1 }}>
+                      {r.ci ? `${r.ci.lo >= 0 ? "+" : ""}${r.ci.lo.toFixed(1)} … ${r.ci.hi >= 0 ? "+" : ""}${r.ci.hi.toFixed(1)}%` : "—"}
+                    </span>
+                    <span style={{ fontFamily: font.mono, fontSize: 12, color: r.lowSample ? c.warning : c.text3 }}>{r.trades}</span>
+                    <span style={{ fontFamily: font.mono, fontSize: 12, color: c.text3, opacity: r.lowSample ? 0.5 : 1 }}>{r.sharpe}</span>
+                    <span style={{ fontFamily: font.mono, fontSize: 12, color: c.warning, opacity: r.lowSample ? 0.5 : 1 }}>{r.maxDD}%</span>
+                    {r.lowSample
+                      ? <span style={{ ...type.bodyStrong, fontSize: 11, color: c.warning }}>⚠ Low N</span>
+                      : <span style={{ ...type.bodyStrong, fontSize: 11, color: r.beats ? c.positive : c.negative }}>{r.beats ? "Beats" : "Loses"}</span>}
                   </div>
                 ))}
                 {(() => {
                   const wins = multiResult.filter(r => !r.error && r.beats).length;
                   const total = multiResult.filter(r => !r.error).length;
+                  const lowN = multiResult.filter(r => !r.error && r.lowSample).length;
                   const rate = total > 0 ? wins / total : 0;
                   const tone = rate < 0.5 ? c.negative : rate < 0.75 ? c.warning : c.positive;
                   return total > 1 && (
@@ -787,6 +844,7 @@ export default function Backtester({ initialTicker } = {}) {
                       {rate < 0.5 ? `Beats buy-and-hold on only ${wins}/${total} tickers — likely overfit to specific conditions.`
                         : rate < 0.75 ? `Mixed results: beats B&H on ${wins}/${total} tickers. Strategy is sensitive to the asset.`
                         : `Strong consistency: beats buy-and-hold on ${wins}/${total} tickers.`}
+                      {lowN > 0 && <span style={{ color: c.warning }}> {lowN} of {total} ran fewer than {MIN_TRADES} trades — treat those rows as unreliable, not evidence.</span>}
                     </div>
                   );
                 })()}

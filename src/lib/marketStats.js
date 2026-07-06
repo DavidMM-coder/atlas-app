@@ -76,6 +76,85 @@ export function calcStats(equityCurve, riskFreeRate = 0.05) {
   };
 }
 
+// ── Bootstrap confidence intervals for the Backtester's "beats buy-and-hold by X%" verdict ──
+//
+// Resamples PERIOD (daily) returns, not per-trade returns: a 2-trade run has a degenerate
+// 2-point trade distribution — exactly the case where the CI matters most — while its daily
+// equity curve still carries the full time-in-market / time-in-cash structure. Resampling is
+// done in ~monthly BLOCKS of consecutive days (circular moving-block bootstrap) rather than
+// day-by-day, so short-range autocorrelation (trends the strategies themselves key off)
+// survives into the resamples, and strategy + benchmark days are resampled as PAIRS so their
+// correlation — what the CAGR gap's variance actually depends on — is preserved.
+// Returns { lo, hi, iterations } for the (strategy − benchmark) CAGR gap in percentage
+// points, or null when the series is too short to say anything.
+export function bootstrapCagrDiffCI(stratEquity, bhEquity, { iterations = 1000, blockLen = 21, loQ = 0.05, hiQ = 0.95 } = {}) {
+  const n = Math.min(stratEquity?.length || 0, bhEquity?.length || 0);
+  if (n < 40) return null;
+  const rs = [], rb = [];
+  for (let i = 1; i < n; i++) {
+    const s0 = stratEquity[i - 1].value, b0 = bhEquity[i - 1].value;
+    if (s0 > 0 && b0 > 0) { rs.push(Math.log(stratEquity[i].value / s0)); rb.push(Math.log(bhEquity[i].value / b0)); }
+  }
+  const m = rs.length;
+  if (m < 40) return null;
+  // Same calendar-dates-not-row-count rule as calcStats — resamples keep the original length,
+  // so the original window's year span applies to every resample.
+  const years = Math.max((new Date(stratEquity[n - 1].date) - new Date(stratEquity[0].date)) / (365.25 * 86400000), 1 / 365.25);
+  const diffs = new Array(iterations);
+  for (let k = 0; k < iterations; k++) {
+    let sumS = 0, sumB = 0, filled = 0;
+    while (filled < m) {
+      const start = Math.floor(Math.random() * m);
+      for (let j = 0; j < blockLen && filled < m; j++, filled++) {
+        const idx = (start + j) % m;
+        sumS += rs[idx]; sumB += rb[idx];
+      }
+    }
+    diffs[k] = (Math.pow(Math.exp(sumS), 1 / years) - Math.pow(Math.exp(sumB), 1 / years)) * 100;
+  }
+  diffs.sort((a, b) => a - b);
+  const q = (p) => diffs[Math.min(iterations - 1, Math.max(0, Math.floor(p * iterations)))];
+  return { lo: q(loQ), hi: q(hiQ), iterations };
+}
+
+// DCA variant. The daily-equity bootstrap above is wrong for DCA twice over: its equity curve
+// contains contribution jumps that aren't returns, and its headline CAGR is money-weighted
+// (XIRR), not equity-curve CAGR. Instead, resample the ASSET's daily returns (same circular
+// block scheme) onto the original date grid, rebuild a synthetic price path, and re-run the
+// deterministic monthly-contribution schedule + XIRR against a lump sum of the same total on
+// that path. Fewer iterations because each one re-runs the DCA sim + XIRR bisection.
+export function bootstrapDcaCagrDiffCI(prices, monthlyAmount, costPct, { iterations = 500, blockLen = 21, loQ = 0.05, hiQ = 0.95 } = {}) {
+  if (!prices || prices.length < 40) return null;
+  const logR = [];
+  for (let i = 1; i < prices.length; i++) {
+    if (prices[i - 1].close > 0 && prices[i].close > 0) logR.push(Math.log(prices[i].close / prices[i - 1].close));
+  }
+  const m = logR.length;
+  if (m < 40) return null;
+  const diffs = [];
+  for (let k = 0; k < iterations; k++) {
+    const path = new Array(m + 1);
+    path[0] = { date: prices[0].date, close: prices[0].close };
+    let filled = 0, close = prices[0].close;
+    while (filled < m) {
+      const start = Math.floor(Math.random() * m);
+      for (let j = 0; j < blockLen && filled < m; j++) {
+        close *= Math.exp(logR[(start + j) % m]);
+        filled++;
+        path[filled] = { date: prices[filled].date, close };
+      }
+    }
+    const dca = runDCA(path, monthlyAmount, costPct);
+    const dcaCagr = parseFloat(calcDCAStats(dca).cagr);
+    const lumpCagr = parseFloat(calcStats(runBuyAndHold(path, dca.invested, costPct)).cagr);
+    if (Number.isFinite(dcaCagr) && Number.isFinite(lumpCagr)) diffs.push(dcaCagr - lumpCagr);
+  }
+  if (diffs.length < 50) return null;
+  diffs.sort((a, b) => a - b);
+  const q = (p) => diffs[Math.min(diffs.length - 1, Math.max(0, Math.floor(p * diffs.length)))];
+  return { lo: q(loQ), hi: q(hiQ), iterations: diffs.length };
+}
+
 // Computes a ground-truth technicals/performance snapshot for one ticker from real price
 // history (fetched via /api/history, the same Yahoo-backed data source the Backtester uses).
 // Returns null if the ticker can't be resolved or there isn't enough history — callers should
