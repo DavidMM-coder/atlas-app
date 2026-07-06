@@ -779,7 +779,7 @@ async function callClaude(system, user, { maxTokens = 4000, maxSearches = 4, fas
 // reason over data we've ALREADY fetched from our own endpoints (news headlines, or a full dossier's
 // price/fundamentals/news). `think` keeps adaptive thinking on for depth (dossier); default off for
 // speed (news blurbs). Because there's no web search, disabling thinking here is safe.
-async function callClaudeAnalyze(system, user, { maxTokens = 1600, think = false } = {}) {
+async function callClaudeAnalyzeOnce(system, user, maxTokens, think) {
   const body = JSON.stringify({
     model: AI_MODEL, max_tokens: maxTokens, system,
     messages: [{ role: "user", content: user }],
@@ -794,7 +794,49 @@ async function callClaudeAnalyze(system, user, { maxTokens = 1600, think = false
   const data = await readAIResponse(resp);
   if (data.error) throw new Error(data.error.message || "API error");
   const text = (data.content || []).filter((b) => b.type === "text").map((b) => b.text).join("\n");
-  return extractJSON(text);
+  return { parsed: extractJSON(text), stopReason: data.stop_reason, text };
+}
+
+// Evidence trail for analyze-path parse failures. Every prior occurrence of the dossier
+// "unreadable" bug destroyed its own evidence — the raw text was discarded, making it
+// undebuggable after the fact (diagnosed live 2026-07-06: the model emitted a spurious `}` after
+// fit.summary, prematurely closing the root object — mid-document corruption that closeJSON, an
+// append-only truncation repairer, cannot fix). Mirror the search path's console.error AND keep
+// the last few raw failures in a localStorage ring buffer. Local debugging aid only — never
+// synced to Firestore or sent anywhere.
+const ANALYZE_FAIL_KEY = "atlas_analyze_failures";
+function logAnalyzeParseFailure(text, stopReason) {
+  console.error("callClaudeAnalyze: extractJSON failed after retry. stop_reason:", stopReason, "raw text:", (text || "").slice(0, 500));
+  try {
+    const prev = JSON.parse(localStorage.getItem(ANALYZE_FAIL_KEY) || "[]");
+    const entry = { at: new Date().toISOString(), stopReason: stopReason || null, textLength: (text || "").length, text: (text || "").slice(0, 30000) };
+    localStorage.setItem(ANALYZE_FAIL_KEY, JSON.stringify([entry, ...(Array.isArray(prev) ? prev : [])].slice(0, 4)));
+  } catch {}
+}
+
+// Same self-healing the search path has had all along (callClaudeAttempt) — the dossier, the most
+// complex JSON this app ever asks for, previously got NONE of it: one truncation retry at a larger
+// budget, then one retry of a non-truncated-but-unparseable response (a fresh sample almost never
+// repeats the same generation slip — verified live: the captured spurious-brace failure succeeded
+// on the very next attempt). One retry each, deliberately not a loop: catches the common transient
+// case without open-endedly doubling cost/latency on a genuinely broken prompt.
+async function callClaudeAnalyze(system, user, { maxTokens = 1600, think = false } = {}) {
+  let { parsed, stopReason, text } = await callClaudeAnalyzeOnce(system, user, maxTokens, think);
+  if (stopReason === "max_tokens") {
+    // Retry truncation even when the truncated payload parsed — a number cut off mid-digits
+    // parses to a valid-but-wrong value (same reasoning as callClaudeAttempt). Clamped to the
+    // proxy's MAX_TOKENS_CAP (api/messages.js rejects max_tokens > 32000): the dossier already
+    // runs at 20000, and an unclamped 1.8× retry (37500) would 400, turning a healable
+    // truncation into a hard failure.
+    const retry = await callClaudeAnalyzeOnce(system, user, Math.min(32000, Math.round(maxTokens * 1.8) + 1500), think);
+    if (retry.parsed || !parsed) ({ parsed, stopReason, text } = retry);
+  }
+  if (!parsed && stopReason !== "max_tokens") {
+    const retry = await callClaudeAnalyzeOnce(system, user, maxTokens, think);
+    if (retry.parsed) ({ parsed, stopReason, text } = retry);
+  }
+  if (!parsed) logAnalyzeParseFailure(text, stopReason);
+  return parsed;
 }
 
 // The model doesn't always obey the "no vague aggregate rows" prompt instruction (e.g. still
