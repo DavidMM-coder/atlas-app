@@ -2119,6 +2119,15 @@ RECENT NEWS for ${upTicker} (real headlines + links — build the news section f
 ${news.items.slice(0, 10).map((n, i) => `[${i}] ${n.headline} — ${n.source}, ${n.date || "recent"} — ${n.url}`).join("\n")}`;
       }
     }
+    // Field ORDER in the schema below is load-bearing, not stylistic: the model's reliably
+    // observed corruption (live-diagnosed 2026-07-06, e.g. KO 4/4) is emitting a spurious `}`
+    // right after finishing a long prose field that still has siblings after it — so every long
+    // prose field (news.summary, insiderActivity.summary, fit.summary, catalysts[].description)
+    // is deliberately the LAST key of its object, making "close the object after the prose" the
+    // CORRECT move instead of a corruption. The pretty-print rule exists for the same reason
+    // (indentation gives the model a nesting-depth cue a 16k-char one-liner lacks). Don't
+    // reorder these fields or drop those format rules without re-measuring the parse-failure
+    // rate. JS property access doesn't care about key order, so renderers are unaffected.
     const sys = `Today's date is ${currentDateStr()}. Treat this as the current date for all recency, prices, valuations and news.
 
 You are a brutally honest, no-nonsense senior equity research analyst — effectively your own independent investment bank. Your job is to produce a complete, institutional-grade stock dossier using the REAL data PROVIDED BELOW — your own computed price history, real fundamentals, and recent news headlines — and to form YOUR OWN judgment from that evidence. Do NOT search the web or call any tools; reason only from the provided data plus your own analytical knowledge. You have NO opinion of your own until the data speaks — if a stock is bad, say it is bad. Do not sugarcoat. Do not be a cheerleader. Scores below 40 are common when warranted.
@@ -2202,8 +2211,7 @@ REQUIRED OUTPUT — all sections mandatory, all data from live searches:
 6. NEWS & SENTIMENT (build ONLY from the RECENT NEWS provided above):
    - overallSentiment: "Very Bullish" / "Bullish" / "Neutral" / "Bearish" / "Very Bearish"
    - sentimentScore: -100 to +100 (negative = bad news dominating)
-   - summary: 2 sentences on what the news flow says about this stock RIGHT NOW
-   - insiderActivity: you do NOT have live SEC/Form-4 access here. If any of the provided news items are about insider buying/selling, summarize them; otherwise set {"summary":"No insider-trading data available in the provided sources","transactions":[]}. NEVER fabricate insider names, share counts, values or dates. When you do report a transaction from the provided news, each object is exactly ONE discrete dated filing.
+   - insiderActivity: you do NOT have live SEC/Form-4 access here. If any of the provided news items are about insider buying/selling, summarize them; otherwise set {"transactions":[],"summary":"No insider-trading data available in the provided sources"}. NEVER fabricate insider names, share counts, values or dates. When you do report a transaction from the provided news, each object is exactly ONE discrete dated filing.
      Each transaction is exactly ONE discrete, dated filing: "insider" names one specific individual (never a group like "multiple insiders"); "shares" is a bare number only, no descriptions or parentheticals tacked on (wrong: "99,000 (Intent to Sell filing)", right: "99,000"); "value" is a single bare dollar amount, never "undisclosed"/"aggregate"; "date" is one specific date/month, never "multiple dates" or a range. If an insider made several separate filings in the window, add up to 2-3 separate transaction objects (one per actual filing) rather than collapsing them into one vague row — and if you can only confirm a pattern or total but no single filing's specifics, leave it out of "transactions" and mention it only in the "summary" prose instead.
    - items: 5–8 recent news items, each with:
      * headline: actual headline text (not paraphrased)
@@ -2213,16 +2221,17 @@ REQUIRED OUTPUT — all sections mandatory, all data from live searches:
      * sentiment: "Positive" / "Negative" / "Neutral"
      * category: one of "Insider Trading", "Earnings", "Management Change", "M&A", "Regulatory/Legal", "Product/Business", "Macro/Sector"
      * impact: one sentence on why this matters for the stock
-   Include any insider-trading items found here too (category "Insider Trading"), in addition to the dedicated insiderActivity summary above.
+   Include any insider-trading items found here too (category "Insider Trading"), in addition to the dedicated insiderActivity summary.
+   - summary: 2 sentences on what the news flow says about this stock RIGHT NOW (the FINAL field of "news" — write it last, then close the object)
 
 7. FIT FOR ${profile.name}:
    - score: 0–100 (how well this stock fits THIS investor's profile AND portfolio)
-   - summary: 3 sentences — address ${profile.name} by name, reference their specific risk tolerance, horizon, goal, AND how this fits or conflicts with their existing holdings
    - action: what ${profile.name} should specifically do: "Buy X shares", "Avoid — here's why", "Hold your X shares", etc.
    - positionSizing: specific guidance grounded in budget "${profile.budget}" — e.g. "No more than 5% of portfolio, roughly $X"
    - watchouts: exactly 3 watchouts written specifically for ${profile.name}'s situation
+   - summary: 3 sentences — address ${profile.name} by name, reference their specific risk tolerance, horizon, goal, AND how this fits or conflicts with their existing holdings (the FINAL field of "fit" — write it last, then close the object)
 
-8. CATALYSTS: 4–6 upcoming catalysts with label + description + timeframe + direction ("Bullish"/"Bearish"/"Neutral")
+8. CATALYSTS: 4–6 upcoming catalysts with label + timeframe + direction ("Bullish"/"Bearish"/"Neutral") + description (description last in each object)
 
 9. ANALYST CONSENSUS: rating, targetPrice, upside vs current price, numAnalysts, highTarget, lowTarget, recentRevisions (upgraded/downgraded in last 30 days)
 
@@ -2235,12 +2244,14 @@ FORMAT RULES:
 - Metric values terse: "28.4x", "$3.2T", "+12.3% YoY", "85.2%", "$182.40"
 - Use "N/A" only when genuinely unavailable in the provided data or your knowledge
 - JSON must be complete and syntactically valid — always close every bracket and brace
+- Output the JSON pretty-printed with 2-space indentation and a newline after every field — do NOT minify it onto one line. (The schema below is shown minified only for compactness; your output must be indented.) The indentation is how you keep your own brace nesting correct in a document this long.
+- Follow the schema's field order exactly within every object. The long prose fields ("summary" in news and fit, "description" in each catalyst) are deliberately the LAST field of their object: write the short fields first, the prose last, and close the object immediately after it. Never close an object right after a prose field that still has fields remaining.
 - If data is unavailable for any metric use "N/A" — never omit a field or leave JSON incomplete
 - For small/obscure companies with limited data, still return the full schema with "N/A" values
 - action field in overall must be one of: "Strong Buy", "Buy", "Hold", "Trim", "Sell", "Avoid"
 
 FULL JSON SCHEMA:
-{"company":"","ticker":"","asOf":"","pillars":{"fundamentals":0,"valuation":0,"technicals":0,"risk":0},"overall":{"score":0,"action":"","thesis":""},"fundamentals":{"groups":[{"title":"","items":[{"label":"","value":""}]}],"conclusion":""},"technicals":{"groups":[{"title":"","items":[{"label":"","value":""}]}],"conclusion":""},"risk":{"groups":[{"title":"","items":[{"label":"","value":""}]}],"conclusion":""},"news":{"overallSentiment":"","sentimentScore":0,"summary":"","insiderActivity":{"summary":"","transactions":[{"insider":"","type":"","shares":"","value":"","date":""}]},"items":[{"headline":"","url":"","source":"","date":"","sentiment":"","category":"","impact":""}]},"fit":{"score":0,"summary":"","action":"","positionSizing":"","watchouts":[""]},"catalysts":[{"label":"","description":"","timeframe":"","direction":""}],"analystConsensus":{"rating":"","targetPrice":"","upside":"","numAnalysts":0,"highTarget":"","lowTarget":"","recentRevisions":""},"dataSources":[""],"flags":[""]}`;
+{"company":"","ticker":"","asOf":"","pillars":{"fundamentals":0,"valuation":0,"technicals":0,"risk":0},"overall":{"score":0,"action":"","thesis":""},"fundamentals":{"groups":[{"title":"","items":[{"label":"","value":""}]}],"conclusion":""},"technicals":{"groups":[{"title":"","items":[{"label":"","value":""}]}],"conclusion":""},"risk":{"groups":[{"title":"","items":[{"label":"","value":""}]}],"conclusion":""},"news":{"overallSentiment":"","sentimentScore":0,"insiderActivity":{"transactions":[{"insider":"","type":"","shares":"","value":"","date":""}],"summary":""},"items":[{"headline":"","url":"","source":"","date":"","sentiment":"","category":"","impact":""}],"summary":""},"fit":{"score":0,"action":"","positionSizing":"","watchouts":[""],"summary":""},"catalysts":[{"label":"","timeframe":"","direction":"","description":""}],"analystConsensus":{"rating":"","targetPrice":"","upside":"","numAnalysts":0,"highTarget":"","lowTarget":"","recentRevisions":""},"dataSources":[""],"flags":[""]}`;
     try {
       // No web search: the dossier reasons over the real price/fundamentals/news we already fetched
       // and passed into the prompt. This can't time out on the upstream search loop and doesn't
