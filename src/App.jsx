@@ -2399,7 +2399,12 @@ FORMAT RULES:
 Schema:
 {"asOf":"","picks":[{"ticker":"","company":"","sector":"","fitScore":0,"pillars":{"fundamentals":0,"valuation":0,"technicals":0,"risk":0},"tags":[""],"snapshot":[{"label":"","value":""}],"reason":"","concern":""}],"marketContext":"one sentence on current market conditions"}`;
     try {
-      const parsed = await callClaude(sys, "Find the best stocks for me right now.", { maxTokens: 2800, maxSearches: 2, fast: true });
+      // 3600 (was 2800): the per-pick pillars object added ~4 numbers + wrapper keys × 6 picks of
+      // required output, and with adaptive thinking eating into a shared budget, first-attempt
+      // truncations (stop_reason max_tokens) got more likely. The extra headroom keeps the enriched
+      // schema a one-shot; output generation isn't Discover's bottleneck (the web search is), so the
+      // latency cost is negligible, and the truncation-retry path (callClaudeAttempt) stays as backstop.
+      const parsed = await callClaude(sys, "Find the best stocks for me right now.", { maxTokens: 3600, maxSearches: 2, fast: true });
       if (seq !== discoverSeq.current) return;   // a newer scan (e.g. universe switch) superseded this
       if (!Array.isArray(parsed.picks)) throw new Error("Couldn't build the shortlist. Tap Scan again.");
       parsed.picks.sort((a, b) => (b.fitScore || 0) - (a.fitScore || 0));
