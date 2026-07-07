@@ -1172,8 +1172,8 @@ function Results({ result, profile, backtestSnapshot, onOpenBacktest }) {
         )}
 
         <Overline color={c.accent} style={{ marginBottom: 12 }}>Pillars</Overline>
-        <PillarRow label="Quality" score={r.pillars?.fundamentals} />
-        <PillarRow label="Value" score={r.pillars?.valuation} />
+        <PillarRow label="Fundamentals" score={r.pillars?.fundamentals} />
+        <PillarRow label="Valuation" score={r.pillars?.valuation} />
         <PillarRow label="Momentum" score={r.pillars?.technicals} />
         <PillarRow label="Safety" score={r.pillars?.risk} />
       </Card>
@@ -1431,16 +1431,21 @@ function Results({ result, profile, backtestSnapshot, onOpenBacktest }) {
 // browsing view shows the SHAPE of a score, not just the single fit number. Deliberately small
 // (tiny labeled bars, no numbers-first emphasis) — this is a scanning view, not a mini-dossier;
 // the full pillar rows with values live behind "Full dossier →".
-const PILLAR_KEYS = [["fundamentals", "Quality"], ["valuation", "Value"], ["technicals", "Momentum"], ["risk", "Safety"]];
+const PILLAR_KEYS = [["fundamentals", "Fundamentals"], ["valuation", "Valuation"], ["technicals", "Momentum"], ["risk", "Safety"]];
 function MiniPillars({ pillars }) {
+  const isMobile = useIsMobile();
   if (!pillars || PILLAR_KEYS.every(([k]) => pillars[k] == null)) return null;
+  // Desktop: all four pillars in one row (flex 1 1 52px). Mobile: the full labels ("Fundamentals",
+  // "Momentum") overflow a ~70px quarter-cell, so drop to a 2×2 grid — each cell takes half the
+  // width (basis 50% minus half the 10px gap → exactly two per row), giving the labels room.
+  const cellStyle = isMobile ? { flex: "1 1 calc(50% - 5px)", minWidth: 0 } : { flex: "1 1 52px", minWidth: 52 };
   return (
     <div style={{ display: "flex", gap: 10, flexWrap: "wrap", marginTop: 12 }}>
       {PILLAR_KEYS.map(([key, label]) => {
         const s = pillars[key];
         const col = scoreColor(s);
         return (
-          <div key={key} style={{ flex: "1 1 52px", minWidth: 52 }}>
+          <div key={key} style={cellStyle}>
             <div style={{ display: "flex", justifyContent: "space-between", alignItems: "baseline", marginBottom: 3 }}>
               <span style={{ ...type.caption, color: c.text3 }}>{label}</span>
               <span style={{ ...type.caption, fontFamily: font.mono, fontWeight: 600, color: col }}>{s != null ? Math.round(s) : "—"}</span>
