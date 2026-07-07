@@ -1829,6 +1829,32 @@ function BottomNav({ nav, setNav, holdingsCount }) {
   );
 }
 
+// Seconds elapsed since `active` became true; resets to 0 whenever it goes inactive. Drives the
+// staged "still working" copy below so a slow web-search call (which can stall 30s–3min under
+// shared-rate-limit contention) never looks frozen.
+function useElapsedSeconds(active) {
+  const [secs, setSecs] = useState(0);
+  useEffect(() => {
+    if (!active) { setSecs(0); return; }
+    const start = Date.now();
+    setSecs(0);
+    const id = setInterval(() => setSecs(Math.round((Date.now() - start) / 1000)), 1000);
+    return () => clearInterval(id);
+  }, [active]);
+  return secs;
+}
+
+// Loading card whose copy escalates with wait time. Mounts only while a web-search-heavy call is
+// in flight (Discover, portfolio news/review), so its timer starts fresh each call and the parent
+// unmounts it on completion. 0–20s keeps the caller's own message; past that it escalates so a
+// multi-minute wait under shared-limit contention reads as "still working", not "frozen".
+function StagedLoadingBlock({ title, sub }) {
+  const secs = useElapsedSeconds(true);
+  if (secs >= 60) return <LoadingBlock title="High demand right now — this can take a couple of minutes." sub="Atlas is still trying, not stuck." />;
+  if (secs >= 20) return <LoadingBlock title="Still working — this is taking longer than usual." sub="Hang tight, Atlas is on it." />;
+  return <LoadingBlock title={title} sub={sub} />;
+}
+
 // ============================================================
 //  ROOT
 // ============================================================
@@ -2044,7 +2070,21 @@ export default function VerdictApp() {
   }, [fetchLivePrices, nav, holdings.length]);
 
   const [autoDiscover, setAutoDiscover] = useState(false);
-  useEffect(() => { if (autoDiscover && profile) { setAutoDiscover(false); discover(); } }, [autoDiscover, profile]);
+  const autoScanTimer = useRef(null);
+  useEffect(() => {
+    if (!(autoDiscover && profile)) return;
+    setAutoDiscover(false);
+    // Auto-fire ONLY: stagger the on-load scan by a random 0–15s so users who open the app around
+    // the same moment don't all hit the shared web-search limit in the same instant. Manual
+    // "Refresh picks" and universe-switch calls invoke discover() directly and are never delayed.
+    // No effect cleanup here on purpose: setAutoDiscover(false) re-runs this effect, and a cleanup
+    // would clear the timer we just scheduled, cancelling the scan. Cleared only on unmount below.
+    autoScanTimer.current = setTimeout(() => discover(), Math.floor(Math.random() * 15000));
+  }, [autoDiscover, profile]); // eslint-disable-line react-hooks/exhaustive-deps
+  useEffect(() => () => { if (autoScanTimer.current) clearTimeout(autoScanTimer.current); }, []);
+  // Elapsed timer for the spreadsheet-import button label (a web-search call too — same staged
+  // honesty as the loading cards, but this site is a button, not a card).
+  const importElapsed = useElapsedSeconds(importAnalyzing);
   // Each tab is a different page, not a scroll position within one — carrying a deep scroll
   // offset from Research into Portfolio just dumps the user mid-table.
   useEffect(() => { window.scrollTo({ top: 0 }); }, [nav]);
@@ -2884,7 +2924,7 @@ Schema:
           <Overline color={c.text3}>Top picks for you</Overline>
           <Button variant="ghost" size="sm" onClick={() => setNav("discover")}>See all →</Button>
         </div>
-        {recsLoading && <Card><LoadingBlock title="Scanning markets for your best fits…" /></Card>}
+        {recsLoading && <Card><StagedLoadingBlock title="Scanning markets for your best fits…" /></Card>}
         {!recsLoading && recs?.picks && (
           <div style={{ display: "grid", gridTemplateColumns: isMobile ? "1fr" : "1fr 1fr 1fr", gap: 12 }}>
             {recs.picks.slice(0, 3).map((p) => (
@@ -2938,7 +2978,7 @@ Schema:
           <SegmentedControl value={universe} onChange={(v) => { setUniverse(v); if (recs || recsError || recsLoading) discover(v); }} options={["Global all-markets", "US markets", "Europe", "Asia-Pacific", "My interest sectors"]} size="sm" />
         </div>
       </Card>
-      {recsLoading && <Card><LoadingBlock title="Finding your best picks…" sub="verifying current data · usually 15–20s" /></Card>}
+      {recsLoading && <Card><StagedLoadingBlock title="Finding your best picks…" sub="verifying current data · usually 15–20s" /></Card>}
       {recsError && !recsLoading && <ErrorBanner msg={recsError} onRetry={discover} label="Scan again" />}
       {recs?.picks && !recsLoading && (
         <div>
@@ -3021,7 +3061,7 @@ Schema:
             </div>
           </Card>
 
-          {reviewLoading && <Card><LoadingBlock title="Fetching live prices and running AI analysis…" sub="live data · tuned to your profile" /></Card>}
+          {reviewLoading && <Card><StagedLoadingBlock title="Fetching live prices and running AI analysis…" sub="live data · tuned to your profile" /></Card>}
           {reviewError && !reviewLoading && <ErrorBanner msg={reviewError} onRetry={analyzePortfolio} label="Try again" />}
 
           {review?.portfolio && !reviewLoading && (
@@ -3047,7 +3087,7 @@ Schema:
           <Card pad={18} style={{ marginBottom: 14 }}>
             <div style={{ display: "flex", alignItems: "center", justifyContent: "space-between", marginBottom: 14 }}>
               <Overline color={c.text3}>Add position</Overline>
-              <Button variant="secondary" size="sm" onClick={() => importRef.current?.click()} icon={<UploadIcon />} loading={importAnalyzing} disabled={importAnalyzing}>{importAnalyzing ? "Analyzing spreadsheet…" : "Import spreadsheet"}</Button>
+              <Button variant="secondary" size="sm" onClick={() => importRef.current?.click()} icon={<UploadIcon />} loading={importAnalyzing} disabled={importAnalyzing}>{importAnalyzing ? (importElapsed >= 60 ? "Still analyzing — high demand…" : importElapsed >= 20 ? "Still analyzing — taking longer…" : "Analyzing spreadsheet…") : "Import spreadsheet"}</Button>
               <input ref={importRef} type="file" accept=".xlsx,.xls,.csv" style={{ display: "none" }} onChange={handleImportFile} />
             </div>
             {importError && <ErrorBanner msg={importError} onRetry={() => { setImportError(null); importRef.current?.click(); }} label="Pick another file" />}
@@ -3098,7 +3138,7 @@ Schema:
             <Button variant="outline" size="sm" onClick={fetchPortfolioNews} loading={newsLoading} disabled={!holdings.length}>{newsItems ? "Refresh" : "Fetch news"}</Button>
           </div>
           {!holdings.length && <Card><EmptyState title="No holdings yet" hint="Add some holdings first to see portfolio news." /></Card>}
-          {newsLoading && <Card><LoadingBlock title="Searching for latest news on your holdings…" sub="Live search · usually 15–25s" /></Card>}
+          {newsLoading && <Card><StagedLoadingBlock title="Searching for latest news on your holdings…" sub="Live search · usually 15–25s" /></Card>}
           {newsError && !newsLoading && <ErrorBanner msg={newsError} onRetry={fetchPortfolioNews} label="Try again" />}
           {newsInsiderActivity && !newsLoading && (
             <Card pad={16} style={{ marginBottom: 14 }}>
