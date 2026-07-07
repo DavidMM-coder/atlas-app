@@ -2079,6 +2079,7 @@ export default function VerdictApp() {
     // "Refresh picks" and universe-switch calls invoke discover() directly and are never delayed.
     // No effect cleanup here on purpose: setAutoDiscover(false) re-runs this effect, and a cleanup
     // would clear the timer we just scheduled, cancelling the scan. Cleared only on unmount below.
+    if (autoScanTimer.current) clearTimeout(autoScanTimer.current);
     autoScanTimer.current = setTimeout(() => discover(), Math.floor(Math.random() * 15000));
   }, [autoDiscover, profile]); // eslint-disable-line react-hooks/exhaustive-deps
   useEffect(() => () => { if (autoScanTimer.current) clearTimeout(autoScanTimer.current); }, []);
