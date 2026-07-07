@@ -2246,6 +2246,7 @@ FORMAT RULES:
 - JSON must be complete and syntactically valid — always close every bracket and brace
 - Output the JSON pretty-printed with 2-space indentation and a newline after every field — do NOT minify it onto one line. (The schema below is shown minified only for compactness; your output must be indented.) The indentation is how you keep your own brace nesting correct in a document this long.
 - Follow the schema's field order exactly within every object. The long prose fields ("summary" in news and fit, "description" in each catalyst) are deliberately the LAST field of their object: write the short fields first, the prose last, and close the object immediately after it. Never close an object right after a prose field that still has fields remaining.
+- Inside every string value, JSON-escape special characters: a double quote must be written \\" and a backslash \\\\, and never put a raw line break inside a string value. When quoting a term or phrase in prose, use single quotes instead ('alpha', 'beat-and-raise') — one raw unescaped " inside a string value breaks the entire document.
 - If data is unavailable for any metric use "N/A" — never omit a field or leave JSON incomplete
 - For small/obscure companies with limited data, still return the full schema with "N/A" values
 - action field in overall must be one of: "Strong Buy", "Buy", "Hold", "Trim", "Sell", "Avoid"
