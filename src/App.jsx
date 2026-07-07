@@ -1427,6 +1427,33 @@ function Results({ result, profile, backtestSnapshot, onOpenBacktest }) {
 // ============================================================
 //  DISCOVER — hero pick + opportunity grid
 // ============================================================
+// Compact factor breakdown for a Discover card — the dossier's four pillars at a glance, so the
+// browsing view shows the SHAPE of a score, not just the single fit number. Deliberately small
+// (tiny labeled bars, no numbers-first emphasis) — this is a scanning view, not a mini-dossier;
+// the full pillar rows with values live behind "Full dossier →".
+const PILLAR_KEYS = [["fundamentals", "Fund"], ["valuation", "Value"], ["technicals", "Tech"], ["risk", "Risk"]];
+function MiniPillars({ pillars }) {
+  if (!pillars || PILLAR_KEYS.every(([k]) => pillars[k] == null)) return null;
+  return (
+    <div style={{ display: "flex", gap: 10, flexWrap: "wrap", marginTop: 12 }}>
+      {PILLAR_KEYS.map(([key, label]) => {
+        const s = pillars[key];
+        const col = scoreColor(s);
+        return (
+          <div key={key} style={{ flex: "1 1 52px", minWidth: 52 }}>
+            <div style={{ display: "flex", justifyContent: "space-between", alignItems: "baseline", marginBottom: 3 }}>
+              <span style={{ ...type.caption, color: c.text3 }}>{label}</span>
+              <span style={{ ...type.caption, fontFamily: font.mono, fontWeight: 600, color: col }}>{s != null ? Math.round(s) : "—"}</span>
+            </div>
+            <div style={{ height: 4, borderRadius: 99, background: c.surface2, overflow: "hidden" }}>
+              <div style={{ width: `${Math.max(0, Math.min(100, s || 0))}%`, height: "100%", background: col, borderRadius: 99 }} />
+            </div>
+          </div>
+        );
+      })}
+    </div>
+  );
+}
 function OpportunityCard({ pick, rank, onOpen, hero }) {
   const score = pick.fitScore != null ? Math.round(pick.fitScore) : null;
   return (
@@ -1466,6 +1493,7 @@ function OpportunityCard({ pick, rank, onOpen, hero }) {
           <span style={{ ...type.caption, fontWeight: 600, color: c.accent, marginTop: 2 }}>Full dossier →</span>
         </div>
       </div>
+      <MiniPillars pillars={pick.pillars} />
     </Card>
   );
 }
@@ -2353,14 +2381,23 @@ Score each pick 0–100 (fitScore) honestly:
 - Speculative pick for Conservative investor: MAX 30
 - Most picks should land 55–78 — only truly exceptional opportunities above 80
 
-For each pick give:
-- reason: specific NOW reason with real data point (e.g. "Beat Q2 EPS by 18%, FCF up 35% YoY, trades at 12x vs sector 20x")
-- concern: single biggest real risk, honest and specific
-- 2 snapshot metrics with current values
+For each pick also give the four pillar sub-scores, 0–100, same framework as a full dossier (these should be consistent with fitScore, not random):
+- pillars.fundamentals: business quality — earnings, margins, growth, balance-sheet strength
+- pillars.valuation: cheapness vs peers and its own history (cheaper = higher score)
+- pillars.technicals: price trend and momentum (above 200d MA / uptrend = higher)
+- pillars.risk: safety (HIGHER = SAFER — low leverage, low volatility, wide moat score high; speculative/fragile names score low)
+And:
 - 2 tags describing the opportunity type
+- 2 snapshot metrics with current values
+- reason: specific NOW reason with real data point (e.g. 'Beat Q2 EPS by 18%, FCF up 35% YoY, trades at 12x vs sector 20x')
+- concern: single biggest real risk, honest and specific
+
+FORMAT RULES:
+- Output the JSON with the fields in exactly the order shown in the schema. The prose fields ('reason', 'concern') are deliberately the LAST two keys of each pick object and 'marketContext' is the LAST key of the root — write the numbers and short fields first, the prose last, and close each object right after its prose. Never close an object immediately after a prose field that still has fields after it.
+- Inside any string value, JSON-escape special characters: a double quote must be written \\" and a backslash \\\\, and never put a raw line break inside a string value. When quoting a term or phrase in prose, use single quotes instead ('beat-and-raise') — one raw unescaped " inside a string value breaks the entire document.
 
 Schema:
-{"asOf":"","marketContext":"one sentence on current market conditions","picks":[{"ticker":"","company":"","sector":"","fitScore":0,"reason":"","concern":"","tags":[""],"snapshot":[{"label":"","value":""}]}]}`;
+{"asOf":"","picks":[{"ticker":"","company":"","sector":"","fitScore":0,"pillars":{"fundamentals":0,"valuation":0,"technicals":0,"risk":0},"tags":[""],"snapshot":[{"label":"","value":""}],"reason":"","concern":""}],"marketContext":"one sentence on current market conditions"}`;
     try {
       const parsed = await callClaude(sys, "Find the best stocks for me right now.", { maxTokens: 2800, maxSearches: 2, fast: true });
       if (seq !== discoverSeq.current) return;   // a newer scan (e.g. universe switch) superseded this
