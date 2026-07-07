@@ -1172,10 +1172,10 @@ function Results({ result, profile, backtestSnapshot, onOpenBacktest }) {
         )}
 
         <Overline color={c.accent} style={{ marginBottom: 12 }}>Pillars</Overline>
-        <PillarRow label="Fundamentals" score={r.pillars?.fundamentals} />
-        <PillarRow label="Valuation" score={r.pillars?.valuation} />
-        <PillarRow label="Technicals" score={r.pillars?.technicals} />
-        <PillarRow label="Risk (safety)" score={r.pillars?.risk} />
+        <PillarRow label="Quality" score={r.pillars?.fundamentals} />
+        <PillarRow label="Value" score={r.pillars?.valuation} />
+        <PillarRow label="Momentum" score={r.pillars?.technicals} />
+        <PillarRow label="Safety" score={r.pillars?.risk} />
       </Card>
 
       {(r.analystConsensus?.rating || r.news?.overallSentiment) && (
@@ -1431,7 +1431,7 @@ function Results({ result, profile, backtestSnapshot, onOpenBacktest }) {
 // browsing view shows the SHAPE of a score, not just the single fit number. Deliberately small
 // (tiny labeled bars, no numbers-first emphasis) — this is a scanning view, not a mini-dossier;
 // the full pillar rows with values live behind "Full dossier →".
-const PILLAR_KEYS = [["fundamentals", "Fund"], ["valuation", "Value"], ["technicals", "Tech"], ["risk", "Risk"]];
+const PILLAR_KEYS = [["fundamentals", "Quality"], ["valuation", "Value"], ["technicals", "Momentum"], ["risk", "Safety"]];
 function MiniPillars({ pillars }) {
   if (!pillars || PILLAR_KEYS.every(([k]) => pillars[k] == null)) return null;
   return (
