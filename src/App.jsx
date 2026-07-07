@@ -159,6 +159,10 @@ const CHAPTERS = [
 ];
 
 const DOSSIER_TABS = ["Fundamentals", "Technicals", "Risk", "News", "Catalysts", "Your fit"];
+// Display-only relabeling of the dossier tabs whose pillar was renamed. The VALUES stay
+// "Technicals"/"Risk" so every `tab === ...` conditional and map lookup keeps working untouched;
+// only the shown text changes to match the pillar bars above (Momentum/Safety).
+const DOSSIER_TAB_LABELS = { Technicals: "Momentum", Risk: "Safety" };
 const LOADING_MSGS = ["Pulling real financials and balance sheet…", "Reading your computed price history & technicals…", "Reviewing recent news and sentiment…", "Weighing valuation and risk…", "Matching everything to your profile…", "Writing the full dossier…"];
 
 // ---------- helpers (unchanged) ----------
@@ -1206,7 +1210,7 @@ function Results({ result, profile, backtestSnapshot, onOpenBacktest }) {
   // ── right evidence ──
   const Evidence = (
     <Card pad={20} style={{ minWidth: 0 }}>
-      <Tabs value={tab} onChange={setTab} items={DOSSIER_TABS} style={{ marginBottom: 20 }} />
+      <Tabs value={tab} onChange={setTab} items={DOSSIER_TABS.map(t => ({ value: t, label: DOSSIER_TAB_LABELS[t] || t }))} style={{ marginBottom: 20 }} />
       <motion.div key={tab} initial={{ opacity: 0, y: 6 }} animate={{ opacity: 1, y: 0 }} transition={{ duration: 0.18 }}>
           {(tab === "Fundamentals" || tab === "Technicals" || tab === "Risk") && (() => {
             const map = { Fundamentals: ["fundamentals", "Quality of the business — earnings, margins, balance sheet"], Technicals: ["technicals", "Price trend, momentum, and chart setup right now"], Risk: ["risk", "Higher = safer. Debt, volatility, moat, business risk."] };
@@ -1217,7 +1221,7 @@ function Results({ result, profile, backtestSnapshot, onOpenBacktest }) {
               <div>
                 <div style={{ display: "flex", alignItems: "center", gap: 14, marginBottom: 20, padding: "14px 16px", background: c.surface2, border: `1px solid ${c.hairline}`, borderRadius: radius.sm }}>
                   <ScoreRing score={pscore} size={56} stroke={5} />
-                  <div><div style={{ ...type.bodyStrong, color: c.text }}>{tab}</div><div style={{ ...type.caption, color: c.text3 }}>{hint}</div></div>
+                  <div><div style={{ ...type.bodyStrong, color: c.text }}>{DOSSIER_TAB_LABELS[tab] || tab}</div><div style={{ ...type.caption, color: c.text3 }}>{hint}</div></div>
                 </div>
                 {tab === "Technicals" && backtestSnapshot && (
                   <div style={{ padding: "16px 18px", background: c.surface2, border: `1px solid ${c.hairline}`, borderRadius: radius.sm, marginBottom: 18 }}>
@@ -2134,7 +2138,7 @@ export default function VerdictApp() {
   function persistHoldings(h) { setHoldings(h); kvSet("atlas_holdings", h); cloudSave({ holdings: h }); }
 
   // ---- deep dossier ----
-  async function evaluate(symbolArg) {
+  async function evaluate(symbolArg, quickScan) {
     const name = ((typeof symbolArg === "string" && symbolArg) ? symbolArg : query).trim();
     if (!name) return;
     // Don't silently no-op when a dossier is already loading — tapping a second pick used to do
@@ -2193,6 +2197,14 @@ RECENT NEWS for ${upTicker} (real headlines + links — build the news section f
 ${news.items.slice(0, 10).map((n, i) => `[${i}] ${n.headline} — ${n.source}, ${n.date || "recent"} — ${n.url}`).join("\n")}`;
       }
     }
+    // Quick-scan estimate from the Discover card that opened this dossier (omitted when opened
+    // directly via search). Fed in as context so the deeper analysis is anchored to the prior
+    // estimate and large unexplained pillar swings become rare — NOT as a target to match.
+    const qs = quickScan;
+    const quickScanBlock = (qs && ["fundamentals", "valuation", "technicals", "risk"].every(k => typeof qs[k] === "number")) ? `
+═══════════════════════════════════════
+QUICK-SCAN ESTIMATE — a fast Discover scan already scored this stock: fundamentals ${Math.round(qs.fundamentals)}, valuation ${Math.round(qs.valuation)}, technicals ${Math.round(qs.technicals)}, risk ${Math.round(qs.risk)} (each 0–100; higher = better, and for risk higher = safer). Do your own deeper analysis and give a considered final score for each pillar. If your score differs meaningfully (more than ~10 points) from the quick-scan estimate on any pillar, briefly say why in that pillar's conclusion. This is prior context, NOT a target — don't force your numbers to match it.
+═══════════════════════════════════════` : "";
     // Field ORDER in the schema below is load-bearing, not stylistic: the model's reliably
     // observed corruption (live-diagnosed 2026-07-06, e.g. KO 4/4) is emitting a spurious `}`
     // right after finishing a long prose field that still has siblings after it — so every long
@@ -2210,7 +2222,7 @@ INDEPENDENT JUDGMENT — non-negotiable:
 - Every pillar score, the overall score, and the action are YOUR conclusions, derived only from hard evidence: the actual financials, your own computed price-history statistics (CAGR, max drawdown, volatility, moving averages, RSI — from Atlas's backtest engine, see below), and actual factual news events (earnings beats/misses, guidance changes, litigation, contracts, management changes, downgrades of the BUSINESS not the stock). Reason from first principles like your own desk's analyst, not by adopting someone else's take.
 - Wall Street analyst ratings/price targets and aggregate market/news sentiment are reported ONLY as separate reference context for the user (sections 6 and 9 below) — they must NEVER be used as an input to any pillar score, the overall score, or the action. Do not average toward consensus, and do not let a stock's hype or crowd mood inflate a score the fundamentals/technicals/risk don't support — or let a beaten-down mood deflate one they do support.
 - If your own fact-based read disagrees with the analyst consensus or the prevailing sentiment, that's fine and expected — say so plainly in the thesis rather than softening your call to match theirs.
-${histBlock}${fundBlock}${newsBlock}
+${histBlock}${fundBlock}${newsBlock}${quickScanBlock}
 
 DATA USAGE — you do NOT have web search; work from what's provided:
 - Use the REAL COMPUTED PRICE HISTORY block for every price/technical/risk metric it covers (price, SMAs, RSI, 52w range, returns, CAGR, drawdown, volatility) — those are exact, do not contradict them.
@@ -2347,7 +2359,7 @@ FULL JSON SCHEMA:
     // older request must not clear the newer one's loading state.
     finally { if (seq === evalSeq.current) { setLoading(false); if (timerRef.current) clearInterval(timerRef.current); } }
   }
-  function openTicker(t) { setQuery(t); evaluate(t); }
+  function openTicker(t, quickScan) { setQuery(t); evaluate(t, quickScan); }
 
   // Keeps a running log of completed dossiers so re-opening one (or re-running it later) doesn't
   // mean losing everything looked at so far — a fresh research replaces `result` on screen, but the
@@ -2934,7 +2946,7 @@ Schema:
         {!recsLoading && recs?.picks && (
           <div style={{ display: "grid", gridTemplateColumns: isMobile ? "1fr" : "1fr 1fr 1fr", gap: 12 }}>
             {recs.picks.slice(0, 3).map((p) => (
-              <Card key={p.ticker} interactive onClick={() => openTicker(p.ticker)} pad={16}>
+              <Card key={p.ticker} interactive onClick={() => openTicker(p.ticker, p.pillars)} pad={16}>
                 <div style={{ display: "flex", alignItems: "center", gap: 10, marginBottom: 12 }}>
                   <StockLogo ticker={p.ticker} size={34} />
                   <div style={{ minWidth: 0 }}>
@@ -2997,7 +3009,7 @@ Schema:
             style={{ display: "grid", gridTemplateColumns: isMobile ? "1fr" : "1fr 1fr", gap: 12 }}>
             {recs.picks.map((p, i) => (
               <motion.div key={p.ticker || i} variants={{ initial: { opacity: 0, y: 10 }, animate: { opacity: 1, y: 0 } }} style={i === 0 ? { gridColumn: isMobile ? "auto" : "1 / -1" } : {}}>
-                <OpportunityCard pick={p} rank={i + 1} hero={i === 0 && !isMobile} onOpen={() => openTicker(p.ticker)} />
+                <OpportunityCard pick={p} rank={i + 1} hero={i === 0 && !isMobile} onOpen={() => openTicker(p.ticker, p.pillars)} />
               </motion.div>
             ))}
           </motion.div>
