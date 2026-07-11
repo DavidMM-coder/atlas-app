@@ -1,3 +1,5 @@
+import { requireUser } from "./_lib/auth.js";
+
 const YF_HEADERS = {
   "User-Agent": "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/120.0.0.0 Safari/537.36",
   "Accept": "application/json, text/plain, */*",
@@ -110,7 +112,14 @@ const TICKER_RE = /^[A-Za-z0-9^=][A-Za-z0-9.\-^=]{0,14}$/;
 
 export default async function handler(req, res) {
   res.setHeader("Access-Control-Allow-Origin", "*");
+  res.setHeader("Access-Control-Allow-Methods", "GET, OPTIONS");
+  res.setHeader("Access-Control-Allow-Headers", "Content-Type, Authorization");
   if (req.method === "OPTIONS") return res.status(200).end();
+
+  // 100/min: legit peak is a multi-ticker stress test (max 8) plus rapid single-run
+  // iteration on a fundamental strategy and a dossier fetch (~20/min worst case) — 5x headroom.
+  const uid = await requireUser(req, res, { limit: 100 });
+  if (!uid) return;
 
   const { ticker } = req.query;
   if (!ticker || !TICKER_RE.test(String(ticker))) return res.status(400).json({ error: "valid ticker required" });

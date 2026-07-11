@@ -1,7 +1,10 @@
 // Yahoo Finance price-history proxy. Serves public market data only (no secrets), so open
-// CORS is fine — but inputs are still validated/encoded so nothing user-controlled can be
-// smuggled into the upstream URL, and responses are CDN-cached briefly so a portfolio
-// refreshing every 45s doesn't hammer Yahoo with identical requests.
+// CORS is fine — but callers must be signed-in Atlas users (anyone who found the URL used to
+// be able to run up Vercel usage and risk Yahoo blocking our egress IP), inputs are still
+// validated/encoded so nothing user-controlled can be smuggled into the upstream URL, and
+// responses are CDN-cached briefly so a portfolio refreshing every 45s doesn't hammer Yahoo
+// with identical requests.
+import { requireUser } from "./_lib/auth.js";
 
 const TICKER_RE = /^[A-Za-z0-9^=][A-Za-z0-9.\-^=]{0,14}$/;
 const RANGES = new Set(["1d", "5d", "1mo", "3mo", "6mo", "1y", "2y", "5y", "10y", "ytd", "max"]);
@@ -9,7 +12,17 @@ const INTERVALS = new Set(["1m", "5m", "15m", "30m", "1h", "1d", "1wk", "1mo"]);
 
 export default async function handler(req, res) {
   res.setHeader("Access-Control-Allow-Origin", "*");
+  // Authorization isn't on the CORS safelist, so the native shells' (capacitor/tauri)
+  // cross-origin GETs now preflight — the header must be explicitly allowed.
+  res.setHeader("Access-Control-Allow-Methods", "GET, OPTIONS");
+  res.setHeader("Access-Control-Allow-Headers", "Content-Type, Authorization");
   if (req.method === "OPTIONS") return res.status(200).end();
+
+  // 600/min: the busiest legitimate minute stacks a track-record load (1 benchmark + one call
+  // per unique picked ticker, ~60 for a mature log) on the 45s portfolio poll (one call per
+  // holding) and a portfolio review burst — ~150 calls. 4x headroom on top of that.
+  const uid = await requireUser(req, res, { limit: 600 });
+  if (!uid) return;
 
   const { ticker, range = "5y", interval = "1d" } = req.query;
   if (!ticker || !TICKER_RE.test(String(ticker))) return res.status(400).json({ error: "valid ticker required" });

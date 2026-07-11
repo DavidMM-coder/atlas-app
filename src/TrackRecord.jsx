@@ -1,6 +1,6 @@
 import React, { useState, useEffect } from "react";
 import { auth, loadPickHistory } from "./firebase.js";
-import { apiUrl } from "./lib/api.js";
+import { apiFetch } from "./lib/api.js";
 import { color as c, font, type, radius } from "./ui/tokens.js";
 import { Card, Overline, LoadingBlock } from "./ui/primitives.jsx";
 
@@ -16,7 +16,7 @@ const MIN_TRADING_DAYS = 3;   // younger picks show as "too recent to evaluate"
 const MIN_TRACK_RECORD = 15;  // scored picks needed before the hit rate is shown with confidence
 
 async function fetchJson(url) {
-  const r = await fetch(url);
+  const r = await apiFetch(url);
   if (!r.ok) throw new Error(`HTTP ${r.status}`);
   return r.json();
 }
@@ -62,8 +62,8 @@ export default function TrackRecord() {
         const range = rangeCovering(oldestMs);
         const uniq = [...new Set(records.map(r => r.ticker))];
         const [bench, ...quotes] = await Promise.all([
-          fetchJson(apiUrl(`/api/history?ticker=${encodeURIComponent(BENCH_TICKER)}&range=${range}&interval=1d`)),
-          ...uniq.map(t => fetchJson(apiUrl(`/api/history?ticker=${encodeURIComponent(t)}&range=5d&interval=1d`)).catch(() => null)),
+          fetchJson(`/api/history?ticker=${encodeURIComponent(BENCH_TICKER)}&range=${range}&interval=1d`),
+          ...uniq.map(t => fetchJson(`/api/history?ticker=${encodeURIComponent(t)}&range=5d&interval=1d`).catch(() => null)),
         ]);
         const benchPrices = bench?.prices || [];
         if (!benchPrices.length) throw new Error("Benchmark data unavailable — try again later.");

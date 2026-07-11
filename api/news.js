@@ -4,6 +4,8 @@
 // shared ONE upstream web-search rate limit with every other AI feature and frequently failed —
 // now the AI only adds analysis on top of these headlines, with no web search involved.
 
+import { requireUser } from "./_lib/auth.js";
+
 const FEEDS = [
   { url: "https://www.cnbc.com/id/10000664/device/rss/rss.html", source: "CNBC" }, // Markets
   { url: "https://www.cnbc.com/id/20910258/device/rss/rss.html", source: "CNBC" }, // Economy
@@ -63,7 +65,14 @@ async function fetchYahooNews(query) {
 
 export default async function handler(req, res) {
   res.setHeader("Access-Control-Allow-Origin", "*");
+  res.setHeader("Access-Control-Allow-Methods", "GET, OPTIONS");
+  res.setHeader("Access-Control-Allow-Headers", "Content-Type, Authorization");
   if (req.method === "OPTIONS") return res.status(200).end();
+
+  // 50/min: legit peak is one market-news load plus manual refreshes and one ticker-news
+  // fetch per dossier (~10/min worst case) — 5x headroom.
+  const uid = await requireUser(req, res, { limit: 50 });
+  if (!uid) return;
 
   // Ticker mode: news for one stock (research dossier). Falls through to the general feed otherwise.
   const ticker = String(req.query?.ticker || "").trim();

@@ -2,7 +2,7 @@
 // Backtester screen and the AI analysis calls (Research dossier, Portfolio review) so that
 // technicals/risk/performance numbers fed to the model are real computed values, not
 // something the model has to search for or estimate itself.
-import { apiUrl } from "./api.js";
+import { apiFetch } from "./api.js";
 
 // Rolling sum, O(n) — the naive slice-and-reduce version is O(n·window), which adds up fast
 // when the stress test runs a 200-day SMA over 10 years of prices for 8 tickers back to back.
@@ -162,7 +162,7 @@ export function bootstrapDcaCagrDiffCI(prices, monthlyAmount, costPct, { iterati
 export async function fetchHistoricalStats(tickerGuess, { range = "2y" } = {}) {
   if (!tickerGuess) return null;
   try {
-    const r = await fetch(apiUrl(`/api/history?ticker=${encodeURIComponent(tickerGuess)}&range=${range}&interval=1d`));
+    const r = await apiFetch(`/api/history?ticker=${encodeURIComponent(tickerGuess)}&range=${range}&interval=1d`);
     if (!r.ok) return null;
     const d = await r.json();
     const prices = d.prices;

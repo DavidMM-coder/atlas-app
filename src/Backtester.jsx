@@ -5,7 +5,7 @@ import {
   InfoTip, ErrorBanner, LoadingBlock, EmptyState, motion,
 } from "./ui/primitives.jsx";
 import { sma, rsiCalc, calcStats, runBuyAndHold, runDCA, calcDCAStats, bootstrapCagrDiffCI, bootstrapDcaCagrDiffCI } from "./lib/marketStats.js";
-import { apiUrl } from "./lib/api.js";
+import { apiFetch } from "./lib/api.js";
 
 // Below this many trades, a strategy-vs-benchmark gap is dominated by a handful of entry/exit
 // rolls of the dice, so the verdict is presented as "not enough data" and the stats are
@@ -499,13 +499,13 @@ export default function Backtester({ initialTicker, taxPrefs, onTaxPrefsChange }
   const isDCA = strat.type === "passive";
 
   async function fetchPrices(t, r = range) {
-    const resp = await fetch(apiUrl(`/api/history?ticker=${encodeURIComponent(t)}&range=${r}`));
+    const resp = await apiFetch(`/api/history?ticker=${encodeURIComponent(t)}&range=${r}`);
     const data = await resp.json();
     if (data.error) throw new Error(data.error);
     return normalizePriceData(data);
   }
   async function fetchFundamentals(t) {
-    const resp = await fetch(apiUrl(`/api/fundamentals?ticker=${encodeURIComponent(t)}`));
+    const resp = await apiFetch(`/api/fundamentals?ticker=${encodeURIComponent(t)}`);
     const data = await resp.json();
     if (data.error) throw new Error(`Fundamentals: ${data.error}`);
     return data;

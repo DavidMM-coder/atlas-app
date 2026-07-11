@@ -3,7 +3,7 @@ import {
   getAuth, GoogleAuthProvider, OAuthProvider,
   signInWithPopup, signInWithEmailAndPassword, createUserWithEmailAndPassword,
   signInWithPhoneNumber, RecaptchaVerifier, signOut, onAuthStateChanged,
-  sendPasswordResetEmail,
+  sendPasswordResetEmail, sendEmailVerification,
 } from "firebase/auth";
 import { getFirestore, doc, setDoc, getDoc, collection, addDoc, getDocs, serverTimestamp } from "firebase/firestore";
 
@@ -101,5 +101,5 @@ export {
   GoogleAuthProvider, OAuthProvider, signInWithPopup,
   signInWithEmailAndPassword, createUserWithEmailAndPassword,
   signInWithPhoneNumber, RecaptchaVerifier, signOut, onAuthStateChanged,
-  sendPasswordResetEmail,
+  sendPasswordResetEmail, sendEmailVerification,
 };

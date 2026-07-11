@@ -1,8 +1,8 @@
 import React, { useState, useEffect, useRef, useCallback, Suspense, lazy } from "react";
 import AuthScreen from "./Auth.jsx";
 import TrackRecord from "./TrackRecord.jsx";
-import { auth, onAuthStateChanged, signOut, saveUserToFirestore, loadUserData, saveUserData, savePickHistory, loadPickHistory } from "./firebase.js";
-import { API_BASE, apiUrl } from "./lib/api.js";
+import { auth, onAuthStateChanged, signOut, saveUserToFirestore, loadUserData, saveUserData, savePickHistory, loadPickHistory, sendEmailVerification } from "./firebase.js";
+import { API_BASE, apiFetch } from "./lib/api.js";
 import { color as c, font, type, radius, shadow, space, scoreColor, grade, actionColor } from "./ui/tokens.js";
 
 // Loaded on demand: the backtester is a whole screen most sessions never open, and xlsx is a
@@ -277,7 +277,7 @@ async function logPickHistory(picks, uni) {
     // recommendation price is the one field we most need and can't backfill later.
     let price = null, currency = null;
     try {
-      const r = await fetch(apiUrl(`/api/history?ticker=${encodeURIComponent(ticker)}&range=5d&interval=1d`));
+      const r = await apiFetch(`/api/history?ticker=${encodeURIComponent(ticker)}&range=5d&interval=1d`);
       if (r.ok) { const d = await r.json(); const last = d.prices?.[d.prices.length - 1]; if (last?.close != null) { price = last.close; currency = d.currency || null; } }
     } catch (_) { /* price best-effort; still log the pick even if the fetch fails */ }
     return { ticker, company: p.company || null, fitScore: p.fitScore ?? null, universe: uni || null, price, currency, at };
@@ -1917,6 +1917,29 @@ export default function VerdictApp() {
   // preferences that sync across devices — unlike the backtester's ticker/strategy/params,
   // which are per-session working state and deliberately reset each visit.
   const [taxPrefs, setTaxPrefs] = useState(TAX_PREFS_DEFAULT);
+
+  // Email-verification gate. The AI relay (api/messages.js) refuses unverified email accounts
+  // server-side; phone-auth accounts (OTP already proved possession) and Google/Apple sign-ins
+  // (provider-verified) pass automatically. reload() mutates the same Firebase User object
+  // WITHOUT firing onAuthStateChanged, so verifyTick exists purely to force the re-render
+  // that clears the banner after the user confirms.
+  const [, setVerifyTick] = useState(0);
+  const [verifyEmailSent, setVerifyEmailSent] = useState(false);
+  const [verifyChecking, setVerifyChecking] = useState(false);
+  async function resendVerifyEmail() {
+    try { await sendEmailVerification(auth.currentUser); setVerifyEmailSent(true); } catch (e) { console.error("Resend verification failed:", e); }
+  }
+  async function confirmVerified() {
+    setVerifyChecking(true);
+    try {
+      await auth.currentUser.reload();
+      // Refresh the cached ID token so the client's copy agrees with the now-verified account.
+      // (The server checks the live account record, so it would pass either way.)
+      if (auth.currentUser.emailVerified) await auth.currentUser.getIdToken(true);
+    } catch {}
+    setVerifyChecking(false);
+    setVerifyTick((t) => t + 1);
+  }
   const [recs, setRecs] = useState(null);
   const [recsLoading, setRecsLoading] = useState(false);
   const [recsError, setRecsError] = useState(null);
@@ -1990,7 +2013,7 @@ export default function VerdictApp() {
     let cancelled = false, timer;
     const loadFx = async (attempt = 0) => {
       try {
-        const r = await fetch(`${API_BASE}/api/fx`);
+        const r = await apiFetch("/api/fx");
         const d = await r.json();
         if (!cancelled && d.rates) { setFxRates(d.rates); return; }
         throw new Error("no rates");
@@ -2091,7 +2114,7 @@ export default function VerdictApp() {
     if (!background) setLivePricesLoading(true);
     const results = await Promise.all(holdings.map(async h => {
       try {
-        const r = await fetch(apiUrl(`/api/history?ticker=${encodeURIComponent(h.ticker)}&range=5d&interval=1d`));
+        const r = await apiFetch(`/api/history?ticker=${encodeURIComponent(h.ticker)}&range=5d&interval=1d`);
         const d = await r.json();
         if (d.prices?.length) {
           const latest = d.prices[d.prices.length - 1];
@@ -2236,8 +2259,8 @@ IMPORTANT: this block describes ticker ${histStats.ticker}${histStats.name ? ` (
     let fundBlock = "", newsBlock = "";
     if (upTicker) {
       const [fund, news] = await Promise.all([
-        fetch(apiUrl(`/api/fundamentals?ticker=${encodeURIComponent(upTicker)}`)).then(r => r.ok ? r.json() : null).catch(() => null),
-        fetch(apiUrl(`/api/news?ticker=${encodeURIComponent(upTicker)}`)).then(r => r.ok ? r.json() : null).catch(() => null),
+        apiFetch(`/api/fundamentals?ticker=${encodeURIComponent(upTicker)}`).then(r => r.ok ? r.json() : null).catch(() => null),
+        apiFetch(`/api/news?ticker=${encodeURIComponent(upTicker)}`).then(r => r.ok ? r.json() : null).catch(() => null),
       ]);
       if (seq !== evalSeq.current) return;
       if (fund && !fund.error) {
@@ -2602,7 +2625,7 @@ Aim for 2-3 items per holding plus 2-3 macro items, max 20 total in "news". Insi
     setMarketNewsError(null);
     try {
       // 1) Fetch real headlines from the news feed (no AI, no search limit).
-      const r = await fetch(apiUrl("/api/news"));
+      const r = await apiFetch("/api/news");
       const d = await r.json();
       if (d.error || !Array.isArray(d.items) || !d.items.length) throw new Error(d.error || "No market news available right now.");
       const feed = d.items.slice(0, 18);
@@ -2661,7 +2684,7 @@ Order the items array most-important first. Return ONLY this JSON:
       const priceResults = await Promise.all(
         holdings.map(async (h) => {
           try {
-            const r = await fetch(apiUrl(`/api/history?ticker=${encodeURIComponent(h.ticker)}&range=1y&interval=1d`));
+            const r = await apiFetch(`/api/history?ticker=${encodeURIComponent(h.ticker)}&range=1y&interval=1d`);
             const d = await r.json();
             const prices = d.prices;
             if (prices && prices.length) {
@@ -3475,6 +3498,27 @@ Schema:
 
         <div style={{ marginLeft: isMobile ? 0 : 76, flex: 1, padding: isMobile ? "64px 14px calc(84px + env(safe-area-inset-bottom))" : "0 36px 60px", maxWidth: isMobile ? "100vw" : "calc(100vw - 76px)", boxSizing: "border-box", overflowX: "hidden" }}>
           {!isMobile && <TopBar title={sectionTitle} onSearch={openTicker} />}
+          {/* Unverified-email banner: these users can sign in and browse, but the AI relay
+              refuses them server-side — this explains that state up front (with a resend)
+              instead of letting every scan/dossier fail with an opaque error. */}
+          {firebaseConfigured && !!auth?.currentUser?.email && !auth.currentUser.emailVerified && !auth.currentUser.phoneNumber && (
+            <div style={{ paddingTop: isMobile ? 0 : 24, marginBottom: isMobile ? 14 : 0 }}>
+              <Card pad={14} accentEdge style={{ borderLeftColor: c.warning, display: "flex", alignItems: "center", gap: 14, flexWrap: "wrap" }}>
+                <div style={{ flex: "1 1 260px", minWidth: 0 }}>
+                  <div style={{ ...type.bodyStrong, color: c.text, marginBottom: 2 }}>Verify your email to unlock AI features</div>
+                  <div style={{ ...type.caption, color: c.text3, lineHeight: 1.5 }}>
+                    {verifyEmailSent
+                      ? `Link re-sent to ${auth.currentUser.email} — click it, then hit "I've verified".`
+                      : `We sent a link to ${auth.currentUser.email}. Research, Discover scans and portfolio reviews stay locked until it's confirmed.`}
+                  </div>
+                </div>
+                <div style={{ display: "flex", gap: 8, flexShrink: 0 }}>
+                  <Button variant="secondary" size="sm" onClick={resendVerifyEmail}>Resend email</Button>
+                  <Button size="sm" loading={verifyChecking} onClick={confirmVerified}>I've verified</Button>
+                </div>
+              </Card>
+            </div>
+          )}
           {/* No AnimatePresence/exit animation here on purpose: with mode="wait" the next screen
               only mounts once the previous one's exit transition reports done, and a heavy tree
               (e.g. a full research dossier with many animated children) can leave that exit

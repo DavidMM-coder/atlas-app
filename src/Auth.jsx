@@ -3,7 +3,7 @@ import {
   auth, db, saveUserToFirestore,
   GoogleAuthProvider, OAuthProvider,
   signInWithPopup, signInWithEmailAndPassword, createUserWithEmailAndPassword,
-  signInWithPhoneNumber, RecaptchaVerifier, sendPasswordResetEmail,
+  signInWithPhoneNumber, RecaptchaVerifier, sendPasswordResetEmail, sendEmailVerification,
 } from "./firebase.js";
 import { color as c, font, type, radius, shadow } from "./ui/tokens.js";
 import { AtlasMark, Button, Input, Field, Overline, motion } from "./ui/primitives.jsx";
@@ -71,6 +71,10 @@ export default function AuthScreen({ onAuth }) {
       }
       const fn = emailMode === "signup" ? createUserWithEmailAndPassword : signInWithEmailAndPassword;
       const result = await fn(auth, email, password);
+      // New accounts get their verification email immediately — the AI relay refuses
+      // unverified emails server-side, and the in-app banner offers a resend. Best-effort:
+      // a send failure must not block the signup itself.
+      if (emailMode === "signup") { try { await sendEmailVerification(result.user); } catch {} }
       await saveUserToFirestore(result.user);
       onAuth(result.user);
     } catch (e) { setError(friendlyError(e)); }

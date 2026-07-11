@@ -32,38 +32,11 @@ function setCors(req, res) {
   res.setHeader("Access-Control-Allow-Headers", "Content-Type, Authorization");
 }
 
-const buckets = new Map(); // key -> [timestamps]
-function rateLimited(key, limit = 20, windowMs = 60_000) {
-  const now = Date.now();
-  const recent = (buckets.get(key) || []).filter((t) => now - t < windowMs);
-  if (recent.length >= limit) { buckets.set(key, recent); return true; }
-  recent.push(now);
-  buckets.set(key, recent);
-  return false;
-}
-
-async function verifyFirebaseToken(idToken) {
-  const key = process.env.VITE_FIREBASE_API_KEY;
-  // Fail CLOSED when Firebase isn't configured. Returning { ok: true } here used to turn the
-  // endpoint into a fully unauthenticated Anthropic relay the moment this env var was missing or
-  // misnamed (e.g. a preview deploy, or a prod typo) — a missing gate silently removed the gate.
-  // If auth can't be enforced, no one gets in. AI features are unavailable rather than wide open.
-  if (!key) return { ok: false, unconfigured: true };
-  if (!idToken) return { ok: false };
-  try {
-    const r = await fetch(`https://identitytoolkit.googleapis.com/v1/accounts:lookup?key=${encodeURIComponent(key)}`, {
-      method: "POST",
-      headers: { "content-type": "application/json" },
-      body: JSON.stringify({ idToken }),
-    });
-    if (!r.ok) return { ok: false };
-    const data = await r.json();
-    const uid = data?.users?.[0]?.localId;
-    return uid ? { ok: true, uid } : { ok: false };
-  } catch {
-    return { ok: false };
-  }
-}
+// Token verification (fail-closed), rate limiting and client-IP extraction are shared with
+// the market-data routes — see api/_lib/auth.js. This route keeps its own handler-level flow
+// because it's the only one with the email-verified requirement and a JSON {error:{message}}
+// error shape.
+import { verifyFirebaseToken, rateLimited, clientIp } from "./_lib/auth.js";
 
 function validateBody(body) {
   if (!body || typeof body !== "object" || Array.isArray(body)) return "Invalid request body.";
@@ -96,12 +69,19 @@ export default async function handler(req, res) {
     if (auth.unconfigured) return res.status(503).json({ error: { message: "AI features are unavailable: the server is not configured for authentication." } });
     return res.status(401).json({ error: { message: "Sign in to use Atlas AI features." } });
   }
+  // The AI relay is where the shared Anthropic budget gets spent, so it requires a verified
+  // identity — a confirmed email, or a phone-auth account (the OTP already proved possession;
+  // those accounts may have no email at all). Google/Apple arrive pre-verified. The client
+  // recognizes the code and shows a "verify your email" prompt with a resend button instead
+  // of a raw error. verifyFirebaseToken reads the LIVE account record, so a user who just
+  // clicked the link passes on their next request — no token refresh needed server-side.
+  if (!auth.verified) {
+    return res.status(403).json({ error: { code: "email_unverified", message: "Verify your email to use Atlas AI features — check your inbox for the verification link, or resend it from the banner in the app." } });
+  }
 
-  // For the rate-limit key prefer the authenticated uid; fall back to the platform-trusted client
-  // IP (Vercel's x-real-ip, the last hop we control) rather than raw x-forwarded-for, whose first
-  // element is fully attacker-supplied and rotatable per request to defeat the limiter.
-  const ip = String(req.headers["x-real-ip"] || String(req.headers["x-forwarded-for"] || "").split(",").pop() || "").trim() || "unknown";
-  if (rateLimited(auth.uid || ip)) {
+  // For the rate-limit key prefer the authenticated uid; fall back to the platform-trusted
+  // client IP.
+  if (rateLimited(auth.uid || clientIp(req))) {
     return res.status(429).json({ error: { message: "Too many requests — wait a minute and try again." } });
   }
 
