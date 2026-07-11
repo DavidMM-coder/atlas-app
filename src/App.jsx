@@ -263,6 +263,11 @@ function kvDel(k) { try { localStorage.removeItem(k); } catch {} }
 // also written as its own doc to users/{uid}/pick_history, so the log survives cache clears and
 // device switches. The cloud write is best-effort — a failure never blocks the local log.
 const PICK_HISTORY_KEY = "atlas_pick_history";
+// Synced user preferences (localStorage + the users/{uid} cloud doc, like profile/holdings).
+// UNIVERSES doubles as the SegmentedControl options and the validation allowlist on hydrate,
+// so a stale/renamed persisted value can never render an empty-selected control.
+const UNIVERSES = ["Global all-markets", "US markets", "Europe", "Asia-Pacific", "My interest sectors"];
+const TAX_PREFS_DEFAULT = { afterTax: false, stRate: "30", ltRate: "15" };
 async function logPickHistory(picks, uni) {
   if (!Array.isArray(picks) || !picks.length) return;
   const at = new Date().toISOString();
@@ -1907,7 +1912,11 @@ export default function VerdictApp() {
   const timerRef = useRef(null);
 
   // discover
-  const [universe, setUniverse] = useState("Global all-markets");
+  const [universe, setUniverse] = useState(UNIVERSES[0]);
+  // After-tax backtest settings live here (not in Backtester) because they're profile-like
+  // preferences that sync across devices — unlike the backtester's ticker/strategy/params,
+  // which are per-session working state and deliberately reset each visit.
+  const [taxPrefs, setTaxPrefs] = useState(TAX_PREFS_DEFAULT);
   const [recs, setRecs] = useState(null);
   const [recsLoading, setRecsLoading] = useState(false);
   const [recsError, setRecsError] = useState(null);
@@ -1955,6 +1964,10 @@ export default function VerdictApp() {
         if (cash != null) setSpareCash(String(cash));
         if (cashCur) setSpareCashCurrency(cashCur);
         if (Array.isArray(rh)) setResearchHistory(rh);
+        const uni = await kvGet("atlas_universe");
+        if (UNIVERSES.includes(uni)) setUniverse(uni);
+        const tp = await kvGet("atlas_tax_prefs");
+        if (tp && typeof tp === "object" && !Array.isArray(tp)) setTaxPrefs({ ...TAX_PREFS_DEFAULT, ...tp });
         // Instant-on-revisit: rehydrate the last market news + top picks from cache so the Today
         // screen shows them immediately instead of re-running a 20–40s live search every visit.
         // Only within a freshness window, so genuinely stale results aren't shown as current — the
@@ -2015,6 +2028,11 @@ export default function VerdictApp() {
         if (cloud.spareCash != null) { setSpareCash(String(cloud.spareCash)); kvSet("atlas_spare_cash", String(cloud.spareCash)); }
         if (cloud.spareCashCurrency) { setSpareCashCurrency(cloud.spareCashCurrency); kvSet("atlas_spare_cash_currency", cloud.spareCashCurrency); }
         if (Array.isArray(cloud.researchHistory) && cloud.researchHistory.length) { setResearchHistory(cloud.researchHistory); kvSet("atlas_research_history", cloud.researchHistory); }
+        if (UNIVERSES.includes(cloud.universe)) { setUniverse(cloud.universe); kvSet("atlas_universe", cloud.universe); }
+        if (cloud.taxPrefs && typeof cloud.taxPrefs === "object" && !Array.isArray(cloud.taxPrefs)) {
+          const tp = { ...TAX_PREFS_DEFAULT, ...cloud.taxPrefs };
+          setTaxPrefs(tp); kvSet("atlas_tax_prefs", tp);
+        }
         setPhase("app");
         if (!hadLocalProfile) setAutoDiscover(true); // fresh device — kick off the first scan
       } else {
@@ -2024,13 +2042,38 @@ export default function VerdictApp() {
         const cash = await kvGet("atlas_spare_cash");
         const cur = await kvGet("atlas_spare_cash_currency");
         const rh = await kvGet("atlas_research_history");
+        const uni = await kvGet("atlas_universe");
+        const tp = await kvGet("atlas_tax_prefs");
         const seed = {};
         if (p?.name) seed.profile = p;
         if (Array.isArray(h)) seed.holdings = h;
         if (cash != null) seed.spareCash = String(cash);
         if (cur) seed.spareCashCurrency = cur;
         if (Array.isArray(rh) && rh.length) seed.researchHistory = rh.slice(0, 12);
+        if (UNIVERSES.includes(uni)) seed.universe = uni;
+        if (tp && typeof tp === "object" && !Array.isArray(tp)) seed.taxPrefs = { ...TAX_PREFS_DEFAULT, ...tp };
         if (Object.keys(seed).length) saveUserData(firebaseUser.uid, seed);
+      }
+
+      // Reconcile the pick log: records logged while signed out exist only in this device's
+      // localStorage — push the ones missing from users/{uid}/pick_history. Matching on each
+      // record's own at|ticker identity (not a synced flag) keeps this idempotent: a record
+      // already in the cloud is skipped, so repeated sign-ins never double-upload and there's
+      // no bookkeeping to drift. If the cloud read FAILS (null — offline, rules), skip rather
+      // than push blind: pushing without knowing what's there is what would duplicate.
+      try {
+        const localPicks = await kvGet(PICK_HISTORY_KEY);
+        if (Array.isArray(localPicks) && localPicks.length) {
+          const cloudPicks = await loadPickHistory(firebaseUser.uid);
+          if (cloudPicks) {
+            const key = (r) => `${r.at}|${r.ticker}`;
+            const seen = new Set(cloudPicks.map(key));
+            const missing = localPicks.filter((r) => r && r.at && r.ticker && !seen.has(key(r)));
+            if (missing.length) await savePickHistory(firebaseUser.uid, missing);
+          }
+        }
+      } catch (e) {
+        console.error("Pick-history reconciliation failed:", e);
       }
     })();
   }, [firebaseUser]);
@@ -2147,6 +2190,13 @@ export default function VerdictApp() {
     }, 2400);
   }
   function persistHoldings(h) { setHoldings(h); kvSet("atlas_holdings", h); cloudSave({ holdings: h }); }
+  function changeUniverse(v) { setUniverse(v); kvSet("atlas_universe", v); cloudSave({ universe: v }); }
+  function updateTaxPrefs(partial) {
+    const next = { ...taxPrefs, ...partial };
+    setTaxPrefs(next); kvSet("atlas_tax_prefs", next);
+    // Debounced: the rate fields fire per keystroke — one Firestore write at the end is enough.
+    cloudSave({ taxPrefs: next }, 900);
+  }
 
   // ---- deep dossier ----
   async function evaluate(symbolArg, quickScan) {
@@ -3007,7 +3057,7 @@ Schema:
         <div style={{ marginTop: 14, overflowX: "auto" }}>
           {/* Picking a universe re-runs the scan immediately (only once a first scan exists —
               otherwise it just sets the filter for the upcoming one). */}
-          <SegmentedControl value={universe} onChange={(v) => { setUniverse(v); if (recs || recsError || recsLoading) discover(v); }} options={["Global all-markets", "US markets", "Europe", "Asia-Pacific", "My interest sectors"]} size="sm" />
+          <SegmentedControl value={universe} onChange={(v) => { changeUniverse(v); if (recs || recsError || recsLoading) discover(v); }} options={UNIVERSES} size="sm" />
         </div>
       </Card>
       {recsLoading && <Card><StagedLoadingBlock title="Finding your best picks…" sub="verifying current data · usually 15–20s" /></Card>}
@@ -3443,7 +3493,7 @@ Schema:
             <div style={{ display: nav === "backtest" ? undefined : "none", paddingTop: isMobile ? 0 : 28 }}>
               <ScreenErrorBoundary>
                 <Suspense fallback={<Card><LoadingBlock title="Loading backtester…" /></Card>}>
-                  <Backtester initialTicker={result?.ticker || query} />
+                  <Backtester initialTicker={result?.ticker || query} taxPrefs={taxPrefs} onTaxPrefsChange={updateTaxPrefs} />
                 </Suspense>
               </ScreenErrorBoundary>
             </div>

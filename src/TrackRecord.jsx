@@ -45,8 +45,11 @@ export default function TrackRecord() {
       try {
         const uid = auth?.currentUser?.uid;
         let records = uid ? await loadPickHistory(uid) : null;
-        // Signed-out / Firebase-unconfigured fallback: this device's local copy of the same log.
-        if (!records) {
+        // Fallback to this device's local copy when the cloud has nothing to show — signed out,
+        // Firebase unconfigured, read failed (null), or an EMPTY subcollection ([]). The empty
+        // case matters: [] is truthy, so `!records` alone hid local picks (logged while signed
+        // out) from signed-in users whose cloud log hadn't been seeded yet.
+        if (!records?.length) {
           try { const v = localStorage.getItem("atlas_pick_history"); records = v ? JSON.parse(v) : []; } catch { records = []; }
         }
         records = (Array.isArray(records) ? records : [])

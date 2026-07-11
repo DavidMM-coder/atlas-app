@@ -466,7 +466,7 @@ function StratBtn({ s, on, onSelect }) {
 }
 
 // ── Main component ────────────────────────────────────────────────────────────
-export default function Backtester({ initialTicker } = {}) {
+export default function Backtester({ initialTicker, taxPrefs, onTaxPrefsChange } = {}) {
   const [ticker, setTicker] = useState(initialTicker || "");
   const [range, setRange] = useState("5y");
   const [stratId, setStratId] = useState("sma_crossover");
@@ -474,9 +474,10 @@ export default function Backtester({ initialTicker } = {}) {
   const [cash, setCash] = useState("10000");
   // After-tax comparison — opt-in so the default pre-tax experience is unchanged; rates are
   // editable (US-centric defaults, but no assumption about the user's actual bracket).
-  const [afterTax, setAfterTax] = useState(false);
-  const [stRate, setStRate] = useState("30");
-  const [ltRate, setLtRate] = useState("15");
+  // Owned by App as a synced preference (localStorage + Firestore), unlike the ticker/strategy/
+  // params above, which are per-session working state and deliberately reset each visit.
+  const { afterTax = false, stRate = "30", ltRate = "15" } = taxPrefs || {};
+  const setTaxPrefs = onTaxPrefsChange || (() => {});
   const [paramVals, setParamVals] = useState({});
   const [loading, setLoading] = useState(false);
   const [error, setError] = useState(null);
@@ -716,7 +717,7 @@ export default function Backtester({ initialTicker } = {}) {
               {/* After-tax comparison toggle — DCA never sells during the period, so there's nothing to tax there */}
               {!isDCA && (
                 <>
-                  <button onClick={() => setAfterTax(v => !v)} className="atlas-btn" aria-pressed={afterTax}
+                  <button onClick={() => setTaxPrefs({ afterTax: !afterTax })} className="atlas-btn" aria-pressed={afterTax}
                     style={{ display: "flex", alignItems: "center", gap: 8, background: "none", border: "none", padding: 0, cursor: "pointer", textAlign: "left" }}>
                     <span style={{ width: 30, height: 17, borderRadius: 99, background: afterTax ? c.accent : c.surface2, border: `1px solid ${afterTax ? c.accent : c.hairline}`, position: "relative", flexShrink: 0, transition: "background .15s ease" }}>
                       <span style={{ position: "absolute", top: 1.5, left: afterTax ? 14 : 2, width: 12, height: 12, borderRadius: 99, background: afterTax ? "#0B0B10" : c.text3, transition: "left .15s ease" }} />
@@ -725,8 +726,8 @@ export default function Backtester({ initialTicker } = {}) {
                   </button>
                   {afterTax && (
                     <div style={{ display: "grid", gridTemplateColumns: "1fr 1fr", gap: 10 }}>
-                      <Field label="Short-term rate (%)"><Input mono value={stRate} onChange={e => setStRate(e.target.value)} inputMode="decimal" placeholder="30" /></Field>
-                      <Field label="Long-term rate (%)"><Input mono value={ltRate} onChange={e => setLtRate(e.target.value)} inputMode="decimal" placeholder="15" /></Field>
+                      <Field label="Short-term rate (%)"><Input mono value={stRate} onChange={e => setTaxPrefs({ stRate: e.target.value })} inputMode="decimal" placeholder="30" /></Field>
+                      <Field label="Long-term rate (%)"><Input mono value={ltRate} onChange={e => setTaxPrefs({ ltRate: e.target.value })} inputMode="decimal" placeholder="15" /></Field>
                     </div>
                   )}
                 </>
