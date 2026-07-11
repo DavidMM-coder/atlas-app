@@ -693,7 +693,9 @@ export default function Backtester({ initialTicker } = {}) {
         <p style={{ ...type.body, color: c.text3, margin: 0 }}>Does this strategy actually beat buy-and-hold after costs — or does it just look like it does?</p>
       </div>
 
-      <div style={{ display: "grid", gridTemplateColumns: "minmax(0, 340px) 1fr", gap: 16, alignItems: "start" }} className="bt-grid">
+      {/* minmax(0,1fr), not bare 1fr: a bare fr track can't shrink below its content's min-width,
+          so wide results content would overflow (clipped) in narrow desktop windows. */}
+      <div style={{ display: "grid", gridTemplateColumns: "minmax(0, 340px) minmax(0, 1fr)", gap: 16, alignItems: "start" }} className="bt-grid">
         {/* ── Config rail ── */}
         <div style={{ display: "flex", flexDirection: "column", gap: 12, position: "sticky", top: 16 }}>
           <Card pad={18}>

@@ -390,7 +390,9 @@ export function MetricTable({ title, items = [], style }) {
             padding: "9px 14px", background: i % 2 ? "transparent" : c.surface2,
             borderBottom: i < items.length - 1 ? `1px solid ${c.hairline}` : "none" }}>
             <span style={{ ...type.small, color: c.text3 }}>{m.label}</span>
-            <span style={{ ...type.mono, color: m.value === "N/A" ? c.text3 : c.text, textAlign: "right" }}>{m.value}</span>
+            {/* minWidth 0 + overflowWrap: AI-written values can contain long unbreakable tokens
+                (ranges, big numbers) — the box's overflow:hidden would clip them; this wraps them. */}
+            <span style={{ ...type.mono, color: m.value === "N/A" ? c.text3 : c.text, textAlign: "right", minWidth: 0, overflowWrap: "anywhere" }}>{m.value}</span>
           </div>
         ))}
       </div>

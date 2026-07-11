@@ -1254,7 +1254,11 @@ function Results({ result, profile, backtestSnapshot, onOpenBacktest }) {
                     </div>
                   </div>
                 )}
-                <div style={{ display: "grid", gridTemplateColumns: "repeat(auto-fill, minmax(300px, 1fr))", gap: 18 }}>
+                {/* min(300px, 100%) instead of a bare 300px floor: in the dossier's right pane at
+                    ~1100-1300px windows two 300px-minimum tracks exceed the pane and the metric
+                    boxes were clipped at the right edge; the min() cap makes tracks never wider
+                    than the container at any width. */}
+                <div style={{ display: "grid", gridTemplateColumns: "repeat(auto-fill, minmax(min(300px, 100%), 1fr))", gap: 18 }}>
                   {(sec?.groups || []).map((g, i) => (
                     <MetricTable key={i} title={g.title} items={(g.items || []).map(it => ({ ...it, label: <GlossLabel text={it.label} /> }))} />
                   ))}
@@ -1414,7 +1418,7 @@ function Results({ result, profile, backtestSnapshot, onOpenBacktest }) {
 
   return (
     <motion.div initial={{ opacity: 0, y: 8 }} animate={{ opacity: 1, y: 0 }} transition={{ duration: 0.25 }} style={{ marginTop: 4 }}>
-      <div style={{ display: "grid", gridTemplateColumns: isMobile ? "1fr" : "minmax(0, 340px) 1fr", gap: 16, alignItems: "start" }}>
+      <div style={{ display: "grid", gridTemplateColumns: isMobile ? "minmax(0, 1fr)" : "minmax(0, 340px) minmax(0, 1fr)", gap: 16, alignItems: "start" }}>
         <div style={{ position: isMobile ? "static" : "sticky", top: 16 }}>{Brief}</div>
         {Evidence}
       </div>
@@ -1439,10 +1443,14 @@ const PILLAR_KEYS = [["fundamentals", "Fundamentals"], ["valuation", "Valuation"
 function MiniPillars({ pillars }) {
   const isMobile = useIsMobile();
   if (!pillars || PILLAR_KEYS.every(([k]) => pillars[k] == null)) return null;
-  // Desktop: all four pillars in one row (flex 1 1 52px). Mobile: the full labels ("Fundamentals",
-  // "Momentum") overflow a ~70px quarter-cell, so drop to a 2×2 grid — each cell takes half the
-  // width (basis 50% minus half the 10px gap → exactly two per row), giving the labels room.
-  const cellStyle = isMobile ? { flex: "1 1 calc(50% - 5px)", minWidth: 0 } : { flex: "1 1 52px", minWidth: 52 };
+  // Mobile: the full labels ("Fundamentals", "Momentum") overflow a ~70px quarter-cell, so a 2×2
+  // grid — each cell takes half the width (basis 50% minus half the 10px gap → exactly two per
+  // row), giving the labels room. Desktop: basis 118px = what "Fundamentals" + a score actually
+  // needs, so four cells sit in one row on any card wide enough and the SAME flex-wrap drops to
+  // 2×2 the moment they don't fit — content-driven, no breakpoint. (The old "flex 1 1 52px,
+  // minWidth 52" let cells shrink to ~74px in Discover's two-column grid at ~800-1050px windows,
+  // where the relabeled "Fundamentals" needs ~95px — the label clipped under the score.)
+  const cellStyle = isMobile ? { flex: "1 1 calc(50% - 5px)", minWidth: 0 } : { flex: "1 1 118px", minWidth: 0 };
   return (
     <div style={{ display: "flex", gap: 10, flexWrap: "wrap", marginTop: 12 }}>
       {PILLAR_KEYS.map(([key, label]) => {
@@ -1450,9 +1458,9 @@ function MiniPillars({ pillars }) {
         const col = scoreColor(s);
         return (
           <div key={key} style={cellStyle}>
-            <div style={{ display: "flex", justifyContent: "space-between", alignItems: "baseline", marginBottom: 3 }}>
-              <span style={{ ...type.caption, color: c.text3 }}>{label}</span>
-              <span style={{ ...type.caption, fontFamily: font.mono, fontWeight: 600, color: col }}>{s != null ? Math.round(s) : "—"}</span>
+            <div style={{ display: "flex", justifyContent: "space-between", alignItems: "baseline", gap: 6, marginBottom: 3 }}>
+              <span style={{ ...type.caption, color: c.text3, minWidth: 0, overflow: "hidden", textOverflow: "ellipsis", whiteSpace: "nowrap" }}>{label}</span>
+              <span style={{ ...type.caption, fontFamily: font.mono, fontWeight: 600, color: col, flexShrink: 0 }}>{s != null ? Math.round(s) : "—"}</span>
             </div>
             <div style={{ height: 4, borderRadius: 99, background: c.surface2, overflow: "hidden" }}>
               <div style={{ width: `${Math.max(0, Math.min(100, s || 0))}%`, height: "100%", background: col, borderRadius: 99 }} />
@@ -1495,9 +1503,12 @@ function OpportunityCard({ pick, rank, onOpen, hero }) {
             </div>
           )}
         </div>
-        <div style={{ display: "flex", flexDirection: "column", gap: 4, alignItems: "flex-end" }}>
+        {/* minWidth 0 + per-line ellipsis: AI-written snapshot values are free-form and can run
+            long — without this the nowrap lines overflow the card and get clipped at the right
+            edge in narrow desktop windows instead of degrading gracefully. */}
+        <div style={{ display: "flex", flexDirection: "column", gap: 4, alignItems: "flex-end", minWidth: 0, maxWidth: "100%" }}>
           {(pick.snapshot || []).slice(0, 3).map((m, i) => (
-            <span key={i} style={{ ...type.caption, color: c.text3, whiteSpace: "nowrap" }}>{m.label} <b style={{ color: c.text, fontFamily: font.mono }}>{m.value}</b></span>
+            <span key={i} style={{ ...type.caption, color: c.text3, whiteSpace: "nowrap", maxWidth: "100%", overflow: "hidden", textOverflow: "ellipsis" }}>{m.label} <b style={{ color: c.text, fontFamily: font.mono }}>{m.value}</b></span>
           ))}
           <span style={{ ...type.caption, fontWeight: 600, color: c.accent, marginTop: 2 }}>Full dossier →</span>
         </div>
@@ -2944,7 +2955,10 @@ Schema:
         </div>
         {recsLoading && <Card><StagedLoadingBlock title="Scanning markets for your best fits…" /></Card>}
         {!recsLoading && recs?.picks && (
-          <div style={{ display: "grid", gridTemplateColumns: isMobile ? "1fr" : "1fr 1fr 1fr", gap: 12 }}>
+          /* minmax(0,1fr), not bare 1fr: a bare fr track can't shrink below its content's
+             min-width, so three pick cards overflow the row (clipped at the right edge) in
+             narrow desktop windows. Same guard on the other multi-column grids below. */
+          <div style={{ display: "grid", gridTemplateColumns: isMobile ? "minmax(0, 1fr)" : "repeat(3, minmax(0, 1fr))", gap: 12 }}>
             {recs.picks.slice(0, 3).map((p) => (
               <Card key={p.ticker} interactive onClick={() => openTicker(p.ticker, p.pillars)} pad={16}>
                 <div style={{ display: "flex", alignItems: "center", gap: 10, marginBottom: 12 }}>
@@ -2967,7 +2981,7 @@ Schema:
 
       {/* quick actions */}
       <motion.div variants={{ initial: { opacity: 0, y: 10 }, animate: { opacity: 1, y: 0 } }}>
-        <div style={{ display: "grid", gridTemplateColumns: isMobile ? "1fr 1fr" : "1fr 1fr 1fr", gap: 12 }}>
+        <div style={{ display: "grid", gridTemplateColumns: isMobile ? "repeat(2, minmax(0, 1fr))" : "repeat(3, minmax(0, 1fr))", gap: 12 }}>
           {[["research", "Research a stock", "Full AI dossier on any ticker"], ["portfolio", "Review portfolio", "Buy / hold / sell on every position"], ["backtest", "Backtest a strategy", "Does it beat buy-and-hold?"]].map(([k, t, d]) => (
             <Card key={k} interactive onClick={() => setNav(k)} pad={16}>
               <div style={{ ...type.bodyStrong, color: c.text, marginBottom: 4 }}>{t}</div>
@@ -3006,7 +3020,7 @@ Schema:
             </Card>
           )}
           <motion.div initial="initial" animate="animate" variants={{ animate: { transition: { staggerChildren: 0.04 } } }}
-            style={{ display: "grid", gridTemplateColumns: isMobile ? "1fr" : "1fr 1fr", gap: 12 }}>
+            style={{ display: "grid", gridTemplateColumns: isMobile ? "minmax(0, 1fr)" : "repeat(2, minmax(0, 1fr))", gap: 12 }}>
             {recs.picks.map((p, i) => (
               <motion.div key={p.ticker || i} variants={{ initial: { opacity: 0, y: 10 }, animate: { opacity: 1, y: 0 } }} style={i === 0 ? { gridColumn: isMobile ? "auto" : "1 / -1" } : {}}>
                 <OpportunityCard pick={p} rank={i + 1} hero={i === 0 && !isMobile} onOpen={() => openTicker(p.ticker, p.pillars)} />
