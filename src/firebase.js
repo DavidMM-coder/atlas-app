@@ -5,7 +5,7 @@ import {
   signInWithPhoneNumber, RecaptchaVerifier, signOut, onAuthStateChanged,
   sendPasswordResetEmail, sendEmailVerification,
 } from "firebase/auth";
-import { getFirestore, doc, setDoc, getDoc, collection, addDoc, getDocs, serverTimestamp } from "firebase/firestore";
+import { getFirestore, doc, setDoc, getDoc, getDocFromServer, collection, addDoc, getDocs, serverTimestamp } from "firebase/firestore";
 
 const configured = !!(
   import.meta.env.VITE_FIREBASE_API_KEY &&
@@ -66,12 +66,32 @@ export async function loadUserData(uid) {
     await new Promise((r) => setTimeout(r, 600));
     return { ok: false };
   }
+  const raced = (p) => Promise.race([
+    p,
+    new Promise((_, reject) => setTimeout(() => reject(new Error("cloud read timed out")), 12000)),
+  ]);
   try {
-    const snap = await Promise.race([
-      getDoc(doc(db, "users", uid)),
-      new Promise((_, reject) => setTimeout(() => reject(new Error("cloud read timed out")), 12000)),
-    ]);
-    return { ok: true, data: snap.exists() ? snap.data() : null };
+    const snap = await raced(getDoc(doc(db, "users", uid)));
+    // Dev-only simulation of the incident below (dead-code-eliminated in prod): the FIRST
+    // read per page pretends the SDK served a stale cached doc with no profile.
+    const simulateStale = import.meta.env.VITE_SIMULATE_STALE_CACHE === "1" && typeof window !== "undefined" && !window.__staleCacheServed;
+    if (simulateStale) window.__staleCacheServed = true;
+    const fromCache = simulateStale ? true : snap.metadata.fromCache;
+    const data = simulateStale ? null : (snap.exists() ? snap.data() : null);
+    // A CACHE-served answer must never be allowed to conclude "no profile exists" — that
+    // conclusion routes users into onboarding (and finishOnboarding's guard into a silent
+    // save), which is destructive-adjacent. Observed live 2026-07-13: a tab whose SDK cache
+    // held the doc from a no-profile window kept boot-reading "no profile" while the server
+    // had the restored profile the whole time. Cached data that DOES contain a profile is
+    // safe to hydrate from immediately (stale-but-real; keeps boot fast), so only the
+    // empty/no-profile conclusion escalates to a server-confirmed read. If the server can't
+    // be reached, this throws into the catch → {ok:false} → the caller's retry/error path,
+    // never a false "genuinely empty".
+    if (!data?.profile?.name && fromCache) {
+      const server = await raced(getDocFromServer(doc(db, "users", uid)));
+      return { ok: true, data: server.exists() ? server.data() : null, fromCache: false };
+    }
+    return { ok: true, data, fromCache };
   } catch (e) {
     console.error("Failed to load cloud data:", e);
     return { ok: false };
@@ -94,7 +114,7 @@ if (typeof window !== "undefined") {
       raw = { getDocError: String(e) };
     }
     const viaLoad = await loadUserData(u.uid);
-    const out = { uid: u.uid, raw, viaLoad: { ok: viaLoad.ok, hasData: !!viaLoad.data, profileName: viaLoad.data?.profile?.name ?? null } };
+    const out = { uid: u.uid, raw, viaLoad: { ok: viaLoad.ok, hasData: !!viaLoad.data, profileName: viaLoad.data?.profile?.name ?? null, fromCache: viaLoad.fromCache ?? null } };
     console.log("atlasDebugCloudDoc:", out);
     return out;
   };
