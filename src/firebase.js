@@ -58,6 +58,14 @@ export async function saveUserToFirestore(user) {
 // connection is turned into an error rather than an indefinite wait.
 export async function loadUserData(uid) {
   if (!db || !uid) return { ok: false };
+  // Test hook, dev-only (vite dead-code-eliminates this in prod builds): with
+  // VITE_SIMULATE_CLOUD_FAIL=1 the read fails until `window.__allowCloud = true`, so the
+  // sync-gate's error + Retry path can be exercised deterministically — a real transport
+  // block is unreliable because the SDK binds its network primitives at module init.
+  if (import.meta.env.VITE_SIMULATE_CLOUD_FAIL === "1" && typeof window !== "undefined" && !window.__allowCloud) {
+    await new Promise((r) => setTimeout(r, 600));
+    return { ok: false };
+  }
   try {
     const snap = await Promise.race([
       getDoc(doc(db, "users", uid)),
