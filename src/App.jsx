@@ -2031,74 +2031,112 @@ export default function VerdictApp() {
   // seed it from whatever this device already has (first sign-in after local-only use). Keyed
   // by uid so switching accounts re-hydrates instead of showing the previous user's data.
   const syncedUid = useRef(null);
+  // Has THIS session hydrated (or authored) the cloud profile? finishOnboarding's overwrite
+  // guard uses it: a session that never saw the cloud profile must re-check before writing one.
+  const hydratedCloudProfile = useRef(false);
+  // pending | done | error — the render gate below blocks the onboarding-vs-app decision on a
+  // profile-less device until this is definitively "done". Deciding from local emptiness while
+  // the first Firestore read was still in flight is exactly how a signed-in user with a full
+  // cloud profile got railroaded into re-onboarding (which then overwrote the cloud profile).
+  const [cloudSync, setCloudSync] = useState("pending");
+  // Small dismissible notice for cloud read/write failures — they used to die in the console,
+  // which is what kept this whole failure mode invisible.
+  const [cloudNotice, setCloudNotice] = useState(null);
   const cloudSaveTimer = useRef(null);
   function cloudSave(partial, debounceMs = 0) {
     const uid = auth?.currentUser?.uid;
     if (!uid) return;
-    if (!debounceMs) { saveUserData(uid, partial); return; }
+    const save = () => saveUserData(uid, partial).then((ok) => {
+      if (!ok) setCloudNotice("A cloud save didn't go through — your change is safe on this device and will sync next time it succeeds.");
+    });
+    if (!debounceMs) { save(); return; }
     clearTimeout(cloudSaveTimer.current);
-    cloudSaveTimer.current = setTimeout(() => saveUserData(uid, partial), debounceMs);
+    cloudSaveTimer.current = setTimeout(save, debounceMs);
+  }
+  async function runCloudSync(user) {
+    setCloudSync("pending");
+    // 2 retries with backoff before declaring error: the failure that matters here is a fresh
+    // device's first-ever Firestore connection flaking — worth a few seconds of patience
+    // before asking the user to retry by hand.
+    let res = null;
+    for (const delay of [0, 2000, 5000]) {
+      if (delay) await sleep(delay);
+      res = await loadUserData(user.uid);
+      if (res.ok) break;
+    }
+    if (!res?.ok) {
+      setCloudSync("error");
+      setCloudNotice("Couldn't reach your cloud data — using this device's local copy for now.");
+      return;
+    }
+    const cloud = res.data;
+    const hadLocalProfile = !!(await kvGet("atlas_profile"))?.name;
+    if (cloud?.profile?.name) {
+      hydratedCloudProfile.current = true;
+      setProfile(cloud.profile); kvSet("atlas_profile", cloud.profile);
+      if (Array.isArray(cloud.holdings)) { setHoldings(cloud.holdings); kvSet("atlas_holdings", cloud.holdings); }
+      if (cloud.spareCash != null) { setSpareCash(String(cloud.spareCash)); kvSet("atlas_spare_cash", String(cloud.spareCash)); }
+      if (cloud.spareCashCurrency) { setSpareCashCurrency(cloud.spareCashCurrency); kvSet("atlas_spare_cash_currency", cloud.spareCashCurrency); }
+      if (Array.isArray(cloud.researchHistory) && cloud.researchHistory.length) { setResearchHistory(cloud.researchHistory); kvSet("atlas_research_history", cloud.researchHistory); }
+      if (UNIVERSES.includes(cloud.universe)) { setUniverse(cloud.universe); kvSet("atlas_universe", cloud.universe); }
+      if (cloud.taxPrefs && typeof cloud.taxPrefs === "object" && !Array.isArray(cloud.taxPrefs)) {
+        const tp = { ...TAX_PREFS_DEFAULT, ...cloud.taxPrefs };
+        setTaxPrefs(tp); kvSet("atlas_tax_prefs", tp);
+      }
+      setPhase("app");
+      if (!hadLocalProfile) setAutoDiscover(true); // fresh device — kick off the first scan
+    } else {
+      // The cloud definitively has no profile (res.ok with an absent doc or profile field) —
+      // push this device's data up so the account is seeded. This branch is only reachable
+      // on a SUCCESSFUL read now; a failed read stops above as "error" instead of landing
+      // here and treating unknown cloud state as empty.
+      const p = await kvGet("atlas_profile");
+      const h = await kvGet("atlas_holdings");
+      const cash = await kvGet("atlas_spare_cash");
+      const cur = await kvGet("atlas_spare_cash_currency");
+      const rh = await kvGet("atlas_research_history");
+      const uni = await kvGet("atlas_universe");
+      const tp = await kvGet("atlas_tax_prefs");
+      const seed = {};
+      if (p?.name) seed.profile = p;
+      if (Array.isArray(h)) seed.holdings = h;
+      if (cash != null) seed.spareCash = String(cash);
+      if (cur) seed.spareCashCurrency = cur;
+      if (Array.isArray(rh) && rh.length) seed.researchHistory = rh.slice(0, 12);
+      if (UNIVERSES.includes(uni)) seed.universe = uni;
+      if (tp && typeof tp === "object" && !Array.isArray(tp)) seed.taxPrefs = { ...TAX_PREFS_DEFAULT, ...tp };
+      if (Object.keys(seed).length) saveUserData(user.uid, seed);
+      if (seed.profile) hydratedCloudProfile.current = true; // this session authored the cloud profile
+    }
+    setCloudSync("done");
+    setCloudNotice(null);
+
+    // Reconcile the pick log: records logged while signed out exist only in this device's
+    // localStorage — push the ones missing from users/{uid}/pick_history. Matching on each
+    // record's own at|ticker identity (not a synced flag) keeps this idempotent: a record
+    // already in the cloud is skipped, so repeated sign-ins never double-upload and there's
+    // no bookkeeping to drift. If the cloud read FAILS (null — offline, rules), skip rather
+    // than push blind: pushing without knowing what's there is what would duplicate. Runs
+    // AFTER cloudSync flips to done — the render gate must never wait on this housekeeping.
+    try {
+      const localPicks = await kvGet(PICK_HISTORY_KEY);
+      if (Array.isArray(localPicks) && localPicks.length) {
+        const cloudPicks = await loadPickHistory(user.uid);
+        if (cloudPicks) {
+          const key = (r) => `${r.at}|${r.ticker}`;
+          const seen = new Set(cloudPicks.map(key));
+          const missing = localPicks.filter((r) => r && r.at && r.ticker && !seen.has(key(r)));
+          if (missing.length) await savePickHistory(user.uid, missing);
+        }
+      }
+    } catch (e) {
+      console.error("Pick-history reconciliation failed:", e);
+    }
   }
   useEffect(() => {
     if (!firebaseUser || syncedUid.current === firebaseUser.uid) return;
     syncedUid.current = firebaseUser.uid;
-    (async () => {
-      const hadLocalProfile = !!(await kvGet("atlas_profile"))?.name;
-      const cloud = await loadUserData(firebaseUser.uid);
-      if (cloud?.profile?.name) {
-        setProfile(cloud.profile); kvSet("atlas_profile", cloud.profile);
-        if (Array.isArray(cloud.holdings)) { setHoldings(cloud.holdings); kvSet("atlas_holdings", cloud.holdings); }
-        if (cloud.spareCash != null) { setSpareCash(String(cloud.spareCash)); kvSet("atlas_spare_cash", String(cloud.spareCash)); }
-        if (cloud.spareCashCurrency) { setSpareCashCurrency(cloud.spareCashCurrency); kvSet("atlas_spare_cash_currency", cloud.spareCashCurrency); }
-        if (Array.isArray(cloud.researchHistory) && cloud.researchHistory.length) { setResearchHistory(cloud.researchHistory); kvSet("atlas_research_history", cloud.researchHistory); }
-        if (UNIVERSES.includes(cloud.universe)) { setUniverse(cloud.universe); kvSet("atlas_universe", cloud.universe); }
-        if (cloud.taxPrefs && typeof cloud.taxPrefs === "object" && !Array.isArray(cloud.taxPrefs)) {
-          const tp = { ...TAX_PREFS_DEFAULT, ...cloud.taxPrefs };
-          setTaxPrefs(tp); kvSet("atlas_tax_prefs", tp);
-        }
-        setPhase("app");
-        if (!hadLocalProfile) setAutoDiscover(true); // fresh device — kick off the first scan
-      } else {
-        // Nothing in the cloud yet — push this device's data up so the account is seeded.
-        const p = await kvGet("atlas_profile");
-        const h = await kvGet("atlas_holdings");
-        const cash = await kvGet("atlas_spare_cash");
-        const cur = await kvGet("atlas_spare_cash_currency");
-        const rh = await kvGet("atlas_research_history");
-        const uni = await kvGet("atlas_universe");
-        const tp = await kvGet("atlas_tax_prefs");
-        const seed = {};
-        if (p?.name) seed.profile = p;
-        if (Array.isArray(h)) seed.holdings = h;
-        if (cash != null) seed.spareCash = String(cash);
-        if (cur) seed.spareCashCurrency = cur;
-        if (Array.isArray(rh) && rh.length) seed.researchHistory = rh.slice(0, 12);
-        if (UNIVERSES.includes(uni)) seed.universe = uni;
-        if (tp && typeof tp === "object" && !Array.isArray(tp)) seed.taxPrefs = { ...TAX_PREFS_DEFAULT, ...tp };
-        if (Object.keys(seed).length) saveUserData(firebaseUser.uid, seed);
-      }
-
-      // Reconcile the pick log: records logged while signed out exist only in this device's
-      // localStorage — push the ones missing from users/{uid}/pick_history. Matching on each
-      // record's own at|ticker identity (not a synced flag) keeps this idempotent: a record
-      // already in the cloud is skipped, so repeated sign-ins never double-upload and there's
-      // no bookkeeping to drift. If the cloud read FAILS (null — offline, rules), skip rather
-      // than push blind: pushing without knowing what's there is what would duplicate.
-      try {
-        const localPicks = await kvGet(PICK_HISTORY_KEY);
-        if (Array.isArray(localPicks) && localPicks.length) {
-          const cloudPicks = await loadPickHistory(firebaseUser.uid);
-          if (cloudPicks) {
-            const key = (r) => `${r.at}|${r.ticker}`;
-            const seen = new Set(cloudPicks.map(key));
-            const missing = localPicks.filter((r) => r && r.at && r.ticker && !seen.has(key(r)));
-            if (missing.length) await savePickHistory(firebaseUser.uid, missing);
-          }
-        }
-      } catch (e) {
-        console.error("Pick-history reconciliation failed:", e);
-      }
-    })();
+    runCloudSync(firebaseUser);
   }, [firebaseUser]);
 
   const priceFetchSeq = useRef(0);
@@ -2193,7 +2231,27 @@ export default function VerdictApp() {
     }
   }, [nav, profile, marketNews]);
 
-  function finishOnboarding(p) { setProfile(p); kvSet("atlas_profile", p); cloudSave({ profile: p }); setPhase("app"); setNav("home"); setAutoDiscover(true); }
+  // Answers held while the Keep/Replace confirm is showing (see finishOnboarding's guard).
+  const [pendingOnboardProfile, setPendingOnboardProfile] = useState(null);
+  function commitOnboarding(p) {
+    hydratedCloudProfile.current = true;   // this session now authored the cloud profile
+    setProfile(p); kvSet("atlas_profile", p); cloudSave({ profile: p }); setPhase("app"); setNav("home"); setAutoDiscover(true);
+  }
+  async function finishOnboarding(p) {
+    // Overwrite guard: if this session never hydrated a cloud profile but one EXISTS (written
+    // by another device), don't silently replace it — a transient first-read failure once
+    // railroaded a real user through re-onboarding and permanently destroyed their original
+    // profile this way. Re-check and ask. If this guard's own read fails, proceed with the
+    // save: never block onboarding completion on a second flaky read (worst case equals the
+    // old behavior).
+    if (firebaseUser && !hydratedCloudProfile.current) {
+      try {
+        const res = await loadUserData(firebaseUser.uid);
+        if (res.ok && res.data?.profile?.name) { setPendingOnboardProfile(p); return; }
+      } catch {}
+    }
+    commitOnboarding(p);
+  }
   function saveProfile(p) { setProfile(p); kvSet("atlas_profile", p); cloudSave({ profile: p }); setShowProfileEditor(false); setRecs(null); setReview(null); }
   function updateSpareCash(v, currency) {
     setSpareCash(v); kvSet("atlas_spare_cash", v);
@@ -2886,6 +2944,11 @@ Schema:
       setResearchHistory([]); setRecs(null); setReview(null); setResult(null); setError(null); setQuery("");
       setNewsItems(null); setNewsInsiderActivity(null); setMarketNews(null); setLivePrices({});
       setPhase("onboarding"); setNav("home");
+      // Reset the sync machinery so the NEXT sign-in starts from a clean "pending" — a stale
+      // "done" from this session would let the render gate fall through to onboarding before
+      // the new account's cloud read has resolved.
+      setCloudSync("pending"); setCloudNotice(null); setPendingOnboardProfile(null);
+      hydratedCloudProfile.current = false;
       ["atlas_profile", "atlas_holdings", "atlas_spare_cash", "atlas_spare_cash_currency", "atlas_research_history", "atlas_market_news", "atlas_recs", PICK_HISTORY_KEY].forEach(kvDel);
     }).catch(() => {});
   }
@@ -2897,8 +2960,57 @@ Schema:
   const firebaseConfigured = !!import.meta.env.VITE_FIREBASE_API_KEY;
   if (firebaseConfigured && !firebaseUser) return <AtlasMotionProvider><AtlasStyles /><AuthScreen onAuth={(u) => setFirebaseUser(u)} /></AtlasMotionProvider>;
 
+  // Cloud-resolution gate: on a signed-in device with NO local profile, the onboarding-vs-app
+  // decision must wait for a DEFINITIVE cloud outcome (done → hydrated or genuinely empty).
+  // Deciding from local emptiness while the first Firestore read was still in flight is how a
+  // user with a full cloud profile got railroaded into re-onboarding — which then overwrote
+  // the original. Devices with a local profile never reach this: the boot effect promotes them
+  // to phase "app" from localStorage before Firebase auth even finishes restoring, so gate #1
+  // above is still showing while this condition turns false.
+  if (firebaseConfigured && firebaseUser && phase === "onboarding" && !profile?.name && cloudSync !== "done") return (
+    <AtlasMotionProvider><AtlasStyles />
+      <div style={{ background: c.canvas, minHeight: "100vh", display: "flex", flexDirection: "column", alignItems: "center", justifyContent: "center", gap: 14, padding: 20 }}>
+        {cloudSync === "pending" ? (
+          <>
+            <Spinner size={20} />
+            <span style={{ ...type.overline, color: c.text3 }}>Restoring your account…</span>
+          </>
+        ) : (
+          <Card pad={22} style={{ maxWidth: 400, textAlign: "center" }}>
+            <div style={{ ...type.bodyStrong, color: c.text, marginBottom: 6 }}>Couldn't reach your cloud data</div>
+            <div style={{ ...type.small, color: c.text3, lineHeight: 1.6, marginBottom: 16 }}>
+              Your profile and holdings live in your account. So you're not asked to set up from scratch, Atlas won't continue until it can check for them.
+            </div>
+            <Button glow onClick={() => runCloudSync(firebaseUser)}>Retry</Button>
+          </Card>
+        )}
+      </div>
+    </AtlasMotionProvider>
+  );
+
   if (phase === "onboarding") return (
-    <AtlasMotionProvider><AtlasStyles /><Onboarding initial={profile} onDone={finishOnboarding} onExit={profile?.name ? () => setPhase("app") : null} /></AtlasMotionProvider>
+    <AtlasMotionProvider><AtlasStyles />
+      <Onboarding initial={profile} onDone={finishOnboarding} onExit={profile?.name ? () => setPhase("app") : null} />
+      {/* Fix-2 confirm: a cloud profile exists that this session never loaded (another device
+          wrote it) and the user just finished onboarding anyway. Keep = hydrate the cloud
+          version via a fresh sync (the gate above shows "Restoring…" while it runs); Replace =
+          commit the answers they just gave. Closing the dialog returns to onboarding intact. */}
+      <Modal open={!!pendingOnboardProfile} onClose={() => setPendingOnboardProfile(null)} width={440}>
+        <div style={{ display: "flex", flexDirection: "column", gap: 14 }}>
+          <div>
+            <Overline color={c.warning} style={{ marginBottom: 6 }}>Profile already exists</Overline>
+            <div style={{ ...type.bodyStrong, color: c.text, marginBottom: 6 }}>This account already has an investor profile</div>
+            <div style={{ ...type.small, color: c.text2, lineHeight: 1.6 }}>
+              It was created on another device. Keep that one, or replace it with the answers you just gave? Replacing updates it on all your devices.
+            </div>
+          </div>
+          <div style={{ display: "flex", gap: 10, justifyContent: "flex-end", flexWrap: "wrap" }}>
+            <Button variant="secondary" onClick={() => { const p = pendingOnboardProfile; setPendingOnboardProfile(null); commitOnboarding(p); }}>Replace with my new answers</Button>
+            <Button glow onClick={() => { setPendingOnboardProfile(null); runCloudSync(firebaseUser); }}>Keep existing profile</Button>
+          </div>
+        </div>
+      </Modal>
+    </AtlasMotionProvider>
   );
 
   // ---- portfolio derived figures ----
@@ -3516,6 +3628,16 @@ Schema:
                   <Button variant="secondary" size="sm" onClick={resendVerifyEmail}>Resend email</Button>
                   <Button size="sm" loading={verifyChecking} onClick={confirmVerified}>I've verified</Button>
                 </div>
+              </Card>
+            </div>
+          )}
+          {/* Cloud read/write failures used to die in the console — surfacing them is what makes
+              a sync outage visible before it can masquerade as "your data is gone". */}
+          {cloudNotice && (
+            <div style={{ paddingTop: isMobile ? 0 : 24, marginBottom: isMobile ? 14 : 0 }}>
+              <Card pad={12} accentEdge style={{ borderLeftColor: c.warning, display: "flex", alignItems: "center", gap: 12 }}>
+                <span style={{ ...type.caption, color: c.text2, lineHeight: 1.5, flex: 1, minWidth: 0 }}>{cloudNotice}</span>
+                <IconButton label="Dismiss" size={28} onClick={() => setCloudNotice(null)}><CloseIcon /></IconButton>
               </Card>
             </div>
           )}

@@ -48,23 +48,38 @@ export async function saveUserToFirestore(user) {
 // security rules that allow that write cover these fields too). This is what actually
 // delivers the sign-in screen's "remember your profile and holdings across devices" promise;
 // localStorage stays as the local cache / signed-out fallback.
+// Three DISTINCT outcomes — the caller must be able to tell them apart:
+//   { ok: true,  data }        the doc exists
+//   { ok: true,  data: null }  the doc genuinely does not exist (a brand-new account)
+//   { ok: false }              the read FAILED or timed out — the cloud state is UNKNOWN
+// Conflating the last two (both used to return null) is what let a transient first-read
+// failure on a fresh phone masquerade as "no profile exists" and railroad a real user into
+// re-onboarding over their cloud profile. getDoc has no timeout of its own, so a hung
+// connection is turned into an error rather than an indefinite wait.
 export async function loadUserData(uid) {
-  if (!db || !uid) return null;
+  if (!db || !uid) return { ok: false };
   try {
-    const snap = await getDoc(doc(db, "users", uid));
-    return snap.exists() ? snap.data() : null;
+    const snap = await Promise.race([
+      getDoc(doc(db, "users", uid)),
+      new Promise((_, reject) => setTimeout(() => reject(new Error("cloud read timed out")), 12000)),
+    ]);
+    return { ok: true, data: snap.exists() ? snap.data() : null };
   } catch (e) {
     console.error("Failed to load cloud data:", e);
-    return null;
+    return { ok: false };
   }
 }
 
+// Returns whether the write actually landed, so callers can surface a failure instead of
+// letting cloud sync die silently (silent write failures hid the profile-overwrite bug).
 export async function saveUserData(uid, partial) {
-  if (!db || !uid || !partial) return;
+  if (!db || !uid || !partial) return false;
   try {
     await setDoc(doc(db, "users", uid), { ...partial, dataUpdatedAt: serverTimestamp() }, { merge: true });
+    return true;
   } catch (e) {
     console.error("Failed to save cloud data:", e);
+    return false;
   }
 }
 
