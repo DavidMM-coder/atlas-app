@@ -78,6 +78,28 @@ export async function loadUserData(uid) {
   }
 }
 
+// Console diagnostic: exactly what the app's own read path (loadUserData → getDoc) returns
+// for the signed-in user, plus the raw snapshot metadata. Run `atlasDebugCloudDoc()` in the
+// browser console when cloud hydration misbehaves — it answers "what does THIS device's SDK
+// see?" without needing REST calls or tokens.
+if (typeof window !== "undefined") {
+  window.atlasDebugCloudDoc = async () => {
+    const u = auth?.currentUser;
+    if (!u) return { error: "not signed in" };
+    let raw = null;
+    try {
+      const snap = await getDoc(doc(db, "users", u.uid));
+      raw = { exists: snap.exists(), fromCache: snap.metadata.fromCache, pendingWrites: snap.metadata.hasPendingWrites, fields: snap.exists() ? Object.keys(snap.data()) : null, profileName: snap.data()?.profile?.name ?? null };
+    } catch (e) {
+      raw = { getDocError: String(e) };
+    }
+    const viaLoad = await loadUserData(u.uid);
+    const out = { uid: u.uid, raw, viaLoad: { ok: viaLoad.ok, hasData: !!viaLoad.data, profileName: viaLoad.data?.profile?.name ?? null } };
+    console.log("atlasDebugCloudDoc:", out);
+    return out;
+  };
+}
+
 // Returns whether the write actually landed, so callers can surface a failure instead of
 // letting cloud sync die silently (silent write failures hid the profile-overwrite bug).
 export async function saveUserData(uid, partial) {
