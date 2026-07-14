@@ -25,6 +25,14 @@ service cloud.firestore {
       }
     }
 
+    // Anonymous-teaser content (loadHousePicks/saveHousePicks in src/firebase.js): exactly one
+    // doc, public read so signed-out visitors can see the cached house view, write restricted
+    // to the owner account that publishes it via atlasPublishHousePicks().
+    match /public_content/house_picks {
+      allow read: if true;
+      allow write: if request.auth != null && request.auth.uid == "mWxFcdY4NUXAbBrA3J4RKWgu6NB3";
+    }
+
     // Everything else is denied by default — no other collections are used by the app.
     match /{document=**} {
       allow read, write: if false;
