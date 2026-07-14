@@ -150,6 +150,49 @@ export async function saveUserData(uid, partial) {
   }
 }
 
+// Anonymous-teaser content: Atlas's house-view scan for a neutral balanced profile, published
+// by the owner (atlasPublishHousePicks console action) and readable WITHOUT auth. Rules scope
+// is exactly one path — public_content/house_picks: read public, write owner-only. Anonymous
+// visitors only ever hit this one cached read: zero AI calls, zero authed-route calls.
+export async function loadHousePicks() {
+  // Dev-only fixture (dead-code-eliminated in prod): lets the teaser UI be exercised locally
+  // before the public_content rules are deployed.
+  if (import.meta.env.VITE_SIMULATE_HOUSE_PICKS === "1") {
+    return {
+      publishedAt: new Date(Date.now() - 2 * 86400e3).toISOString(),
+      marketContext: "Markets are grinding higher on resilient earnings, with breadth improving beyond mega-cap tech.",
+      picks: [
+        { ticker: "MSFT", company: "Microsoft Corporation", sector: "Software", fitScore: 82, pillars: { fundamentals: 90, valuation: 58, technicals: 76, risk: 86 }, tags: ["Wide moat", "Cash-rich"], snapshot: [{ label: "Fwd P/E", value: "31x" }, { label: "Rev growth", value: "+15% YoY" }], reason: "Azure growth reaccelerated to 30%+ while margins expanded.", concern: "Valuation leaves little room for a capex-digestion pause." },
+        { ticker: "JNJ", company: "Johnson & Johnson", sector: "Healthcare", fitScore: 74, pillars: { fundamentals: 82, valuation: 70, technicals: 58, risk: 90 }, tags: ["Dividend aristocrat", "Defensive"], snapshot: [{ label: "P/E", value: "15x" }, { label: "Yield", value: "3.1%" }], reason: "Trades below its 10-year average multiple with a fortress balance sheet.", concern: "Litigation overhang resurfaces periodically." },
+        { ticker: "ASML", company: "ASML Holding N.V.", sector: "Semi Equipment", fitScore: 78, pillars: { fundamentals: 88, valuation: 55, technicals: 72, risk: 68 }, tags: ["Monopoly position", "Secular growth"], snapshot: [{ label: "Backlog", value: "€38B" }, { label: "Rev growth", value: "+22% YoY" }], reason: "EUV monopoly with a record backlog stretching into 2027.", concern: "Export-control headlines drive sharp drawdowns." },
+        { ticker: "V", company: "Visa Inc.", sector: "Payments", fitScore: 76, pillars: { fundamentals: 89, valuation: 60, technicals: 66, risk: 87 }, tags: ["Network effects", "Capital-light"], snapshot: [{ label: "Op margin", value: "67%" }, { label: "Fwd P/E", value: "27x" }], reason: "Cross-border volumes still compounding double-digit with 60%+ margins.", concern: "Regulatory pressure on interchange fees." },
+      ],
+    };
+  }
+  if (!db) return null;
+  try {
+    const snap = await Promise.race([
+      getDoc(doc(db, "public_content", "house_picks")),
+      new Promise((_, reject) => setTimeout(() => reject(new Error("house-picks read timed out")), 8000)),
+    ]);
+    return snap.exists() ? snap.data() : null;
+  } catch (e) {
+    console.error("Failed to load house picks:", e);
+    return null;   // teaser degrades to feature blurbs, never an error
+  }
+}
+
+export async function saveHousePicks(data) {
+  if (!db || !data) return false;
+  try {
+    await setDoc(doc(db, "public_content", "house_picks"), data);
+    return true;
+  } catch (e) {
+    console.error("Failed to publish house picks:", e);
+    return false;
+  }
+}
+
 // Cloud copy of the append-only Discover pick log — one document per pick under
 // users/{uid}/pick_history, so the log survives cache clears and device switches. A
 // subcollection rather than an array field on users/{uid}: the log grows forever, and a

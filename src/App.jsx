@@ -1,7 +1,7 @@
 import React, { useState, useEffect, useRef, useCallback, Suspense, lazy } from "react";
 import AuthScreen from "./Auth.jsx";
 import TrackRecord from "./TrackRecord.jsx";
-import { auth, onAuthStateChanged, signOut, saveUserToFirestore, loadUserData, saveUserData, savePickHistory, loadPickHistory, sendEmailVerification } from "./firebase.js";
+import { auth, onAuthStateChanged, signOut, saveUserToFirestore, loadUserData, saveUserData, savePickHistory, loadPickHistory, sendEmailVerification, loadHousePicks, saveHousePicks } from "./firebase.js";
 import { API_BASE, apiFetch } from "./lib/api.js";
 import { color as c, font, type, radius, shadow, space, scoreColor, grade, actionColor } from "./ui/tokens.js";
 
@@ -157,6 +157,28 @@ const CHAPTERS = [
   { label: "Style & experience", start: 7, end: 12 },
   { label: "Preferences", start: 13, end: 16 },
 ];
+
+// First-run onboarding is split: five ESSENTIALS get a new account to personalized picks fast,
+// the other twelve live behind an in-app, dismissible "sharpen your picks" card. The five are
+// the fields the prompts lean on hardest: the dossier's scoring-calibration block keys on
+// riskTolerance/horizon/goal, experience shapes tone and sizing caution, and name personalizes
+// every fit section. (budget also matters for sizing, but it's a money question — wrong for a
+// first impression; positionSizing degrades to percentage guidance until it's answered.)
+const ESSENTIAL_STEP_IDS = ["name", "riskTolerance", "horizon", "goal", "experience"];
+const ESSENTIAL_STEPS = STEPS.filter((s) => ESSENTIAL_STEP_IDS.includes(s.id));
+const REFINEMENT_STEPS = STEPS.filter((s) => !ESSENTIAL_STEP_IDS.includes(s.id));
+const ESSENTIAL_CHAPTERS = [{ label: "Essentials", start: 0, end: ESSENTIAL_STEPS.length - 1 }];
+// REFINEMENT_STEPS order (from STEPS): budget, philosophy, targetReturn, positionConviction,
+// activityLevel, drawdownReaction, incomeStability, emergencyFund, region, interests, avoid, intentions
+const REFINEMENT_CHAPTERS = [
+  { label: "Money & style", start: 0, end: 4 },
+  { label: "Risk reality", start: 5, end: 8 },
+  { label: "Preferences", start: 9, end: 11 },
+];
+// Completeness check for the refinement card: only the NON-optional refinement fields count —
+// interests/avoid/intentions are legitimately skippable, so existing complete profiles that
+// skipped them must NOT be nagged.
+const REFINE_CHECK_IDS = ["budget", "philosophy", "targetReturn", "positionConviction", "activityLevel", "drawdownReaction", "incomeStability", "emergencyFund", "region"];
 
 const DOSSIER_TABS = ["Fundamentals", "Technicals", "Risk", "News", "Catalysts", "Your fit"];
 // Display-only relabeling of the dossier tabs whose pillar was renamed. The VALUES stay
@@ -875,20 +897,105 @@ function fmtHistoryDate(iso) {
   return `${d.toLocaleDateString(undefined, { month: "short", day: "numeric" })} · ${d.toLocaleTimeString(undefined, { hour: "numeric", minute: "2-digit" })}`;
 }
 
+// Every field defaults — the essential-5 onboarding creates profiles with most refinement
+// fields missing, and a missing field must read as an explicit unknown, never the literal
+// string "undefined" leaking into a prompt.
 function profileText(p) {
+  const ns = "not specified";
+  const missingAny = ["budget", "philosophy", "targetReturn", "drawdownReaction", "incomeStability"].some((k) => p[k] == null);
   return [
-    `Name: ${p.name}`, `Risk tolerance: ${p.riskTolerance}`, `Time horizon: ${p.horizon}`,
-    `Investable budget: ${p.budget}`, `Primary goal: ${p.goal}`, `Investing style: ${p.philosophy || "n/a"}`,
-    `Target annual return: ${p.targetReturn || "n/a"}`, `Position conviction: ${p.positionConviction || "n/a"}`,
-    `Activity level: ${p.activityLevel || "n/a"}`, `Experience: ${p.experience}`,
-    `Reaction to a 20% drop: ${p.drawdownReaction}`, `Income stability: ${p.incomeStability}`,
-    `Emergency fund: ${p.emergencyFund || "n/a"}`, `Home-market preference: ${p.region || "No preference"}`,
+    `Name: ${p.name || "Investor"}`, `Risk tolerance: ${p.riskTolerance || ns}`, `Time horizon: ${p.horizon || ns}`,
+    `Investable budget: ${p.budget || ns}`, `Primary goal: ${p.goal || ns}`, `Investing style: ${p.philosophy || ns}`,
+    `Target annual return: ${p.targetReturn || ns}`, `Position conviction: ${p.positionConviction || ns}`,
+    `Activity level: ${p.activityLevel || ns}`, `Experience: ${p.experience || ns}`,
+    `Reaction to a 20% drop: ${p.drawdownReaction || ns}`, `Income stability: ${p.incomeStability || ns}`,
+    `Emergency fund: ${p.emergencyFund || ns}`, `Home-market preference: ${p.region || "No preference"}`,
     `Sectors of interest: ${(p.interests || []).join(", ") || "none"}`,
     `Industries to avoid: ${(p.avoid || []).join(", ") || "none"}`,
     p.intentions ? `In their own words: "${p.intentions}"` : "",
+    missingAny ? `(Fields marked "${ns}" are unknown — assume a typical middle-of-the-road investor for those and do NOT invent specifics about them.)` : "",
   ].filter(Boolean).join("\n");
 }
 function holdingsText(h) { return h && h.length ? h.map((x) => `${x.ticker}: ${x.shares} shares @ ${x.cost}${x.currency && x.currency !== "USD" ? ` ${x.currency}` : ""} avg cost`).join("\n") : "none"; }
+
+// The Discover scan's system prompt, shared verbatim by the in-app scan (discover()) and the
+// house-picks publisher (atlasPublishHousePicks) so the anonymous teaser's content is produced
+// by EXACTLY the same analyst framing as the real feature — only the profile differs.
+function discoverSystemPrompt({ profile, holdings, spareCash, spareCashCurrency, uni }) {
+  return `Today's date is ${currentDateStr()}. Treat this as the current date; set "asOf" to it and base every pick on the most recent data available as of now.
+
+You are a brutally honest equity research analyst — your own independent investment bank, not a mouthpiece for Wall Street consensus. Your only job is to find the BEST stocks for this specific investor RIGHT NOW, based on YOUR OWN read of the hard evidence (fundamentals, valuation, technicals, real factual news events) — not on analyst ratings, price-target chasing, or crowd sentiment. If a name is popular/hyped but the numbers don't back it, leave it out; if a name is out of favor but the numbers are genuinely strong, include it anyway. Use web_search to get current prices, valuations, and recent news. Return ONE JSON object only — no prose, no fences.
+
+INVESTOR PROFILE:
+${profileText(profile)}
+
+CURRENT HOLDINGS:
+${holdingsText(holdings)}
+
+SPARE CASH TO DEPLOY: ${spareCash && parseNum(spareCash) > 0 ? `${spareCashCurrency} ${spareCash}` : "not specified"}
+
+═══ TASK ═══
+Find the 6 best stock opportunities for this investor right now. Be decisive — use your training knowledge plus 1–2 targeted searches to verify current prices or recent catalysts.
+
+MARKET UNIVERSE — the investor chose "${uni}": ${UNIVERSE_RULES[uni] || UNIVERSE_RULES["Global all-markets"]}
+Skip tickers they already own. Non-US tickers must include exchange suffix (e.g. "SHEL.L", "9988.HK", "SAP.DE"). No OTC/pink sheets.
+
+Score each pick 0–100 (fitScore) honestly:
+- Loss-making, no path to profit: MAX 40
+- P/E >50x with decelerating growth: MAX 35
+- Speculative pick for Conservative investor: MAX 30
+- Most picks should land 55–78 — only truly exceptional opportunities above 80
+
+For each pick also give the four pillar sub-scores, 0–100, same framework as a full dossier (these should be consistent with fitScore, not random):
+- pillars.fundamentals: business quality — earnings, margins, growth, balance-sheet strength
+- pillars.valuation: cheapness vs peers and its own history (cheaper = higher score)
+- pillars.technicals: price trend and momentum (above 200d MA / uptrend = higher)
+- pillars.risk: safety (HIGHER = SAFER — low leverage, low volatility, wide moat score high; speculative/fragile names score low)
+And:
+- 2 tags describing the opportunity type
+- 2 snapshot metrics with current values
+- reason: specific NOW reason with real data point (e.g. 'Beat Q2 EPS by 18%, FCF up 35% YoY, trades at 12x vs sector 20x')
+- concern: single biggest real risk, honest and specific
+
+FORMAT RULES:
+- Output the JSON with the fields in exactly the order shown in the schema. The prose fields ('reason', 'concern') are deliberately the LAST two keys of each pick object and 'marketContext' is the LAST key of the root — write the numbers and short fields first, the prose last, and close each object right after its prose. Never close an object immediately after a prose field that still has fields after it.
+- Inside any string value, JSON-escape special characters: a double quote must be written \\" and a backslash \\\\, and never put a raw line break inside a string value. When quoting a term or phrase in prose, use single quotes instead ('beat-and-raise') — one raw unescaped " inside a string value breaks the entire document.
+
+Schema:
+{"asOf":"","picks":[{"ticker":"","company":"","sector":"","fitScore":0,"pillars":{"fundamentals":0,"valuation":0,"technicals":0,"risk":0},"tags":[""],"snapshot":[{"label":"","value":""}],"reason":"","concern":""}],"marketContext":"one sentence on current market conditions"}`;
+}
+
+// The neutral profile behind the anonymous teaser's house view. Every value is a REAL option
+// string from STEPS (so the prompt reads exactly like a genuine mid-spectrum user), and the
+// label the public sees is "balanced investor" — this is Atlas's house view of a neutral
+// profile, never a claim about aggregated users.
+const NEUTRAL_PROFILE = {
+  name: "Balanced Investor", riskTolerance: "Moderate", horizon: "Long", budget: "$10k – 50k",
+  goal: "Balanced growth", philosophy: "No strong style", targetReturn: "Solid (8–12%)",
+  positionConviction: "Balanced mix", activityLevel: "Check now and then", experience: "Some",
+  drawdownReaction: "Hold", incomeStability: "Stable", emergencyFund: "Yes, fully",
+  region: "No preference", interests: [], avoid: [],
+};
+
+// Owner console action: regenerate the anonymous teaser's cached house picks. Requires being
+// signed in (the AI relay demands a verified user) AND the owner-only write rule on
+// public_content/house_picks — anonymous visitors only ever READ the published result, so the
+// teaser has zero AI cost per visitor. Run `atlasPublishHousePicks()` from the app console.
+if (typeof window !== "undefined") {
+  window.atlasPublishHousePicks = async () => {
+    console.log("Running house-view scan (neutral balanced profile)…");
+    const sys = discoverSystemPrompt({ profile: NEUTRAL_PROFILE, holdings: [], spareCash: "", spareCashCurrency: "USD", uni: "Global all-markets" });
+    const parsed = await callClaude(sys, "Find the best stocks for me right now.", { maxTokens: 3600, maxSearches: 2, fast: true });
+    if (!Array.isArray(parsed.picks)) throw new Error("Scan came back without picks — try again.");
+    parsed.picks.sort((a, b) => (b.fitScore || 0) - (a.fitScore || 0));
+    const payload = { ...parsed, publishedAt: new Date().toISOString(), profileLabel: "balanced investor (house view)" };
+    const ok = await saveHousePicks(payload);
+    console.log(ok
+      ? `Published ${parsed.picks.length} house picks (as of ${payload.publishedAt}).`
+      : "Publish FAILED — check that the public_content/house_picks rules are deployed and you're signed in as the owner.");
+    return payload;
+  };
+}
 
 // ---------- stock logo (dark) ----------
 function StockLogo({ ticker, size = 32 }) {
@@ -913,12 +1020,12 @@ function StockLogo({ ticker, size = 32 }) {
 // ============================================================
 //  ONBOARDING — full-bleed, progress spine, one question at a time
 // ============================================================
-function Onboarding({ initial, onDone, onExit }) {
+function Onboarding({ initial, onDone, onExit, steps = STEPS, chapters = CHAPTERS }) {
   const [i, setI] = useState(0);
   const [profile, setProfile] = useState(initial || {});
-  const step = STEPS[i], last = i === STEPS.length - 1, total = STEPS.length;
+  const step = steps[i], last = i === steps.length - 1, total = steps.length;
   const isExisting = !!(initial && initial.name);
-  const chapterIdx = CHAPTERS.findIndex(ch => i >= ch.start && i <= ch.end);
+  const chapterIdx = chapters.findIndex(ch => i >= ch.start && i <= ch.end);
   function setVal(v) { setProfile((p) => ({ ...p, [step.id]: v })); }
   function next() { last ? onDone(profile) : setI(i + 1); }
   function choose(v) { const np = { ...profile, [step.id]: v }; setProfile(np); last ? onDone(np) : setI(i + 1); }
@@ -935,7 +1042,7 @@ function Onboarding({ initial, onDone, onExit }) {
             <AtlasMark size={30} /><span style={{ ...type.title, color: c.text }}>Atlas</span>
           </div>
           <div style={{ display: "flex", flexDirection: "column", gap: 4 }}>
-            {CHAPTERS.map((ch, ci) => {
+            {chapters.map((ch, ci) => {
               const active = ci === chapterIdx, done = ci < chapterIdx;
               return (
                 <div key={ch.label} style={{ display: "flex", alignItems: "center", gap: 12, padding: "10px 0" }}>
@@ -967,7 +1074,7 @@ function Onboarding({ initial, onDone, onExit }) {
               <motion.div key={step.id}
                 initial={{ opacity: 0, y: 12 }} animate={{ opacity: 1, y: 0 }} exit={{ opacity: 0, y: -8 }}
                 transition={{ duration: 0.25, ease: [0.16,1,0.3,1] }}>
-                <Overline color={c.accent} style={{ marginBottom: 14 }}>{CHAPTERS[chapterIdx]?.label}</Overline>
+                <Overline color={c.accent} style={{ marginBottom: 14 }}>{chapters[chapterIdx]?.label}</Overline>
                 <h2 style={{ ...type.displayL, color: c.text, margin: 0 }}>{step.title}</h2>
                 {step.sub && <p style={{ ...type.bodyL, color: c.text3, marginTop: 12, lineHeight: 1.55 }}>{step.sub}</p>}
 
@@ -1524,6 +1631,100 @@ function OpportunityCard({ pick, rank, onOpen, hero }) {
 }
 
 // ============================================================
+//  ANONYMOUS TEASER — Atlas's house view, before the auth wall
+// ============================================================
+// Shown to signed-out visitors INSTEAD of an immediate sign-in wall. Content is the cached
+// house-view scan published by the owner (public_content/house_picks) — anonymous visitors
+// only ever read that cache: zero AI calls, zero authed-route calls, zero marginal cost.
+// Regulatory framing is deliberate: this is "Atlas's current market view" for a NEUTRAL
+// balanced profile, labeled as such — never "top recommendations", never a claim about
+// aggregation across users. The educational disclaimer is on-screen, not behind a link.
+const TEASER_DISCLAIMER = "Atlas surfaces research ideas for educational purposes only — not investment advice. All scores and analysis are AI-generated from public data and may be incomplete or outdated. Always conduct independent due diligence before any transaction.";
+const TEASER_STALE_MS = 7 * 86400e3;
+function TeaserScreen({ onSignIn }) {
+  const [teaser, setTeaser] = useState({ status: "loading" });
+  useEffect(() => {
+    let cancelled = false;
+    loadHousePicks().then((data) => {
+      if (cancelled) return;
+      const ageMs = data?.publishedAt ? Date.now() - new Date(data.publishedAt).getTime() : Infinity;
+      const usable = Array.isArray(data?.picks) && data.picks.length >= 3 && ageMs < TEASER_STALE_MS;
+      // Empty, unreadable or >7-days-stale cache degrades to feature blurbs — never an error.
+      setTeaser(usable ? { status: "picks", data } : { status: "features" });
+    });
+    return () => { cancelled = true; };
+  }, []);
+
+  const CTA = (
+    <Card accentEdge pad={20} style={{ marginTop: 4 }}>
+      <div style={{ ...type.bodyStrong, color: c.text, marginBottom: 4 }}>These are Atlas's picks for a neutral, balanced profile.</div>
+      <div style={{ ...type.small, color: c.text2, lineHeight: 1.6, marginBottom: 14 }}>
+        Sign in and Atlas scores every stock to how YOU invest — your risk tolerance, horizon, goals and holdings — with full research dossiers, portfolio reviews and backtesting.
+      </div>
+      <Button glow onClick={onSignIn}>Sign in / Create account</Button>
+    </Card>
+  );
+
+  return (
+    <div style={{ minHeight: "100dvh", background: c.canvas, display: "flex", flexDirection: "column", alignItems: "center", padding: "0 16px 48px" }}>
+      <div style={{ width: "100%", maxWidth: 780 }}>
+        <div style={{ display: "flex", alignItems: "center", justifyContent: "space-between", padding: "20px 0 28px" }}>
+          <div style={{ display: "flex", alignItems: "center", gap: 10 }}><AtlasMark size={28} /><span style={{ ...type.title, color: c.text }}>Atlas</span></div>
+          <Button variant="secondary" size="sm" onClick={onSignIn}>Sign in</Button>
+        </div>
+
+        <Overline color={c.accent} style={{ marginBottom: 8 }}>Atlas's current market view</Overline>
+        <h1 style={{ ...type.displayL, color: c.text, margin: 0 }}>The market, read by your own research desk.</h1>
+        <p style={{ ...type.bodyL, color: c.text3, marginTop: 10, lineHeight: 1.55, marginBottom: 20 }}>
+          Educational analysis of how Atlas currently reads the market for a neutral, balanced investor profile — the house view, not a recommendation.
+        </p>
+
+        {teaser.status === "loading" && (
+          <Card><div style={{ display: "flex", alignItems: "center", gap: 12, padding: 8 }}><Spinner size={16} /><span style={{ ...type.overline, color: c.text3 }}>Loading the house view…</span></div></Card>
+        )}
+
+        {teaser.status === "picks" && (
+          <>
+            {teaser.data.marketContext && (
+              <Card accentEdge pad={14} style={{ borderLeftColor: c.warning, marginBottom: 12 }}>
+                <span style={{ ...type.small, color: c.text2, lineHeight: 1.5 }}><b style={{ color: c.text }}>Market context:</b> {teaser.data.marketContext}</span>
+              </Card>
+            )}
+            <div style={{ display: "flex", flexDirection: "column", gap: 12 }}>
+              {teaser.data.picks.slice(0, 4).map((p, i) => (
+                <OpportunityCard key={p.ticker || i} pick={p} rank={i + 1} onOpen={onSignIn} />
+              ))}
+            </div>
+            <div style={{ ...type.caption, color: c.text3, margin: "12px 2px 16px" }}>
+              House view as of {new Date(teaser.data.publishedAt).toLocaleDateString("en-US", { year: "numeric", month: "long", day: "numeric" })} · scored against a balanced investor profile, not yours.
+            </div>
+            {CTA}
+          </>
+        )}
+
+        {teaser.status === "features" && (
+          <>
+            <div style={{ display: "grid", gridTemplateColumns: "repeat(auto-fit, minmax(min(220px, 100%), 1fr))", gap: 12, marginBottom: 16 }}>
+              {[["Research dossiers", "A full, brutally honest AI dossier on any stock — fundamentals, momentum, safety, news and fit."],
+                ["Market scans", "Atlas scans global markets and scores every pick against how you actually invest."],
+                ["Backtesting", "Test strategies against real price history before risking a cent — including after-tax."]].map(([t, d]) => (
+                <Card key={t} pad={18}>
+                  <div style={{ ...type.bodyStrong, color: c.text, marginBottom: 6 }}>{t}</div>
+                  <div style={{ ...type.caption, color: c.text3, lineHeight: 1.55 }}>{d}</div>
+                </Card>
+              ))}
+            </div>
+            {CTA}
+          </>
+        )}
+
+        <p style={{ ...type.caption, color: c.text3, marginTop: 20, lineHeight: 1.6, borderTop: `1px solid ${c.hairline}`, paddingTop: 14 }}>{TEASER_DISCLAIMER}</p>
+      </div>
+    </div>
+  );
+}
+
+// ============================================================
 //  PORTFOLIO — holding row
 // ============================================================
 function ExposureBar({ segments }) {
@@ -1917,6 +2118,11 @@ export default function VerdictApp() {
   // preferences that sync across devices — unlike the backtester's ticker/strategy/params,
   // which are per-session working state and deliberately reset each visit.
   const [taxPrefs, setTaxPrefs] = useState(TAX_PREFS_DEFAULT);
+  // Signed-out flow: false = anonymous teaser, true = the AuthScreen (via the teaser's CTA).
+  const [showAuth, setShowAuth] = useState(false);
+  // Full-screen refinement pass (the 12 non-essential onboarding questions), opened from the
+  // dismissible "sharpen your picks" card on Today.
+  const [refineOpen, setRefineOpen] = useState(false);
 
   // Email-verification gate. The AI relay (api/messages.js) refuses unverified email accounts
   // server-side; phone-auth accounts (OTP already proved possession) and Google/Apple sign-ins
@@ -2009,7 +2215,10 @@ export default function VerdictApp() {
 
   // FX rates: retry with backoff on failure (a single silent failure used to leave multi-currency
   // portfolios stuck at "—" for the whole session) and refresh every few hours for long sessions.
+  // Gated on sign-in: /api/fx requires auth, and the anonymous teaser must make ZERO calls to
+  // authed routes (previously this fired 401s + retries for every signed-out visitor).
   useEffect(() => {
+    if (!!import.meta.env.VITE_FIREBASE_API_KEY && !firebaseUser) return;
     let cancelled = false, timer;
     const loadFx = async (attempt = 0) => {
       try {
@@ -2024,7 +2233,7 @@ export default function VerdictApp() {
     loadFx();
     const refresh = setInterval(() => loadFx(), 6 * 3600 * 1000);
     return () => { cancelled = true; clearTimeout(timer); clearInterval(refresh); };
-  }, []);
+  }, [firebaseUser]);
 
   // ---- cross-device sync ----
   // On sign-in, the cloud copy is the durable one: hydrate from it when it exists, otherwise
@@ -2253,6 +2462,16 @@ export default function VerdictApp() {
     commitOnboarding(p);
   }
   function saveProfile(p) { setProfile(p); kvSet("atlas_profile", p); cloudSave({ profile: p }); setShowProfileEditor(false); setRecs(null); setReview(null); }
+  // Light profile patch — persists + syncs WITHOUT resetting picks/review (saveProfile nukes
+  // both to force a re-scan; dismissing the refinement card must not cost the user their scan).
+  function updateProfileFields(partial) {
+    const next = { ...profile, ...partial };
+    setProfile(next); kvSet("atlas_profile", next); cloudSave({ profile: next });
+  }
+  // The refinement card shows while any non-optional refinement field is missing and the user
+  // hasn't dismissed it. Both the answers and the dismissal live IN the profile, so the state
+  // syncs across devices and existing complete profiles never see the card.
+  const needsRefinement = !!profile?.name && !profile.refineDismissed && REFINE_CHECK_IDS.some((k) => profile[k] == null);
   function updateSpareCash(v, currency) {
     setSpareCash(v); kvSet("atlas_spare_cash", v);
     // Tag the amount with whatever currency it's actually in — same pattern as a holding's own currency —
@@ -2455,7 +2674,7 @@ REQUIRED OUTPUT — all sections mandatory, all data from live searches:
 7. FIT FOR ${profile.name}:
    - score: 0–100 (how well this stock fits THIS investor's profile AND portfolio)
    - action: what ${profile.name} should specifically do: "Buy X shares", "Avoid — here's why", "Hold your X shares", etc.
-   - positionSizing: specific guidance grounded in budget "${profile.budget}" — e.g. "No more than 5% of portfolio, roughly $X"
+   - positionSizing: specific guidance grounded in budget "${profile.budget || "not specified — use percentages of portfolio, not dollar amounts"}" — e.g. "No more than 5% of portfolio, roughly $X"
    - watchouts: exactly 3 watchouts written specifically for ${profile.name}'s situation
    - summary: 3 sentences — address ${profile.name} by name, reference their specific risk tolerance, horizon, goal, AND how this fits or conflicts with their existing holdings (the FINAL field of "fit" — write it last, then close the object)
 
@@ -2557,47 +2776,8 @@ FULL JSON SCHEMA:
     const uni = typeof universeArg === "string" ? universeArg : universe;
     const seq = ++discoverSeq.current;
     setRecsLoading(true); setRecsError(null); setRecs(null);
-    const sys = `Today's date is ${currentDateStr()}. Treat this as the current date; set "asOf" to it and base every pick on the most recent data available as of now.
-
-You are a brutally honest equity research analyst — your own independent investment bank, not a mouthpiece for Wall Street consensus. Your only job is to find the BEST stocks for this specific investor RIGHT NOW, based on YOUR OWN read of the hard evidence (fundamentals, valuation, technicals, real factual news events) — not on analyst ratings, price-target chasing, or crowd sentiment. If a name is popular/hyped but the numbers don't back it, leave it out; if a name is out of favor but the numbers are genuinely strong, include it anyway. Use web_search to get current prices, valuations, and recent news. Return ONE JSON object only — no prose, no fences.
-
-INVESTOR PROFILE:
-${profileText(profile)}
-
-CURRENT HOLDINGS:
-${holdingsText(holdings)}
-
-SPARE CASH TO DEPLOY: ${spareCash && parseNum(spareCash) > 0 ? `${spareCashCurrency} ${spareCash}` : "not specified"}
-
-═══ TASK ═══
-Find the 6 best stock opportunities for this investor right now. Be decisive — use your training knowledge plus 1–2 targeted searches to verify current prices or recent catalysts.
-
-MARKET UNIVERSE — the investor chose "${uni}": ${UNIVERSE_RULES[uni] || UNIVERSE_RULES["Global all-markets"]}
-Skip tickers they already own. Non-US tickers must include exchange suffix (e.g. "SHEL.L", "9988.HK", "SAP.DE"). No OTC/pink sheets.
-
-Score each pick 0–100 (fitScore) honestly:
-- Loss-making, no path to profit: MAX 40
-- P/E >50x with decelerating growth: MAX 35
-- Speculative pick for Conservative investor: MAX 30
-- Most picks should land 55–78 — only truly exceptional opportunities above 80
-
-For each pick also give the four pillar sub-scores, 0–100, same framework as a full dossier (these should be consistent with fitScore, not random):
-- pillars.fundamentals: business quality — earnings, margins, growth, balance-sheet strength
-- pillars.valuation: cheapness vs peers and its own history (cheaper = higher score)
-- pillars.technicals: price trend and momentum (above 200d MA / uptrend = higher)
-- pillars.risk: safety (HIGHER = SAFER — low leverage, low volatility, wide moat score high; speculative/fragile names score low)
-And:
-- 2 tags describing the opportunity type
-- 2 snapshot metrics with current values
-- reason: specific NOW reason with real data point (e.g. 'Beat Q2 EPS by 18%, FCF up 35% YoY, trades at 12x vs sector 20x')
-- concern: single biggest real risk, honest and specific
-
-FORMAT RULES:
-- Output the JSON with the fields in exactly the order shown in the schema. The prose fields ('reason', 'concern') are deliberately the LAST two keys of each pick object and 'marketContext' is the LAST key of the root — write the numbers and short fields first, the prose last, and close each object right after its prose. Never close an object immediately after a prose field that still has fields after it.
-- Inside any string value, JSON-escape special characters: a double quote must be written \\" and a backslash \\\\, and never put a raw line break inside a string value. When quoting a term or phrase in prose, use single quotes instead ('beat-and-raise') — one raw unescaped " inside a string value breaks the entire document.
-
-Schema:
-{"asOf":"","picks":[{"ticker":"","company":"","sector":"","fitScore":0,"pillars":{"fundamentals":0,"valuation":0,"technicals":0,"risk":0},"tags":[""],"snapshot":[{"label":"","value":""}],"reason":"","concern":""}],"marketContext":"one sentence on current market conditions"}`;
+    // Prompt shared with the house-picks publisher — see discoverSystemPrompt.
+    const sys = discoverSystemPrompt({ profile, holdings, spareCash, spareCashCurrency, uni });
     try {
       // 3600 (was 2800): the per-pick pillars object added ~4 numbers + wrapper keys × 6 picks of
       // required output, and with adaptive thinking eating into a shared budget, first-attempt
@@ -2958,7 +3138,24 @@ Schema:
     <AtlasMotionProvider><AtlasStyles /><div style={{ background: c.canvas, minHeight: "100vh", display: "flex", alignItems: "center", justifyContent: "center", gap: 12 }}><Spinner size={20} /><span style={{ ...type.overline, color: c.text3 }}>Loading</span></div></AtlasMotionProvider>
   );
   const firebaseConfigured = !!import.meta.env.VITE_FIREBASE_API_KEY;
-  if (firebaseConfigured && !firebaseUser) return <AtlasMotionProvider><AtlasStyles /><AuthScreen onAuth={(u) => setFirebaseUser(u)} /></AtlasMotionProvider>;
+  // Signed-out visitors get the anonymous teaser first — value before the auth wall. The CTA
+  // flips to the unchanged AuthScreen. Signed-in users can never reach this branch (firebaseUser
+  // set), so the boot flow behind it — cloud-resolution gate included — is untouched.
+  if (firebaseConfigured && !firebaseUser) return (
+    <AtlasMotionProvider><AtlasStyles />
+      {showAuth ? (
+        <>
+          <AuthScreen onAuth={(u) => setFirebaseUser(u)} />
+          <button onClick={() => setShowAuth(false)} className="atlas-btn"
+            style={{ position: "fixed", top: 18, left: 18, background: "none", border: "none", cursor: "pointer", ...type.small, color: c.text3, padding: 6 }}>
+            ← Back
+          </button>
+        </>
+      ) : (
+        <TeaserScreen onSignIn={() => setShowAuth(true)} />
+      )}
+    </AtlasMotionProvider>
+  );
 
   // Cloud-resolution gate: on a signed-in device with NO local profile, the onboarding-vs-app
   // decision must wait for a DEFINITIVE cloud outcome (done → hydrated or genuinely empty).
@@ -2990,7 +3187,7 @@ Schema:
 
   if (phase === "onboarding") return (
     <AtlasMotionProvider><AtlasStyles />
-      <Onboarding initial={profile} onDone={finishOnboarding} onExit={profile?.name ? () => setPhase("app") : null} />
+      <Onboarding steps={ESSENTIAL_STEPS} chapters={ESSENTIAL_CHAPTERS} initial={profile} onDone={finishOnboarding} onExit={profile?.name ? () => setPhase("app") : null} />
       {/* Fix-2 confirm: a cloud profile exists that this session never loaded (another device
           wrote it) and the user just finished onboarding anyway. Keep = hydrate the cloud
           version via a fresh sync (the gate above shows "Restoring…" while it runs); Replace =
@@ -3010,6 +3207,17 @@ Schema:
           </div>
         </div>
       </Modal>
+    </AtlasMotionProvider>
+  );
+
+  // Refinement pass: the 12 non-essential onboarding questions, opened from the dismissible
+  // "sharpen your picks" card. Saves through saveProfile so completing it forces a re-scan
+  // (that's the promised payoff) and syncs like any profile change.
+  if (refineOpen) return (
+    <AtlasMotionProvider><AtlasStyles />
+      <Onboarding steps={REFINEMENT_STEPS} chapters={REFINEMENT_CHAPTERS} initial={profile}
+        onDone={(p) => { setRefineOpen(false); saveProfile({ ...profile, ...p }); }}
+        onExit={() => setRefineOpen(false)} />
     </AtlasMotionProvider>
   );
 
@@ -3063,6 +3271,25 @@ Schema:
         <Overline color={c.accent} style={{ marginBottom: 8 }}>Good to see you, {profile?.name || "Investor"}</Overline>
         <h1 style={{ ...type.displayL, color: c.text, margin: 0 }}>Your market, at a glance.</h1>
       </motion.div>
+
+      {/* Refinement nudge — non-blocking, dismissible, gone forever once answered or dismissed
+          (both states live in the synced profile, so this respects the choice across devices). */}
+      {needsRefinement && (
+        <motion.div variants={{ initial: { opacity: 0, y: 10 }, animate: { opacity: 1, y: 0 } }}>
+          <Card accentEdge pad={16} style={{ display: "flex", alignItems: "center", gap: 14, flexWrap: "wrap" }}>
+            <div style={{ flex: "1 1 260px", minWidth: 0 }}>
+              <div style={{ ...type.bodyStrong, color: c.text, marginBottom: 3 }}>Sharpen your picks</div>
+              <div style={{ ...type.caption, color: c.text3, lineHeight: 1.5 }}>
+                Atlas is scoring on your 5 essentials. Answer {REFINEMENT_STEPS.length} more quick questions — budget, style, risk reality — and every score gets sharper.
+              </div>
+            </div>
+            <div style={{ display: "flex", gap: 8, alignItems: "center", flexShrink: 0 }}>
+              <Button size="sm" glow onClick={() => setRefineOpen(true)}>Continue setup</Button>
+              <IconButton label="Dismiss" size={28} onClick={() => updateProfileFields({ refineDismissed: true })}><CloseIcon /></IconButton>
+            </div>
+          </Card>
+        </motion.div>
+      )}
 
       {/* portfolio strip */}
       <motion.div variants={{ initial: { opacity: 0, y: 10 }, animate: { opacity: 1, y: 0 } }}>
