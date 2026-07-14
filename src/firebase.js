@@ -56,6 +56,18 @@ export async function saveUserToFirestore(user) {
 // failure on a fresh phone masquerade as "no profile exists" and railroad a real user into
 // re-onboarding over their cloud profile. getDoc has no timeout of its own, so a hung
 // connection is turned into an error rather than an indefinite wait.
+// Per-tab flight recorder for cloud reads (sessionStorage, last 10 entries, booleans only).
+// The profile-loss incident took three debugging rounds because the boot read's outcome was
+// unobservable after the fact — this makes every loadUserData call auditable post-hoc:
+// read sessionStorage.atlas_sync_trace (or run atlasDebugCloudDoc()).
+function noteSyncTrace(entry) {
+  try {
+    const arr = JSON.parse(sessionStorage.getItem("atlas_sync_trace") || "[]");
+    arr.push({ at: new Date().toISOString(), ...entry });
+    sessionStorage.setItem("atlas_sync_trace", JSON.stringify(arr.slice(-10)));
+  } catch {}
+}
+
 export async function loadUserData(uid) {
   if (!db || !uid) return { ok: false };
   // Test hook, dev-only (vite dead-code-eliminates this in prod builds): with
@@ -78,22 +90,27 @@ export async function loadUserData(uid) {
     if (simulateStale) window.__staleCacheServed = true;
     const fromCache = simulateStale ? true : snap.metadata.fromCache;
     const data = simulateStale ? null : (snap.exists() ? snap.data() : null);
-    // A CACHE-served answer must never be allowed to conclude "no profile exists" — that
+    // A profile-less answer must NEVER be concluded without a server round-trip — that
     // conclusion routes users into onboarding (and finishOnboarding's guard into a silent
-    // save), which is destructive-adjacent. Observed live 2026-07-13: a tab whose SDK cache
-    // held the doc from a no-profile window kept boot-reading "no profile" while the server
-    // had the restored profile the whole time. Cached data that DOES contain a profile is
-    // safe to hydrate from immediately (stale-but-real; keeps boot fast), so only the
-    // empty/no-profile conclusion escalates to a server-confirmed read. If the server can't
-    // be reached, this throws into the catch → {ok:false} → the caller's retry/error path,
-    // never a false "genuinely empty".
-    if (!data?.profile?.name && fromCache) {
+    // save), which is destructive-adjacent. Snapshot metadata is NOT a reliable guard here:
+    // caught live 2026-07-14, the boot getDoc raced the concurrent saveUserToFirestore
+    // identity merge-write and latency compensation served the local overlay — identity
+    // fields only, NO profile — with fromCache:false and hasPendingWrites:true. So the
+    // escalation is unconditional on !profile: getDocFromServer bypasses the local overlay
+    // and returns server truth. Costs one extra round-trip ONLY for genuinely-new accounts.
+    // A profile-bearing answer needs no escalation — stale-but-real is safe to hydrate.
+    // If the server can't be reached, raced() throws into the catch → {ok:false} → the
+    // caller's retry/error path, never a false "genuinely empty".
+    if (!data?.profile?.name) {
       const server = await raced(getDocFromServer(doc(db, "users", uid)));
+      noteSyncTrace({ exists: snap.exists(), fromCache: snap.metadata.fromCache, pendingWrites: snap.metadata.hasPendingWrites, hasProfile: !!data?.profile?.name, escalated: true, serverExists: server.exists(), serverHasProfile: !!server.data()?.profile?.name });
       return { ok: true, data: server.exists() ? server.data() : null, fromCache: false };
     }
+    noteSyncTrace({ exists: snap.exists(), fromCache: snap.metadata.fromCache, pendingWrites: snap.metadata.hasPendingWrites, hasProfile: true, escalated: false });
     return { ok: true, data, fromCache };
   } catch (e) {
     console.error("Failed to load cloud data:", e);
+    noteSyncTrace({ error: String(e).slice(0, 80) });
     return { ok: false };
   }
 }
