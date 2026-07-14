@@ -918,6 +918,19 @@ function profileText(p) {
 }
 function holdingsText(h) { return h && h.length ? h.map((x) => `${x.ticker}: ${x.shares} shares @ ${x.cost}${x.currency && x.currency !== "USD" ? ` ${x.currency}` : ""} avg cost`).join("\n") : "none"; }
 
+// Each universe option maps to a hard constraint injected into the scan prompt — the segmented
+// control genuinely changes which markets get considered, not just the label on screen.
+// MODULE scope on purpose: discoverSystemPrompt below references it, and it previously living
+// inside the component shipped a call-time ReferenceError that broke every real scan while the
+// build stayed green (bundlers don't check bare identifiers — see the lint step in package.json).
+const UNIVERSE_RULES = {
+  "Global all-markets": "Consider every publicly listed equity worldwide.",
+  "US markets": "HARD FILTER: only stocks listed on US exchanges (NYSE, NASDAQ, AMEX) — plain US tickers with no exchange suffix. A US-listed ADR of a foreign company is acceptable; a foreign home-market listing is not.",
+  "Europe": "HARD FILTER: only stocks whose primary listing is on a European exchange (LSE, Euronext, XETRA, Borsa Italiana, SIX, Nordic exchanges, etc.). Every ticker MUST carry its Yahoo exchange suffix (e.g. \"SHEL.L\", \"SAP.DE\", \"ASML.AS\").",
+  "Asia-Pacific": "HARD FILTER: only stocks whose primary listing is in the Asia-Pacific region (Tokyo, Hong Kong, mainland China, Korea, Taiwan, Singapore, India, Australia, New Zealand). Every ticker MUST carry its Yahoo exchange suffix (e.g. \"9988.HK\", \"7203.T\", \"005930.KS\").",
+  "My interest sectors": "HARD FILTER: only stocks in the investor's stated sectors of interest from the profile above (if none are listed, treat as all sectors). Any market worldwide is fine.",
+};
+
 // The Discover scan's system prompt, shared verbatim by the in-app scan (discover()) and the
 // house-picks publisher (atlasPublishHousePicks) so the anonymous teaser's content is produced
 // by EXACTLY the same analyst framing as the real feature — only the profile differs.
@@ -976,6 +989,13 @@ const NEUTRAL_PROFILE = {
   drawdownReaction: "Hold", incomeStability: "Stable", emergencyFund: "Yes, fully",
   region: "No preference", interests: [], avoid: [],
 };
+
+// Dev smoke (dead-code-eliminated in prod): build the shared prompt once at module load so a
+// scope regression in discoverSystemPrompt throws on the first dev boot instead of at scan
+// time in prod — the UNIVERSE_RULES extraction bug shipped exactly that way.
+if (import.meta.env.DEV) {
+  discoverSystemPrompt({ profile: NEUTRAL_PROFILE, holdings: [], spareCash: "", spareCashCurrency: "USD", uni: "Global all-markets" });
+}
 
 // Owner console action: regenerate the anonymous teaser's cached house picks. Requires being
 // signed in (the AI relay demands a verified user) AND the owner-only write rule on
@@ -2761,15 +2781,6 @@ FULL JSON SCHEMA:
   }
 
   // ---- discovery ----
-  // Each option maps to a hard constraint injected into the scan prompt — the segmented
-  // control genuinely changes which markets get considered, not just the label on screen.
-  const UNIVERSE_RULES = {
-    "Global all-markets": "Consider every publicly listed equity worldwide.",
-    "US markets": "HARD FILTER: only stocks listed on US exchanges (NYSE, NASDAQ, AMEX) — plain US tickers with no exchange suffix. A US-listed ADR of a foreign company is acceptable; a foreign home-market listing is not.",
-    "Europe": "HARD FILTER: only stocks whose primary listing is on a European exchange (LSE, Euronext, XETRA, Borsa Italiana, SIX, Nordic exchanges, etc.). Every ticker MUST carry its Yahoo exchange suffix (e.g. \"SHEL.L\", \"SAP.DE\", \"ASML.AS\").",
-    "Asia-Pacific": "HARD FILTER: only stocks whose primary listing is in the Asia-Pacific region (Tokyo, Hong Kong, mainland China, Korea, Taiwan, Singapore, India, Australia, New Zealand). Every ticker MUST carry its Yahoo exchange suffix (e.g. \"9988.HK\", \"7203.T\", \"005930.KS\").",
-    "My interest sectors": "HARD FILTER: only stocks in the investor's stated sectors of interest from the profile above (if none are listed, treat as all sectors). Any market worldwide is fine.",
-  };
   async function discover(universeArg) {
     // Don't hard-bail when a scan is already running: switching the universe mid-scan must be able
     // to supersede it, or the old universe's picks land under the newly-selected filter label.
