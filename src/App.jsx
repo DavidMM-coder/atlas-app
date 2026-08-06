@@ -2958,9 +2958,13 @@ Order the items array most-important first. Return ONLY this JSON:
         return `${h.ticker}: ${h.shares} shares @ ${costLabel} avg cost · current price unavailable`;
       }).join("\n");
 
-      const sys = `Today's date is ${currentDateStr()}. Treat this as the current date for all recency, prices and news.
+      // Cached market headlines as recency context — already fetched by the Today screen, costs a
+      // few hundred tokens instead of a live search.
+      const newsCtx = (marketNews?.items || []).slice(0, 5).map((n) => `- ${n.headline} (${n.source}, ${n.date || "recent"})`).join("\n");
 
-You are a portfolio analyst giving brutally honest, hands-on advice — your own independent call on each position, not a summary of what other analysts or the market mood currently think. Base every action and score strictly on the hard facts: this investor's cost basis, the live price, each holding's own real computed trailing performance (CAGR/drawdown/volatility, from Atlas's backtest engine — provided below), the underlying business's real fundamentals/trajectory, and factual recent news — never on analyst ratings or crowd sentiment. Current prices and performance stats are already provided below — do NOT search for prices, they are live and accurate. Return ONE JSON object only.
+      const sys = `Today's date is ${currentDateStr()}. Treat this as the current date for all recency and prices.
+
+You are a portfolio analyst giving brutally honest, hands-on advice — your own independent call on each position, not a summary of what other analysts or the market mood currently think. Base every action and score strictly on the hard facts: this investor's cost basis, the live price, each holding's own real computed trailing performance (CAGR/drawdown/volatility, from Atlas's backtest engine — provided below), and the underlying business's fundamentals and trajectory as you know them. You do NOT have web search: current prices and performance stats are already provided and are live and accurate — never contradict them. For company developments, rely on your training knowledge plus the market headlines below; do NOT invent specific recent events, figures or dates you are not confident of. Never lean on analyst ratings or crowd sentiment. Return ONE JSON object only.
 
 INVESTOR PROFILE:
 ${profileText(profile)}
@@ -2969,21 +2973,25 @@ CURRENT HOLDINGS with live prices:
 ${holdingsWithPrices}
 
 SPARE CASH AVAILABLE TO DEPLOY: ${spareCash && parseNum(spareCash) > 0 ? `${spareCashCurrency} ${spareCash}` : "not specified"}
-
-For EACH holding decide ONE action: "Buy More","Hold","Trim","Sell" — exactly these four, nothing else (no "Add", no synonyms; "Buy More" already means increase this position). Use the exact currentPrice provided. Give scoreForYou 0–100 and one-sentence rationale referencing their cost basis and profile.
+${newsCtx ? `\nRECENT MARKET HEADLINES (already fetched — context only):\n${newsCtx}\n` : ""}
+For EACH holding decide ONE action: "Buy More","Hold","Trim","Sell" — exactly these four, nothing else (no "Add", no synonyms; "Buy More" already means increase this position). Give scoreForYou 0–100 and one-sentence rationale referencing their cost basis and profile.
 
 For the portfolio summary, if spare cash is specified give SPECIFIC deployment advice. Be concrete, not vague.
 
 Schema:
-{"asOf":"","holdings":[{"ticker":"","company":"","currentPrice":"","action":"","rationale":"","scoreForYou":0}],"portfolio":{"summary":"","concentration":"","cashAdvice":"","suggestions":[""]}}`;
+{"holdings":[{"ticker":"","action":"","scoreForYou":0,"rationale":""}],"portfolio":{"summary":"","concentration":"","cashAdvice":"","suggestions":[""]}}`;
 
-      // Scale the budget to the actual portfolio size — a fixed 2500 was plenty for a handful of
-      // holdings but silently truncated once someone had a dozen-plus positions, each needing its own
-      // ticker/action/rationale/score line plus the portfolio-level summary. Same prompt, same search
-      // depth — just enough room to finish writing the answer instead of getting cut off mid-JSON.
-      const reviewMaxTokens = Math.max(3200, holdings.length * 280 + 1200);
-      const parsed = await callClaude(sys, "Review my portfolio.", { maxTokens: reviewMaxTokens, maxSearches: 2 });
-      if (!parsed.holdings) throw new Error("Couldn't analyze the portfolio. Try again.");
+      // Measured 2026-07-15 (17 holdings, prod): the old search-enabled full-thinking call took
+      // 141s, injected 62k input tokens of search results, and thinking ate the whole output
+      // budget → truncation → a 255s retry with 213k input tokens. Total ~400s and ~275k input
+      // tokens for ONE review. The fix: callClaudeAnalyze (no tools, thinking off — the dossier's
+      // proven path), live data fed in as before, cached headlines instead of a live search, and
+      // a schema trimmed to exactly what the UI renders (currentPrice is overwritten client-side
+      // and company/asOf were never rendered). Budget scales with portfolio size; the truncation
+      // retry inside callClaudeAnalyze stays as backstop.
+      const reviewMaxTokens = Math.max(2200, holdings.length * 150 + 1000);
+      const parsed = await callClaudeAnalyze(sys, "Review my portfolio.", { maxTokens: reviewMaxTokens });
+      if (!parsed?.holdings) throw new Error("Couldn't analyze the portfolio. Try again.");
       const enriched = { ...parsed, holdings: parsed.holdings.map((h) => {
         const p = priceMap[(h.ticker || "").toUpperCase()];
         if (p?.price != null) return { ...h, currentPrice: String(p.price.toFixed(2)) };
