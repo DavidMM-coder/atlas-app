@@ -2470,14 +2470,16 @@ export default function VerdictApp() {
     // Overwrite guard: if this session never hydrated a cloud profile but one EXISTS (written
     // by another device), don't silently replace it — a transient first-read failure once
     // railroaded a real user through re-onboarding and permanently destroyed their original
-    // profile this way. Re-check and ask. If this guard's own read fails, proceed with the
-    // save: never block onboarding completion on a second flaky read (worst case equals the
-    // old behavior).
+    // profile this way. Re-check and ask. If the guard's own read FAILS, ask too ("save
+    // anyway / retry the check") instead of silently saving: the original fail-open default
+    // meant one flaky read turned a re-onboarding into a silent profile overwrite — observed
+    // contributing to the 2026-08-06 cloud-doc overwrite. Only a server-confirmed
+    // "no profile exists" commits without asking.
     if (firebaseUser && !hydratedCloudProfile.current) {
-      try {
-        const res = await loadUserData(firebaseUser.uid);
-        if (res.ok && res.data?.profile?.name) { setPendingOnboardProfile(p); return; }
-      } catch {}
+      let res = null;
+      try { res = await loadUserData(firebaseUser.uid); } catch { res = null; }
+      if (res?.ok && res.data?.profile?.name) { setPendingOnboardProfile({ answers: p, cloudProfileExists: true }); return; }
+      if (!res?.ok) { setPendingOnboardProfile({ answers: p, cloudProfileExists: false }); return; }
     }
     commitOnboarding(p);
   }
@@ -3212,19 +3214,38 @@ Schema:
           version via a fresh sync (the gate above shows "Restoring…" while it runs); Replace =
           commit the answers they just gave. Closing the dialog returns to onboarding intact. */}
       <Modal open={!!pendingOnboardProfile} onClose={() => setPendingOnboardProfile(null)} width={440}>
-        <div style={{ display: "flex", flexDirection: "column", gap: 14 }}>
-          <div>
-            <Overline color={c.warning} style={{ marginBottom: 6 }}>Profile already exists</Overline>
-            <div style={{ ...type.bodyStrong, color: c.text, marginBottom: 6 }}>This account already has an investor profile</div>
-            <div style={{ ...type.small, color: c.text2, lineHeight: 1.6 }}>
-              It was created on another device. Keep that one, or replace it with the answers you just gave? Replacing updates it on all your devices.
+        {pendingOnboardProfile?.cloudProfileExists ? (
+          <div style={{ display: "flex", flexDirection: "column", gap: 14 }}>
+            <div>
+              <Overline color={c.warning} style={{ marginBottom: 6 }}>Profile already exists</Overline>
+              <div style={{ ...type.bodyStrong, color: c.text, marginBottom: 6 }}>This account already has an investor profile</div>
+              <div style={{ ...type.small, color: c.text2, lineHeight: 1.6 }}>
+                It was created on another device. Keep that one, or replace it with the answers you just gave? Replacing updates it on all your devices.
+              </div>
+            </div>
+            <div style={{ display: "flex", gap: 10, justifyContent: "flex-end", flexWrap: "wrap" }}>
+              <Button variant="secondary" onClick={() => { const a = pendingOnboardProfile.answers; setPendingOnboardProfile(null); commitOnboarding(a); }}>Replace with my new answers</Button>
+              <Button glow onClick={() => { setPendingOnboardProfile(null); runCloudSync(firebaseUser); }}>Keep existing profile</Button>
             </div>
           </div>
-          <div style={{ display: "flex", gap: 10, justifyContent: "flex-end", flexWrap: "wrap" }}>
-            <Button variant="secondary" onClick={() => { const p = pendingOnboardProfile; setPendingOnboardProfile(null); commitOnboarding(p); }}>Replace with my new answers</Button>
-            <Button glow onClick={() => { setPendingOnboardProfile(null); runCloudSync(firebaseUser); }}>Keep existing profile</Button>
+        ) : (
+          // Fail-ASK variant: the guard's cloud check FAILED, so whether a profile exists on
+          // another device is unknown. Saving blind here is how a profile overwrite once
+          // happened — make the risk explicit and let the user choose.
+          <div style={{ display: "flex", flexDirection: "column", gap: 14 }}>
+            <div>
+              <Overline color={c.warning} style={{ marginBottom: 6 }}>Couldn't check your account</Overline>
+              <div style={{ ...type.bodyStrong, color: c.text, marginBottom: 6 }}>Atlas couldn't reach the cloud to check for an existing profile</div>
+              <div style={{ ...type.small, color: c.text2, lineHeight: 1.6 }}>
+                If this account already has a profile from another device, saving now would replace it there too. Retry the check, or save anyway if you're sure.
+              </div>
+            </div>
+            <div style={{ display: "flex", gap: 10, justifyContent: "flex-end", flexWrap: "wrap" }}>
+              <Button variant="secondary" onClick={() => { const a = pendingOnboardProfile.answers; setPendingOnboardProfile(null); commitOnboarding(a); }}>Save anyway</Button>
+              <Button glow onClick={() => { const a = pendingOnboardProfile.answers; setPendingOnboardProfile(null); finishOnboarding(a); }}>Retry check</Button>
+            </div>
           </div>
-        </div>
+        )}
       </Modal>
     </AtlasMotionProvider>
   );
