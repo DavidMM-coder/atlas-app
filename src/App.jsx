@@ -600,6 +600,74 @@ function computeImportRows(headers, rawRows, mapping, nameMap = {}) {
   return rows;
 }
 
+// ---------- spreadsheet import: live ticker resolution ----------
+// Format validity ≠ existence, and model knowledge ≠ current listings (real case: bare "STLN",
+// The Oncology Institute's post-re-ticker symbol, was nulled by the AI verify pass while
+// Yahoo quoted it fine). The chain below is the authority: live quote → suffix/root variants →
+// symbol search → name search → only then "unresolved", which the UI makes fixable inline.
+async function validateTickerLive(ticker) {
+  try {
+    const r = await apiFetch(`/api/history?ticker=${encodeURIComponent(ticker)}&range=5d&interval=1d`);
+    if (!r.ok) return null;
+    const d = await r.json();
+    if (d.prices?.length) return { ticker: (d.ticker || ticker).toUpperCase(), name: d.name || "", currency: d.currency || null };
+  } catch {}
+  return null;
+}
+async function lookupSymbol(q) {
+  try {
+    const r = await apiFetch(`/api/lookup?q=${encodeURIComponent(q)}`);
+    if (!r.ok) return [];
+    return (await r.json()).quotes || [];
+  } catch { return []; }
+}
+const normCompanyName = (s) => String(s || "").toLowerCase().replace(/\b(inc|corp|corporation|plc|ltd|limited|holding|holdings|group|sa|se|nv|ag|co)\b/g, "").replace(/[^a-z0-9]/g, "");
+const tickerRoot = (t) => String(t || "").toUpperCase().replace(/\.[A-Z0-9]{1,4}$/, "");
+// Resolution chain for one preview row. Conservative on purpose: search results are adopted
+// only on an exact symbol match or a single unambiguous candidate — never a fuzzy guess.
+async function resolveImportTicker(row) {
+  const tried = new Set();
+  const tryQuote = async (t) => {
+    if (!t || tried.has(t) || !looksLikeTicker(t)) return null;
+    tried.add(t);
+    return await validateTickerLive(t);
+  };
+  // 1) the ticker as computed (bare, or already carrying the mapped exchange suffix)
+  if (row.ticker && (await tryQuote(row.ticker))) return { ticker: row.ticker, status: "verified" };
+  // 2) variants: the bare root (a suffix appended from a stale exchange column can be wrong —
+  //    e.g. a US re-listing still labeled with the old venue)
+  if (row.ticker) {
+    const root = tickerRoot(row.ticker);
+    if (root !== row.ticker && (await tryQuote(root))) return { ticker: root, status: "corrected", note: `${row.ticker} → ${root}` };
+  }
+  // 3) symbol search on the ticker (or the raw source cell when the ticker came back empty)
+  const q = (row.ticker || row.sourceLabel || "").trim();
+  if (q && looksLikeTicker(q)) {
+    const quotes = await lookupSymbol(q);
+    const exact = quotes.find((x) => x.symbol.toUpperCase() === q.toUpperCase());
+    if (exact) return { ticker: exact.symbol.toUpperCase(), status: row.ticker ? "verified" : "corrected", note: row.ticker ? null : `${q} → ${exact.symbol}` };
+    const rootMatches = quotes.filter((x) => tickerRoot(x.symbol) === q.toUpperCase());
+    if (rootMatches.length === 1) return { ticker: rootMatches[0].symbol.toUpperCase(), status: "corrected", note: `${q} → ${rootMatches[0].symbol}` };
+  }
+  // 4) company-name search when the sheet gave us a name-like source cell
+  if (row.sourceLabel && row.sourceLabel !== row.ticker) {
+    const quotes = await lookupSymbol(row.sourceLabel);
+    const nq = normCompanyName(row.sourceLabel);
+    const close = nq ? quotes.filter((x) => { const nn = normCompanyName(x.name); return nn && (nn.includes(nq) || nq.includes(nn)); }) : [];
+    if (close.length === 1) return { ticker: close[0].symbol.toUpperCase(), status: "corrected", note: `"${row.sourceLabel}" → ${close[0].symbol}` };
+  }
+  return { ticker: row.ticker, status: "unresolved" };
+}
+// Small concurrency limiter so a 20-row sheet resolves in ~2 waves without hammering the API.
+async function mapLimit(items, limit, fn) {
+  const out = [];
+  let i = 0;
+  await Promise.all(Array.from({ length: Math.min(limit, items.length) }, async () => {
+    while (i < items.length) { const idx = i++; out[idx] = await fn(items[idx], idx); }
+  }));
+  return out;
+}
+
 const IMPORT_MAPPING_SYSTEM_PROMPT = `You analyze raw spreadsheet exports of a person's stock portfolio (from brokerages like Schwab, Fidelity, Robinhood, Interactive Brokers, or a manual tracker) so an app can import the holdings automatically. Layouts vary wildly between sources. Be decisive.
 
 Return ONE JSON object only. No prose, no markdown fences.
@@ -3096,6 +3164,7 @@ Schema:
 
       const rows = computeImportRows(headers, rawRows, mapping, nameMap);
       setImportPreview({ headers, rawRows, mapping, nameMap, rows, aiAssisted: needsAI, cashDetected, includeCash: true });
+      startImportResolution(rows);   // background live verification — preview renders immediately
     } catch (err) {
       setImportError("Could not read that file. Make sure it's a valid .xlsx, .xls or .csv file.");
     } finally {
@@ -3109,8 +3178,53 @@ Schema:
       if (!prev) return prev;
       const mapping = { ...prev.mapping, [field]: value || null };
       const rows = computeImportRows(prev.headers, prev.rawRows, mapping, prev.nameMap);
+      queueMicrotask(() => startImportResolution(rows));
       return { ...prev, mapping, rows };
     });
+  }
+
+  // Live-resolution pass over the preview rows — runs in the BACKGROUND after the preview is
+  // already on screen (the sheet renders instantly; badges refine as checks land), so an
+  // all-US sheet pays zero added latency. Generation-guarded so a remap mid-flight wins.
+  const importResolveSeq = useRef(0);
+  function startImportResolution(rows) {
+    const seq = ++importResolveSeq.current;
+    const targets = rows.map((r, i) => ({ r, i })).filter(({ r }) => r.ticker || r.sourceLabel);
+    if (!targets.length) return;
+    (async () => {
+      const results = await mapLimit(targets, 6, async ({ r, i }) => ({ i, res: await resolveImportTicker(r) }));
+      setImportPreview(prev => {
+        if (!prev || importResolveSeq.current !== seq) return prev;
+        const rows2 = prev.rows.slice();
+        for (const { i, res } of results) {
+          const old = rows2[i]; if (!old) continue;
+          const ticker = (res.ticker || old.ticker || "").toUpperCase();
+          // A suffix-changing correction can change the listing; only override a DEFAULTED
+          // currency — an explicit column/sheet currency always wins (it describes the cost).
+          const currency = res.status === "corrected" && old.currency === "USD" ? inferCurrencyFromTicker(ticker) : old.currency;
+          const hasNums = old.shares && parseNum(old.shares) > 0 && old.cost && parseNum(old.cost) > 0;
+          rows2[i] = { ...old, ticker, currency, resolveStatus: res.status, resolveNote: res.note || null, valid: res.status !== "unresolved" && !!ticker && !!hasNums };
+        }
+        return { ...prev, rows: rows2 };
+      });
+    })();
+  }
+  function setRowFix(i, v) {
+    setImportPreview(prev => { if (!prev) return prev; const rows = prev.rows.slice(); rows[i] = { ...rows[i], fixValue: v, fixError: null }; return { ...prev, rows }; });
+  }
+  // Inline fix on an unresolved row: the typed symbol re-validates LIVE before it's accepted —
+  // a wrong symbol stays red with a reason instead of being imported broken or skipped.
+  async function applyRowFix(i) {
+    const row = importPreview?.rows[i];
+    if (!row) return;
+    const t = String(row.fixValue || "").trim().toUpperCase();
+    const patch = (p) => setImportPreview(prev => { if (!prev) return prev; const rows = prev.rows.slice(); rows[i] = { ...rows[i], ...p }; return { ...prev, rows }; });
+    if (!looksLikeTicker(t)) return patch({ fixError: "Not a valid symbol format" });
+    patch({ fixChecking: true, fixError: null });
+    const hit = await validateTickerLive(t);
+    if (!hit) return patch({ fixChecking: false, fixError: "No live quote for that symbol" });
+    const hasNums = row.shares && parseNum(row.shares) > 0 && row.cost && parseNum(row.cost) > 0;
+    patch({ ticker: t, currency: row.currency === "USD" ? inferCurrencyFromTicker(t) : row.currency, valid: !!hasNums, resolveStatus: "verified", resolveNote: `fixed → ${t}`, fixChecking: false, fixError: null, fixValue: "" });
   }
   function confirmImport() {
     const valid = importPreview.rows.filter(r => r.valid);
@@ -3823,8 +3937,25 @@ Schema:
                 {importPreview.rows.map((r, i) => (
                   <div key={i} style={{ display: "grid", gridTemplateColumns: "1fr 80px 100px 60px", padding: "9px 14px", borderBottom: `1px solid ${c.hairline}`, background: r.valid ? "transparent" : c.negativeSoft, alignItems: "center" }}>
                     <div style={{ minWidth: 0 }}>
-                      <div style={{ fontFamily: font.mono, fontSize: 13, fontWeight: 700, color: r.valid ? c.accent : c.negative }}>{r.ticker || <em style={{ opacity: 0.4 }}>unresolved</em>}</div>
-                      {r.sourceLabel && <div style={{ ...type.caption, color: c.text3, whiteSpace: "nowrap", overflow: "hidden", textOverflow: "ellipsis" }}>from "{r.sourceLabel}"</div>}
+                      <div style={{ display: "flex", alignItems: "baseline", gap: 7, minWidth: 0 }}>
+                        <span style={{ fontFamily: font.mono, fontSize: 13, fontWeight: 700, color: r.valid ? c.accent : c.negative }}>{r.ticker || <em style={{ opacity: 0.4 }}>unresolved</em>}</span>
+                        {(r.ticker || r.sourceLabel) && !r.resolveStatus && <Spinner size={10} />}
+                        {r.resolveStatus === "verified" && <span title="Live quote confirmed" style={{ ...type.caption, color: c.positive }}>✓</span>}
+                      </div>
+                      {r.resolveNote && <div style={{ ...type.caption, color: c.accent, whiteSpace: "nowrap", overflow: "hidden", textOverflow: "ellipsis" }}>{r.resolveNote}</div>}
+                      {!r.resolveNote && r.sourceLabel && <div style={{ ...type.caption, color: c.text3, whiteSpace: "nowrap", overflow: "hidden", textOverflow: "ellipsis" }}>from "{r.sourceLabel}"</div>}
+                      {r.resolveStatus === "unresolved" && (
+                        <div style={{ marginTop: 6 }}>
+                          <div style={{ display: "flex", gap: 6, alignItems: "center" }}>
+                            <Input mono value={r.fixValue ?? ""} placeholder="Type symbol, e.g. STLN"
+                              onChange={(e) => setRowFix(i, e.target.value)}
+                              onKeyDown={(e) => e.key === "Enter" && applyRowFix(i)}
+                              style={{ height: 30, fontSize: 12, padding: "4px 9px", maxWidth: 150 }} />
+                            <Button size="sm" variant="secondary" loading={r.fixChecking} onClick={() => applyRowFix(i)}>Check</Button>
+                          </div>
+                          {r.fixError && <div style={{ ...type.caption, color: c.negative, marginTop: 3 }}>{r.fixError}</div>}
+                        </div>
+                      )}
                     </div>
                     <span style={{ fontFamily: font.mono, fontSize: 12, color: r.shares ? c.text : c.negative }}>{r.shares || "—"}</span>
                     <span style={{ fontFamily: font.mono, fontSize: 12, color: r.cost ? c.text : c.negative }}>{r.cost ? `${r.currency !== "USD" ? r.currency + " " : "$"}${r.cost}` : "—"}</span>
@@ -3832,7 +3963,7 @@ Schema:
                   </div>
                 ))}
               </div>
-              {importPreview.rows.filter(r => !r.valid).length > 0 && <div style={{ ...type.caption, color: c.warning }}>Rows highlighted in red are missing required fields and will be skipped.</div>}
+              {importPreview.rows.filter(r => !r.valid).length > 0 && <div style={{ ...type.caption, color: c.warning }}>Red rows won't be imported yet — type the correct symbol where offered (it's checked against a live quote), or fill the missing fields.</div>}
               <div style={{ display: "flex", gap: 10, justifyContent: "flex-end" }}>
                 <Button variant="secondary" onClick={() => setImportPreview(null)}>Cancel</Button>
                 {/* A cash-only sheet is importable too — the detected cash goes to Spare Cash even

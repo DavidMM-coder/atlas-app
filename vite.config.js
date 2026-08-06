@@ -292,11 +292,36 @@ function fxProxy() {
   };
 }
 
+// Mirrors api/lookup.js — Yahoo symbol search for the import's ticker-resolution chain.
+function lookupProxy() {
+  return {
+    name: "lookup-proxy",
+    configureServer(server) {
+      server.middlewares.use("/api/lookup", (req, res) => {
+        (async () => {
+          const q = (new URL(req.url, "http://localhost").searchParams.get("q") || "").trim().slice(0, 60);
+          res.setHeader("content-type", "application/json");
+          if (!q) { res.statusCode = 400; return res.end(JSON.stringify({ error: "q required" })); }
+          const r = await fetch(`https://query1.finance.yahoo.com/v1/finance/search?q=${encodeURIComponent(q)}&quotesCount=6&newsCount=0`, { headers: { "User-Agent": "Mozilla/5.0" } });
+          if (!r.ok) { res.statusCode = 502; return res.end(JSON.stringify({ error: `Symbol search returned ${r.status}` })); }
+          const d = await r.json();
+          const quotes = (d.quotes || [])
+            .filter((x) => x.symbol && (x.quoteType === "EQUITY" || x.quoteType === "ETF"))
+            .slice(0, 6)
+            .map((x) => ({ symbol: x.symbol, name: x.shortname || x.longname || "", exch: x.exchDisp || "", type: x.quoteType }));
+          res.statusCode = 200;
+          res.end(JSON.stringify({ quotes }));
+        })().catch((e) => { res.statusCode = 500; res.setHeader("content-type", "application/json"); res.end(JSON.stringify({ error: String(e) })); });
+      });
+    },
+  };
+}
+
 export default defineConfig(({ mode }) => {
   const env = loadEnv(mode, process.cwd(), "");
   const apiKey = env.ANTHROPIC_API_KEY || process.env.ANTHROPIC_API_KEY || "";
   return {
-    plugins: [react(), anthropicProxy(apiKey), historyProxy(), fundamentalsProxy(), fxProxy(), newsProxy()],
+    plugins: [react(), anthropicProxy(apiKey), historyProxy(), fundamentalsProxy(), fxProxy(), newsProxy(), lookupProxy()],
     server: { port: Number(process.env.PORT) || 5173, host: true },
     build: {
       rollupOptions: {
