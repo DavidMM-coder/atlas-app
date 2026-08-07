@@ -205,7 +205,11 @@ function historyProxy() {
           res.setHeader("content-type", "application/json");
           return res.end(JSON.stringify({ error: "valid ticker, range and interval required" }));
         }
-        const yhUrl = `https://query1.finance.yahoo.com/v8/finance/chart/${encodeURIComponent(ticker)}?interval=${encodeURIComponent(interval)}&range=${encodeURIComponent(range)}`;
+        // Mirrors api/history.js's opt-in extended-session quote mode (see the comments there).
+        const wantPrePost = url.searchParams.get("prepost") === "1";
+        const yhUrl = wantPrePost
+          ? `https://query1.finance.yahoo.com/v8/finance/chart/${encodeURIComponent(ticker)}?interval=1m&range=1d&includePrePost=true`
+          : `https://query1.finance.yahoo.com/v8/finance/chart/${encodeURIComponent(ticker)}?interval=${encodeURIComponent(interval)}&range=${encodeURIComponent(range)}`;
         fetch(yhUrl, { headers: { "User-Agent": "Mozilla/5.0" } })
           .then(r => r.json())
           .then(data => {
@@ -214,6 +218,30 @@ function historyProxy() {
               res.statusCode = 404;
               res.setHeader("content-type", "application/json");
               return res.end(JSON.stringify({ error: "No data found for ticker" }));
+            }
+            if (wantPrePost) {
+              const m = result.meta || {};
+              let reg = m.tradingPeriods?.regular ?? m.tradingPeriods;
+              while (Array.isArray(reg)) reg = reg[0];
+              const win = (reg && Number.isFinite(reg.start)) ? reg
+                : (Number.isFinite(m.regularMarketTime) ? { start: m.regularMarketTime - 6.5 * 3600, end: m.regularMarketTime } : null);
+              const cl = result.indicators?.quote?.[0]?.close || [];
+              const pts = (result.timestamp || []).map((t, i) => [t, cl[i]]).filter(([, c]) => c != null);
+              const regularPrice = m.regularMarketPrice ?? (win ? (pts.filter(([t]) => t >= win.start && t < win.end).pop() || [])[1] : null) ?? null;
+              const last = pts[pts.length - 1];
+              let extSession = null;
+              if (last && win && last[0] >= win.end) extSession = "post";
+              else if (last && win && last[0] < win.start) extSession = "pre";
+              const moved = last && regularPrice != null && Math.abs(last[1] - regularPrice) / regularPrice > 0.0005;
+              const useExt = !!(extSession && moved);
+              res.statusCode = 200;
+              res.setHeader("content-type", "application/json");
+              return res.end(JSON.stringify({
+                ticker: m.symbol, currency: m.currency, name: m.longName || m.shortName || m.symbol,
+                price: useExt ? last[1] : (regularPrice ?? last?.[1] ?? null), regularPrice,
+                extPrice: useExt ? last[1] : null, extSession: useExt ? extSession : null, extTime: useExt ? last[0] : null,
+                prices: [],
+              }));
             }
             const timestamps = result.timestamp;
             const q = result.indicators.quote[0];

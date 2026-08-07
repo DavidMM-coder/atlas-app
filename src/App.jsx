@@ -1860,6 +1860,9 @@ function HoldingRow({ h, livePrice, fxRates, review, onOpen, onRemove }) {
   const liveCurrency = normalizeCurrencyCode(livePrice?.currency || rowCurrency);
   const curPrice = fxConvert(rawPrice, liveCurrency, rowCurrency, fxRates);
   const wasConverted = curPrice != null && liveCurrency !== rowCurrency;
+  // "after hours" / "pre-market" tag — set only when the live quote's latest print came from an
+  // extended session (see api/history.js prepost mode), so it never appears spuriously.
+  const extLabel = livePrice?.extSession === "post" ? "after hours" : livePrice?.extSession === "pre" ? "pre-market" : null;
   const cost = parseNum(h.cost);
   const sh = parseNum(h.shares);
   const foreignCur = rowCurrency !== "USD" ? rowCurrency : null;
@@ -1886,6 +1889,7 @@ function HoldingRow({ h, livePrice, fxRates, review, onOpen, onRemove }) {
         </button>
         <div style={{ textAlign: "right" }}>
           {curPrice != null && <div style={{ ...type.data, color: c.text }}>{fmtCurrency(curPrice, rowCurrency)}</div>}
+          {extLabel && <div style={{ ...type.caption, fontSize: 9, color: c.warning }}>{extLabel}</div>}
           <div style={{ fontFamily: font.mono, fontSize: 10, color: c.text3 }}>{fmtShares(h.shares)} sh</div>
         </div>
         <IconButton label="Remove" onClick={onRemove} size={30} style={{ color: c.text3 }}>×</IconButton>
@@ -1906,6 +1910,13 @@ function HoldingRow({ h, livePrice, fxRates, review, onOpen, onRemove }) {
         </button>
         <div style={{ padding: "13px 8px", textAlign: "right" }}>
           <span style={{ ...type.data, color: curPrice != null ? c.text : c.text3 }}>{curPrice != null ? fmtCurrency(curPrice, rowCurrency) : "—"}</span>
+          {/* Only rendered when the latest print actually came from an extended session AND
+              differs from the regular close — a normal stock shows no tag. */}
+          {extLabel && (
+            <div style={{ ...type.caption, fontSize: 9, color: c.warning }} title={livePrice?.regularPrice != null ? `${extLabel}: last regular close was ${fmtCurrency(livePrice.regularPrice, liveCurrency)}` : extLabel}>
+              {extLabel}
+            </div>
+          )}
           {wasConverted && <div style={{ fontFamily: font.mono, fontSize: 9, color: c.text3 }} title="Live price converted into this holding's recorded currency">{fmtCurrency(rawPrice, liveCurrency)} native</div>}
         </div>
         <div style={{ padding: "13px 8px", textAlign: "right", ...type.data, color: c.text2 }}>{fmtShares(h.shares)}</div>
@@ -2449,9 +2460,15 @@ export default function VerdictApp() {
     if (!background) setLivePricesLoading(true);
     const results = await Promise.all(holdings.map(async h => {
       try {
-        const r = await apiFetch(`/api/history?ticker=${encodeURIComponent(h.ticker)}&range=5d&interval=1d`);
+        // prepost=1: the LIVE price must include extended-session trading. Daily candles are
+        // regular-session only, so a holding that moved after the close (e.g. 4pm ET earnings)
+        // otherwise displayed the pre-move close as if it were current.
+        const r = await apiFetch(`/api/history?ticker=${encodeURIComponent(h.ticker)}&prepost=1`);
         const d = await r.json();
-        if (d.prices?.length) {
+        if (d.price != null) {
+          return [h.ticker, { price: d.price, currency: d.currency, name: d.name, extSession: d.extSession || null, regularPrice: d.regularPrice ?? null }];
+        }
+        if (d.prices?.length) {   // defensive: older/other response shape
           const latest = d.prices[d.prices.length - 1];
           return [h.ticker, { price: latest.close, currency: d.currency, name: d.name }];
         }
