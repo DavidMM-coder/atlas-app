@@ -732,6 +732,47 @@ async function aiAuthHeaders(forceRefresh = false) {
 
 const AI_MODEL = "claude-sonnet-5";
 
+// Consistency: pin sampling low so identical inputs produce near-identical scores/actions.
+// DEFENSIVE, not assumed: Sonnet 5's API surface documents non-default sampling params as
+// removed (400), and thinking-enabled requests historically required temperature=1 — so the
+// first call each session tries temperature 0.1, and if the API rejects it with an error
+// naming the parameter, the call is resent without it and the whole session remembers.
+// Worst case is ONE fast 400 round-trip per session; a sampling rejection never fails a call.
+let SAMPLING_UNSUPPORTED = false;
+const SAMPLING_ERR_RE = /temperature|top_p|top_k|sampling/i;
+function samplingParams() { return SAMPLING_UNSUPPORTED ? {} : { temperature: 0.1 }; }
+function samplingRejected(data) {
+  if (SAMPLING_UNSUPPORTED || !data?.error) return false;
+  if (!SAMPLING_ERR_RE.test(String(data.error.message || ""))) return false;
+  SAMPLING_UNSUPPORTED = true;
+  console.info("[atlas] model rejected temperature — resending without sampling params (session-wide)");
+  return true;
+}
+
+// 30 minutes: within it, re-requesting the same analysis returns the saved result unchanged —
+// same inputs → the same answer, instantly. Past it, prices/news have moved enough that a fresh
+// run is the honest default. The explicit Re-analyze affordances always force fresh regardless.
+const ANALYSIS_FRESH_MS = 30 * 60 * 1000;
+
+// "just now" / "N min ago" / "N hours ago" for the analyzed-at chips.
+function fmtAgo(ts) {
+  const m = Math.max(0, Math.round((Date.now() - ts) / 60000));
+  if (m < 1) return "just now";
+  if (m < 60) return `${m} min ago`;
+  const h = Math.round(m / 60);
+  return h === 1 ? "1 hour ago" : `${h} hours ago`;
+}
+
+// Stable fingerprint of everything the portfolio review's answer depends on — a cached review is
+// reused only while ALL of it is unchanged. Holdings are sorted so row order alone never reads as
+// a change; any edit to a position, the profile, or spare cash invalidates the cache by mismatch.
+function reviewFingerprint(holdings, profile, spareCash, spareCashCurrency) {
+  const h = (holdings || [])
+    .map((x) => [String(x.ticker || "").toUpperCase(), x.shares, x.cost, x.currency || "USD"])
+    .sort((a, b) => (a[0] < b[0] ? -1 : 1));
+  return JSON.stringify([h, profile || null, spareCash || "", spareCashCurrency || "USD"]);
+}
+
 // The model has no idea what today's date is unless we tell it — left to itself it stamps its
 // training-era year (e.g. "2025") on things like a dossier/scan "asOf". Prepend the real current
 // date to every prompt that reasons about "now" so recency, valuations and news are grounded.
@@ -756,7 +797,8 @@ async function readAIResponse(resp) {
 }
 
 async function callClaudeOnce(system, user, maxTokens, maxSearches, fast) {
-  const body = JSON.stringify({
+  // Body rebuilt per attempt: the sampling-rejection retry below must resend WITHOUT temperature.
+  const makeBody = () => JSON.stringify({
     model: AI_MODEL, max_tokens: maxTokens, system,
     messages: [{ role: "user", content: user }],
     tools: [{ type: "web_search_20260209", name: "web_search", max_uses: maxSearches }],
@@ -765,17 +807,19 @@ async function callClaudeOnce(system, user, maxTokens, maxSearches, fast) {
     // triggers web search on Sonnet 5, so unlike DISABLING thinking this still fetches real data.
     // NOTE: never set thinking:{type:"disabled"} here; that suppresses search and returns garbage.
     ...(fast ? { output_config: { effort: "medium" } } : {}),
+    ...samplingParams(),
   });
   const doFetch = async (forceRefresh) => fetch(`${API_BASE}/api/messages`, {
     method: "POST", headers: { "Content-Type": "application/json", ...(await aiAuthHeaders(forceRefresh)) },
-    body,
+    body: makeBody(),
   });
   let resp = await doFetch(false);
   // A 401 when we DO have a signed-in user almost always means the cached Firebase ID token went
   // stale (they expire ~hourly). Force-refresh the token and retry once before surfacing "sign in"
   // — this self-heals a session that's still valid but whose cached token lapsed.
   if (resp.status === 401 && auth?.currentUser) resp = await doFetch(true);
-  const data = await readAIResponse(resp);
+  let data = await readAIResponse(resp);
+  if (samplingRejected(data)) { resp = await doFetch(false); data = await readAIResponse(resp); }
   if (data.error) throw new Error(data.error.message || "API error");
   const text = (data.content || []).filter((b) => b.type === "text").map((b) => b.text).join("\n");
   return { parsed: extractJSON(text), stopReason: data.stop_reason, text };
@@ -879,18 +923,21 @@ async function callClaude(system, user, { maxTokens = 4000, maxSearches = 4, fas
 // price/fundamentals/news). `think` keeps adaptive thinking on for depth (dossier); default off for
 // speed (news blurbs). Because there's no web search, disabling thinking here is safe.
 async function callClaudeAnalyzeOnce(system, user, maxTokens, think) {
-  const body = JSON.stringify({
+  // Body rebuilt per attempt: the sampling-rejection retry below must resend WITHOUT temperature.
+  const makeBody = () => JSON.stringify({
     model: AI_MODEL, max_tokens: maxTokens, system,
     messages: [{ role: "user", content: user }],
     thinking: think ? { type: "adaptive" } : { type: "disabled" },
     ...(think ? { output_config: { effort: "medium" } } : {}),
+    ...samplingParams(),
   });
   const doFetch = async (forceRefresh) => fetch(`${API_BASE}/api/messages`, {
-    method: "POST", headers: { "Content-Type": "application/json", ...(await aiAuthHeaders(forceRefresh)) }, body,
+    method: "POST", headers: { "Content-Type": "application/json", ...(await aiAuthHeaders(forceRefresh)) }, body: makeBody(),
   });
   let resp = await doFetch(false);
   if (resp.status === 401 && auth?.currentUser) resp = await doFetch(true);   // self-heal a stale token
-  const data = await readAIResponse(resp);
+  let data = await readAIResponse(resp);
+  if (samplingRejected(data)) { resp = await doFetch(false); data = await readAIResponse(resp); }
   if (data.error) throw new Error(data.error.message || "API error");
   const text = (data.content || []).filter((b) => b.type === "text").map((b) => b.text).join("\n");
   return { parsed: extractJSON(text), stopReason: data.stop_reason, text };
@@ -1326,7 +1373,7 @@ function PillarRow({ label, score, sub }) {
   );
 }
 
-function Results({ result, profile, backtestSnapshot, onOpenBacktest }) {
+function Results({ result, profile, backtestSnapshot, onOpenBacktest, onReanalyze }) {
   const [tab, setTab] = useState("Fundamentals");
   const isMobile = useIsMobile();
   const r = result, overall = r.overall?.score;
@@ -1361,6 +1408,12 @@ function Results({ result, profile, backtestSnapshot, onOpenBacktest }) {
         {r._savedAt && (
           <div style={{ ...type.caption, color: c.warning, background: c.warningSoft, border: `1px solid rgba(251,184,69,0.3)`, borderRadius: radius.sm, padding: "8px 12px", marginBottom: 14, lineHeight: 1.5 }}>
             Saved dossier from {fmtHistoryDate(r._savedAt)} — prices, news and scores reflect that moment. Use "Update" in Past research for a fresh read.
+          </div>
+        )}
+        {r._cachedAt && !r._savedAt && (
+          <div style={{ ...type.caption, color: c.text2, background: c.surface2, border: `1px solid ${c.hairline}`, borderRadius: radius.sm, padding: "8px 12px", marginBottom: 14, lineHeight: 1.5, display: "flex", alignItems: "center", justifyContent: "space-between", gap: 10, flexWrap: "wrap" }}>
+            <span>Analyzed {fmtAgo(r._cachedAt)} — showing the saved result, so repeat requests stay consistent.</span>
+            {onReanalyze && <Button variant="ghost" size="sm" onClick={onReanalyze}>Re-analyze</Button>}
           </div>
         )}
 
@@ -2307,6 +2360,14 @@ export default function VerdictApp() {
         const rc = await kvGet("atlas_recs");
         const recsFresh = !!(rc?.data && rc.at && Date.now() - rc.at < FRESH_MS);
         if (recsFresh) { setRecs(rc.data); recsAtRef.current = rc.at; }
+        // Restore a still-fresh portfolio review across reloads — but only if the inputs it was
+        // computed from (holdings/profile/cash, as just loaded above) are byte-identical. Uses the
+        // locally-loaded values, not state (setState above hasn't applied yet in this closure).
+        const rv = await kvGet("atlas_review");
+        if (rv?.data?.holdings && rv.freshUntil > Date.now() &&
+            rv.fp === reviewFingerprint(Array.isArray(h) ? h : [], p, cash != null ? String(cash) : "", cashCur || "USD")) {
+          setReview({ ...rv.data, _analyzedAt: rv.analyzedAt });
+        }
         if (p && p.name) { setProfile(p); setPhase("app"); if (!recsFresh) setAutoDiscover(true); }
       } catch {}
     })();
@@ -2606,9 +2667,34 @@ export default function VerdictApp() {
   }
 
   // ---- deep dossier ----
-  async function evaluate(symbolArg, quickScan) {
+  async function evaluate(symbolArg, quickScan, opts = {}) {
     const name = ((typeof symbolArg === "string" && symbolArg) ? symbolArg : query).trim();
     if (!name) return;
+    // Consistency cache — same inputs within the freshness window get the SAME answer, instantly,
+    // instead of a fresh sample that can move scores a few points for no input reason. Every entry
+    // point consults this (Run analysis, Enter, opening a pick or holding); the ONLY fresh paths
+    // are the explicit re-analyze affordances (the chip's Re-analyze, Past research's Update),
+    // which pass force:true. Matches by ticker, or by exact company name for name-typed queries.
+    if (!opts.force) {
+      const key = name.toUpperCase();
+      const hit = researchHistory.find((e) => e?.result && e.freshUntil && e.freshUntil > Date.now() &&
+        (e.ticker === key || (e.company || "").toUpperCase() === key));
+      if (hit) {
+        const seq = ++evalSeq.current;   // this cache-open owns the shown dossier
+        setNav("research"); setLoading(false); setError(null);
+        setQuery(hit.ticker);
+        // _cachedAt drives the "Analyzed X min ago" chip + Re-analyze affordance in Results.
+        setResult({ ...hit.result, _cachedAt: hit.analyzedAt });
+        // Recompute the backtest snapshot for THIS ticker (cheap, no AI) — same as openResearchHistory.
+        setBacktestSnapshot(null);
+        fetchHistoricalStats(hit.ticker).then((hs) => {
+          if (seq !== evalSeq.current || !hs?.prices) return;
+          const snap = backtestSmaCrossover(hs.prices);
+          if (snap) setBacktestSnapshot({ ...snap, ticker: hit.ticker });
+        });
+        return;
+      }
+    }
     // Don't silently no-op when a dossier is already loading — tapping a second pick used to do
     // nothing (no nav, no feedback). Instead navigate and supersede: the newest requested ticker
     // wins, and a slower earlier request bails at its guards below instead of clobbering the result.
@@ -2837,7 +2923,11 @@ FULL JSON SCHEMA:
     const ticker = (parsed.ticker || query || "").toUpperCase().trim();
     if (!ticker) return;
     setResearchHistory((prev) => {
-      const entry = { ticker, company: parsed.company || ticker, asOf: parsed.asOf || "", savedAt: new Date().toISOString(), result: parsed };
+      // analyzedAt/freshUntil are the consistency-cache metadata: evaluate() reuses this entry
+      // instead of re-running the AI while freshUntil is in the future. Older entries without
+      // these fields simply never match the freshness check — they behave as always-stale.
+      const now = Date.now();
+      const entry = { ticker, company: parsed.company || ticker, asOf: parsed.asOf || "", savedAt: new Date().toISOString(), analyzedAt: now, freshUntil: now + ANALYSIS_FRESH_MS, result: parsed };
       const next = [entry, ...prev.filter((e) => e.ticker !== ticker)].slice(0, 25);
       kvSet("atlas_research_history", next);
       // Sync a trimmed copy to the cloud so past research survives across devices and sign-out
@@ -2862,7 +2952,8 @@ FULL JSON SCHEMA:
       if (snap) setBacktestSnapshot({ ...snap, ticker: entry.ticker });
     });
   }
-  function updateResearchHistory(ticker) { setQuery(ticker); evaluate(ticker); }
+  // Past research's "Update" is an explicit re-analyze affordance — always a fresh run.
+  function updateResearchHistory(ticker) { setQuery(ticker); evaluate(ticker, undefined, { force: true }); }
   function removeResearchHistory(ticker) {
     setResearchHistory((prev) => { const next = prev.filter((e) => e.ticker !== ticker); kvSet("atlas_research_history", next); cloudSave({ researchHistory: next.slice(0, 12) }); return next; });
   }
@@ -3009,8 +3100,21 @@ Order the items array most-important first. Return ONLY this JSON:
   }
 
   // ---- portfolio review ----
-  async function analyzePortfolio() {
+  async function analyzePortfolio(opts = {}) {
     if (reviewLoading || !holdings.length) return;
+    // Consistency cache: a repeat request with the SAME inputs (holdings, profile, spare cash)
+    // inside the freshness window returns the saved review unchanged and instantly — no API call,
+    // no chance of an action flipping between two back-to-back runs. Persisted in localStorage so
+    // it survives reload. The chip's Re-analyze passes force:true — the only deliberate-fresh path.
+    const fp = reviewFingerprint(holdings, profile, spareCash, spareCashCurrency);
+    if (!opts.force) {
+      const cached = await kvGet("atlas_review");
+      if (cached?.data?.holdings && cached.fp === fp && cached.freshUntil > Date.now()) {
+        setReview({ ...cached.data, _analyzedAt: cached.analyzedAt });
+        setReviewError(null);
+        return;
+      }
+    }
     setReviewLoading(true); setReviewError(null);
     try {
       // Fetch a full year of real price history per holding (not just the latest quote) so the
@@ -3084,7 +3188,11 @@ Schema:
         if (p?.price != null) return { ...h, currentPrice: String(p.price.toFixed(2)) };
         return h;
       }) };
-      setReview(enriched);
+      const analyzedAt = Date.now();
+      setReview({ ...enriched, _analyzedAt: analyzedAt });
+      // Device-local by design (not cloud-synced): it's a consistency cache, not user data — the
+      // other device recomputes from its own live state, and the fingerprint keeps it honest.
+      kvSet("atlas_review", { data: enriched, fp, analyzedAt, freshUntil: analyzedAt + ANALYSIS_FRESH_MS });
     } catch (err) { setReviewError(err.message || "Something went wrong."); }
     finally { setReviewLoading(false); }
   }
@@ -3642,7 +3750,9 @@ Schema:
             </div>
             {fxIncomplete && <div style={{ ...type.caption, color: c.warning, marginTop: 8 }}>Some positions excluded from the total — exchange rates still loading.</div>}
           </div>
-          <Button onClick={analyzePortfolio} loading={reviewLoading} disabled={!holdings.length} glow>{review ? "Re-analyse" : "Run AI Analysis"}</Button>
+          {/* Cache-consulting: a repeat click within the freshness window returns the saved review
+              instantly. The deliberate fresh run lives on the review chip's Re-analyze button. */}
+          <Button onClick={() => analyzePortfolio()} loading={reviewLoading} disabled={!holdings.length} glow>Run AI Analysis</Button>
         </div>
         {expSegments.length > 0 && <div style={{ marginTop: 18 }}><ExposureBar segments={expSegments} /></div>}
       </Card>
@@ -3677,10 +3787,16 @@ Schema:
           </Card>
 
           {reviewLoading && <Card><StagedLoadingBlock title="Fetching live prices and running AI analysis…" sub="live data · tuned to your profile" /></Card>}
-          {reviewError && !reviewLoading && <ErrorBanner msg={reviewError} onRetry={analyzePortfolio} label="Try again" />}
+          {reviewError && !reviewLoading && <ErrorBanner msg={reviewError} onRetry={() => analyzePortfolio()} label="Try again" />}
 
           {review?.portfolio && !reviewLoading && (
             <motion.div initial={{ opacity: 0, y: 8 }} animate={{ opacity: 1, y: 0 }} style={{ marginBottom: 14, display: "flex", flexDirection: "column", gap: 10 }}>
+              {review._analyzedAt && (
+                <div style={{ ...type.caption, color: c.text2, background: c.surface2, border: `1px solid ${c.hairline}`, borderRadius: radius.sm, padding: "8px 12px", lineHeight: 1.5, display: "flex", alignItems: "center", justifyContent: "space-between", gap: 10, flexWrap: "wrap" }}>
+                  <span>Analyzed {fmtAgo(review._analyzedAt)} — repeat requests return this same result while your portfolio is unchanged.</span>
+                  <Button variant="ghost" size="sm" onClick={() => analyzePortfolio({ force: true })}>Re-analyze</Button>
+                </div>
+              )}
               {review.portfolio.cashAdvice && spareCashDisplay != null && (
                 <Card accentEdge pad={18} style={{ background: c.accentSoft, borderColor: c.accentBorder }}>
                   <Overline color={c.accent} style={{ marginBottom: 8 }}>Deploy {fmtCurrency(spareCashDisplay, portfolioCurrency)} cash</Overline>
@@ -3846,7 +3962,7 @@ Schema:
         </Card>
       )}
       {error && !loading && <ErrorBanner msg={error} onRetry={() => evaluate()} />}
-      {result && !loading && <Results result={result} profile={profile} backtestSnapshot={backtestSnapshot && (!result.ticker || backtestSnapshot.ticker === String(result.ticker).toUpperCase()) ? backtestSnapshot : null} onOpenBacktest={() => setNav("backtest")} />}
+      {result && !loading && <Results result={result} profile={profile} backtestSnapshot={backtestSnapshot && (!result.ticker || backtestSnapshot.ticker === String(result.ticker).toUpperCase()) ? backtestSnapshot : null} onOpenBacktest={() => setNav("backtest")} onReanalyze={() => evaluate(result.ticker || query, undefined, { force: true })} />}
       {!result && !loading && !error && <Card><EmptyState title="Research any stock" hint="Enter a ticker or company name above to generate a full dossier scored to your profile and portfolio." /></Card>}
     </div>
   ));
