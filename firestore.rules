@@ -33,6 +33,23 @@ service cloud.firestore {
       allow write: if request.auth != null && request.auth.uid == "mWxFcdY4NUXAbBrA3J4RKWgu6NB3";
     }
 
+    // Scout data layer (universe snapshots, per-ticker fundamentals/insider caches, refresh
+    // state) — owner-only, same single-account model as house_picks: the batch runner runs
+    // in the owner's signed-in browser session, and the screener reads the cached snapshots.
+    // Wildcard doc ids because scout_fundamentals/scout_insiders are one doc per ticker.
+    match /scout_universe/{docId} {
+      allow read, write: if request.auth != null && request.auth.uid == "mWxFcdY4NUXAbBrA3J4RKWgu6NB3";
+    }
+    match /scout_fundamentals/{ticker} {
+      allow read, write: if request.auth != null && request.auth.uid == "mWxFcdY4NUXAbBrA3J4RKWgu6NB3";
+    }
+    match /scout_insiders/{ticker} {
+      allow read, write: if request.auth != null && request.auth.uid == "mWxFcdY4NUXAbBrA3J4RKWgu6NB3";
+    }
+    match /scout_refresh_state/{docId} {
+      allow read, write: if request.auth != null && request.auth.uid == "mWxFcdY4NUXAbBrA3J4RKWgu6NB3";
+    }
+
     // Everything else is denied by default — no other collections are used by the app.
     match /{document=**} {
       allow read, write: if false;

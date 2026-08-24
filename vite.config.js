@@ -152,7 +152,7 @@ function fundamentalsProxy() {
         }
         (async () => {
           const [{ crumb, cookieStr }, secQuarterlyFinancials] = await Promise.all([getYahooCrumb(), fetchSecQuarterlyFinancials(ticker)]);
-          const modules = ["defaultKeyStatistics","financialData","incomeStatementHistoryQuarterly","earningsHistory","summaryDetail"].join(",");
+          const modules = ["defaultKeyStatistics","financialData","incomeStatementHistoryQuarterly","earningsHistory","summaryDetail","price"].join(",");
           const yhUrl = `https://query1.finance.yahoo.com/v10/finance/quoteSummary/${encodeURIComponent(ticker)}?modules=${encodeURIComponent(modules)}&crumb=${encodeURIComponent(crumb)}`;
           const r = await fetch(yhUrl, { headers: { ...YF_HEADERS, Cookie: cookieStr } });
           const data = await r.json();
@@ -170,7 +170,7 @@ function fundamentalsProxy() {
             quarterlyFinancials = secQuarterlyFinancials;
           } else {
             const earningsEpsByDate = Object.fromEntries(earnings.map(e => [e.date, e.actual]));
-            quarterlyFinancials = qStmts.map(s => { const date = new Date(s.endDate.raw * 1000).toISOString().slice(0, 10); const eps = s.dilutedEPS?.raw ?? earningsEpsByDate[date] ?? null; return { date, totalRevenue: s.totalRevenue?.raw ?? null, netIncome: s.netIncome?.raw ?? null, eps, filed: null }; }).filter(s => s.totalRevenue != null).sort((a, b) => a.date.localeCompare(b.date));
+            quarterlyFinancials = qStmts.map(s => { const date = new Date(s.endDate.raw * 1000).toISOString().slice(0, 10); const eps = s.dilutedEPS?.raw ?? earningsEpsByDate[date] ?? null; return { date, totalRevenue: s.totalRevenue?.raw ?? null, netIncome: s.netIncome?.raw ?? null, eps, filed: null, operatingIncome: s.operatingIncome?.raw ?? null, grossProfit: s.grossProfit?.raw ?? null, sharesDiluted: null }; }).filter(s => s.totalRevenue != null).sort((a, b) => a.date.localeCompare(b.date));
           }
           let dividends = [];
           try {
@@ -182,10 +182,69 @@ function fundamentalsProxy() {
           const stats = result.defaultKeyStatistics || {};
           const financial = result.financialData || {};
           const summary = result.summaryDetail || {};
+          const priceMod = result.price || {};
+          // Mirrors api/fundamentals.js's Scout `extended` block.
+          const extended = {
+            currency: priceMod.currency ?? financial.financialCurrency ?? null,
+            marketCap: priceMod.marketCap?.raw ?? summary.marketCap?.raw ?? null,
+            price: priceMod.regularMarketPrice?.raw ?? financial.currentPrice?.raw ?? null,
+            exchange: priceMod.exchange ?? null,
+            exchangeName: priceMod.exchangeName ?? null,
+            quoteType: priceMod.quoteType ?? null,
+            avgVolume: summary.averageVolume?.raw ?? priceMod.averageDailyVolume3Month?.raw ?? null,
+            sharesOutstanding: stats.sharesOutstanding?.raw ?? null,
+            heldPercentInsiders: stats.heldPercentInsiders?.raw ?? null,
+            heldPercentInstitutions: stats.heldPercentInstitutions?.raw ?? null,
+            numberOfAnalystOpinions: financial.numberOfAnalystOpinions?.raw ?? null,
+            grossMargins: financial.grossMargins?.raw ?? null,
+            operatingMargins: financial.operatingMargins?.raw ?? null,
+            profitMargins: financial.profitMargins?.raw ?? null,
+            totalCash: financial.totalCash?.raw ?? null,
+            totalDebt: financial.totalDebt?.raw ?? null,
+            ebitda: financial.ebitda?.raw ?? null,
+            freeCashflow: financial.freeCashflow?.raw ?? null,
+            operatingCashflow: financial.operatingCashflow?.raw ?? null,
+            totalRevenueTTM: financial.totalRevenue?.raw ?? null,
+            revenueGrowth: financial.revenueGrowth?.raw ?? null,
+          };
           res.statusCode = 200;
           res.setHeader("content-type", "application/json");
-          res.end(JSON.stringify({ ticker: ticker.toUpperCase(), trailingPE: summary.trailingPE?.raw ?? null, forwardPE: stats.forwardPE?.raw ?? null, pb: stats.priceToBook?.raw ?? null, dividendYield: summary.trailingAnnualDividendYield?.raw ?? null, revenueGrowth: financial.revenueGrowth?.raw ?? null, earningsGrowth: financial.earningsGrowth?.raw ?? null, quarterlyFinancials, earnings, dividends }));
+          res.end(JSON.stringify({ ticker: ticker.toUpperCase(), trailingPE: summary.trailingPE?.raw ?? null, forwardPE: stats.forwardPE?.raw ?? null, pb: stats.priceToBook?.raw ?? null, dividendYield: summary.trailingAnnualDividendYield?.raw ?? null, revenueGrowth: financial.revenueGrowth?.raw ?? null, earningsGrowth: financial.earningsGrowth?.raw ?? null, quarterlyFinancials, earnings, dividends, extended }));
         })().catch(e => { res.statusCode = 500; res.setHeader("content-type", "application/json"); res.end(JSON.stringify({ error: String(e) })); });
+      });
+    },
+  };
+}
+
+// Mirrors api/scout.js by importing the SAME source module the prod handler uses (auth is
+// the only prod-side difference; the dev middleware doesn't enforce it, like its siblings).
+function scoutProxy() {
+  return {
+    name: "scout-proxy",
+    configureServer(server) {
+      server.middlewares.use("/api/scout", (req, res) => {
+        const url = new URL(req.url, "http://localhost");
+        const q = (k) => url.searchParams.get(k) || "";
+        (async () => {
+          const src = await import("./api/_lib/scout-sources.js");
+          const action = q("action");
+          const TICK = /^[A-Za-z0-9][A-Za-z0-9.\-]{0,14}$/;
+          let out;
+          if (action === "us-symbols") out = await src.usSymbols();
+          else if (action === "metric" && TICK.test(q("ticker"))) out = await src.usMetric(q("ticker"));
+          else if (action === "eu") out = await src.euVenue(q("venue"));
+          else if (action === "lse") out = await src.lseXlsx(Number(q("hint")) || undefined);
+          else if (action === "form4-index" && /^\d{8}$/.test(q("date"))) out = await src.form4Index(q("date"));
+          else if (action === "form4" && /^edgar\/data\/\d+\/[\d-]+\.txt$/.test(q("path"))) out = await src.form4Filing(q("path"));
+          else out = { ok: false, status: 400, error: "unknown or malformed action" };
+          res.statusCode = out.ok ? 200 : (out.status >= 400 && out.status < 600 ? out.status : 502);
+          res.setHeader("content-type", "application/json");
+          res.end(JSON.stringify(out.ok ? out.data : { error: out.error || "upstream failed" }));
+        })().catch((e) => {
+          res.statusCode = 500;
+          res.setHeader("content-type", "application/json");
+          res.end(JSON.stringify({ error: String(e).replace(/token=[^&\s"']+/g, "token=***") }));
+        });
       });
     },
   };
@@ -348,8 +407,12 @@ function lookupProxy() {
 export default defineConfig(({ mode }) => {
   const env = loadEnv(mode, process.cwd(), "");
   const apiKey = env.ANTHROPIC_API_KEY || process.env.ANTHROPIC_API_KEY || "";
+  // The scout dev middleware shares api/_lib/scout-sources.js with prod, which reads the
+  // Finnhub key from process.env — loadEnv() parses .env files but does NOT populate
+  // process.env, so bridge it here (dev-server process only; never shipped to the browser).
+  if (env.FINNHUB_API_KEY && !process.env.FINNHUB_API_KEY) process.env.FINNHUB_API_KEY = env.FINNHUB_API_KEY;
   return {
-    plugins: [react(), anthropicProxy(apiKey), historyProxy(), fundamentalsProxy(), fxProxy(), newsProxy(), lookupProxy()],
+    plugins: [react(), anthropicProxy(apiKey), historyProxy(), fundamentalsProxy(), fxProxy(), newsProxy(), lookupProxy(), scoutProxy()],
     server: { port: Number(process.env.PORT) || 5173, host: true },
     build: {
       rollupOptions: {

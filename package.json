@@ -3,7 +3,7 @@
   "private": true,
   "version": "0.1.0",
   "type": "module",
-  "description": "Verdict — a personalized AI stock-evaluation app (research/education, not investment advice).",
+  "description": "Verdict \u2014 a personalized AI stock-evaluation app (research/education, not investment advice).",
   "scripts": {
     "dev": "vite",
     "lint": "eslint .",
@@ -14,7 +14,8 @@
     "tauri:build": "tauri build",
     "mobile:sync": "npm run build && cap sync",
     "mobile:android": "npm run build && cap sync && cap open android",
-    "mobile:ios": "npm run build && cap sync && cap open ios"
+    "mobile:ios": "npm run build && cap sync && cap open ios",
+    "test": "node --test 'tests/**/*.test.js'"
   },
   "dependencies": {
     "@capacitor/android": "^8.4.1",

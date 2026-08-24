@@ -90,6 +90,12 @@ async function fetchSecQuarterlyFinancials(ticker) {
     const revByDate = extractQuarterly(usgaap, ["RevenueFromContractWithCustomerExcludingAssessedTax", "Revenues", "SalesRevenueNet", "SalesRevenueServicesGross"], "USD");
     const epsByDate = extractQuarterly(usgaap, ["EarningsPerShareDiluted", "EarningsPerShareBasic"], "USD/shares");
     const niByDate = extractQuarterly(usgaap, ["NetIncomeLoss"], "USD");
+    // Scout additions (additive row keys — existing consumers ignore them): operating income
+    // + gross profit power the margin-trajectory metrics; diluted share counts power the
+    // dilution penalty. Same tag-merge + first-filed discipline as revenue.
+    const oiByDate = extractQuarterly(usgaap, ["OperatingIncomeLoss"], "USD");
+    const gpByDate = extractQuarterly(usgaap, ["GrossProfit"], "USD");
+    const shByDate = extractQuarterly(usgaap, ["WeightedAverageNumberOfDilutedSharesOutstanding", "WeightedAverageNumberOfSharesOutstandingBasic"], "shares");
     const allDates = new Set([...Object.keys(revByDate), ...Object.keys(epsByDate), ...Object.keys(niByDate)]);
     const quarterlyFinancials = [...allDates]
       .sort()
@@ -98,6 +104,9 @@ async function fetchSecQuarterlyFinancials(ticker) {
         totalRevenue: revByDate[date]?.val ?? null,
         netIncome: niByDate[date]?.val ?? null,
         eps: epsByDate[date]?.val ?? null,
+        operatingIncome: oiByDate[date]?.val ?? null,
+        grossProfit: gpByDate[date]?.val ?? null,
+        sharesDiluted: shByDate[date]?.val ?? null,
         // Earliest date this quarter's numbers were actually public (latest of the per-metric filings).
         filed: [revByDate[date]?.filed, niByDate[date]?.filed, epsByDate[date]?.filed].filter(Boolean).sort().pop() || null,
       }))
@@ -133,6 +142,7 @@ export default async function handler(req, res) {
       "incomeStatementHistoryQuarterly",
       "earningsHistory",
       "summaryDetail",
+      "price", // Scout: currency, marketCap and exchange — works for EU suffixes too
     ].join(",");
 
     const url = `https://query1.finance.yahoo.com/v10/finance/quoteSummary/${encodeURIComponent(ticker)}?modules=${encodeURIComponent(modules)}&crumb=${encodeURIComponent(crumb)}`;
@@ -176,7 +186,10 @@ export default async function handler(req, res) {
           const date = new Date(s.endDate.raw * 1000).toISOString().slice(0, 10);
           const eps = s.dilutedEPS?.raw ?? earningsEpsByDate[date] ?? null;
           // Yahoo doesn't expose a filing date — callers fall back to a conservative lag.
-          return { date, totalRevenue: s.totalRevenue?.raw ?? null, netIncome: s.netIncome?.raw ?? null, eps, filed: null };
+          return {
+            date, totalRevenue: s.totalRevenue?.raw ?? null, netIncome: s.netIncome?.raw ?? null, eps, filed: null,
+            operatingIncome: s.operatingIncome?.raw ?? null, grossProfit: s.grossProfit?.raw ?? null, sharesDiluted: null,
+          };
         })
         .filter(s => s.totalRevenue != null)
         .sort((a, b) => a.date.localeCompare(b.date));
@@ -196,6 +209,36 @@ export default async function handler(req, res) {
     const stats = result.defaultKeyStatistics || {};
     const financial = result.financialData || {};
     const summary = result.summaryDetail || {};
+    const priceMod = result.price || {};
+
+    // Scout extension: fields the quoteSummary payload already carried but the app never
+    // extracted — ownership levels, analyst count, margins, cash/debt, liquidity. Grouped
+    // under one additive key so existing consumers see an unchanged shape. EU listings
+    // (.PA/.AS/.L/.DE/.ST/...) populate these too, which is what makes the EU leg of the
+    // screener possible without a paid provider.
+    const extended = {
+      currency: priceMod.currency ?? financial.financialCurrency ?? null,
+      marketCap: priceMod.marketCap?.raw ?? summary.marketCap?.raw ?? null,
+      price: priceMod.regularMarketPrice?.raw ?? financial.currentPrice?.raw ?? null,
+      exchange: priceMod.exchange ?? null,
+      exchangeName: priceMod.exchangeName ?? null,
+      quoteType: priceMod.quoteType ?? null,
+      avgVolume: summary.averageVolume?.raw ?? priceMod.averageDailyVolume3Month?.raw ?? null,
+      sharesOutstanding: stats.sharesOutstanding?.raw ?? null,
+      heldPercentInsiders: stats.heldPercentInsiders?.raw ?? null,
+      heldPercentInstitutions: stats.heldPercentInstitutions?.raw ?? null,
+      numberOfAnalystOpinions: financial.numberOfAnalystOpinions?.raw ?? null,
+      grossMargins: financial.grossMargins?.raw ?? null,
+      operatingMargins: financial.operatingMargins?.raw ?? null,
+      profitMargins: financial.profitMargins?.raw ?? null,
+      totalCash: financial.totalCash?.raw ?? null,
+      totalDebt: financial.totalDebt?.raw ?? null,
+      ebitda: financial.ebitda?.raw ?? null,
+      freeCashflow: financial.freeCashflow?.raw ?? null,
+      operatingCashflow: financial.operatingCashflow?.raw ?? null,
+      totalRevenueTTM: financial.totalRevenue?.raw ?? null,
+      revenueGrowth: financial.revenueGrowth?.raw ?? null,
+    };
 
     // Fundamentals move on a quarterly cadence — an hour of shared CDN cache spares Yahoo/SEC
     // from repeated identical fetches (e.g. stress-testing 8 tickers, then re-running).
@@ -211,6 +254,7 @@ export default async function handler(req, res) {
       quarterlyFinancials,
       earnings,
       dividends,
+      extended,
     });
   } catch (e) {
     return res.status(500).json({ error: "Failed to fetch fundamentals: " + String(e) });
