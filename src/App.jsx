@@ -17,6 +17,7 @@ import {
   ErrorBanner, EmptyState, Modal, SlideOver, motion, AnimatePresence,
 } from "./ui/primitives.jsx";
 import { fetchHistoricalStats, historicalStatsText, runBuyAndHold, calcStats, backtestSmaCrossover } from "./lib/marketStats.js";
+import { computePortfolioRisk, portfolioRiskText } from "./lib/portfolioRisk.js";
 
 // Catches a render error in whichever screen is active and shows a recoverable message instead
 // of letting it unmount the entire app (React's default with no error boundary is a blank page).
@@ -1351,6 +1352,65 @@ function ProfileEditor({ profile, onSave, onClose, onSignOut }) {
 // ============================================================
 //  DOSSIER — two-column: sticky brief + scrolling evidence
 // ============================================================
+// Correlation heatmap + portfolio-risk stats for the review — rendered straight from the
+// computed matrix (src/lib/portfolioRisk.js), never from AI output. Diverging cell color:
+// red-ish = the pair moves together (risk concentrates), blue-ish = it genuinely diversifies.
+function corrCellColor(v) {
+  const t = Math.max(-1, Math.min(1, v));
+  return t >= 0 ? `rgba(230, 96, 82, ${0.08 + 0.55 * t})` : `rgba(82, 140, 230, ${0.08 + 0.55 * -t})`;
+}
+function CorrelationCard({ risk }) {
+  if (!risk || !risk.tickers || risk.tickers.length < 2) return null;
+  const n = risk.tickers.length;
+  const cell = n > 12 ? 24 : 30;
+  const stats = [
+    risk.portfolioVol != null && ["Portfolio volatility", `${risk.portfolioVol.toFixed(1)}%`, "annualized, exposure-weighted"],
+    risk.weightedStandaloneVol != null && ["Sum of parts", `${risk.weightedStandaloneVol.toFixed(1)}%`, "weighted standalone vols"],
+    risk.diversificationBenefit != null && ["Diversification benefit", `−${Math.max(0, risk.diversificationBenefit).toFixed(0)}%`, "volatility removed by mixing"],
+    risk.avgCorr != null && ["Avg pair correlation", risk.avgCorr.toFixed(2), "1y daily returns"],
+  ].filter(Boolean);
+  return (
+    <Card pad={18}>
+      <Overline color={c.text3} style={{ marginBottom: 4 }}>Correlation &amp; portfolio risk</Overline>
+      <div style={{ ...type.caption, color: c.text3, marginBottom: 14 }}>Computed from each holding's real 1y daily returns — not estimated.</div>
+      <div style={{ display: "flex", gap: 22, flexWrap: "wrap", marginBottom: 16 }}>
+        {stats.map(([label, val, sub]) => (
+          <div key={label}>
+            <div style={{ ...type.caption, color: c.text3 }}>{label}</div>
+            <div style={{ ...type.data, fontSize: 20, color: c.text }}>{val}</div>
+            <div style={{ ...type.caption, color: c.text3, fontSize: 10 }}>{sub}</div>
+          </div>
+        ))}
+      </div>
+      <div style={{ overflowX: "auto" }}>
+        <div style={{ display: "grid", gridTemplateColumns: `52px repeat(${n}, ${cell}px)`, gap: 1, width: "max-content" }}>
+          <span />
+          {risk.tickers.map((t) => (
+            <span key={`h-${t}`} style={{ ...type.caption, fontSize: 9, color: c.text3, writingMode: "vertical-rl", transform: "rotate(180deg)", height: 44, display: "flex", alignItems: "center", justifyContent: "flex-end" }}>{t}</span>
+          ))}
+          {risk.tickers.map((rowT, i) => (
+            <React.Fragment key={`r-${rowT}`}>
+              <span style={{ ...type.caption, fontSize: 9, color: c.text3, display: "flex", alignItems: "center", justifyContent: "flex-end", paddingRight: 6 }}>{rowT}</span>
+              {risk.tickers.map((colT, j) => (
+                <span key={`${rowT}-${colT}`} title={`${rowT} × ${colT}: ${risk.corr[i][j].toFixed(2)}`}
+                  style={{ width: cell, height: cell, background: i === j ? c.surface2 : corrCellColor(risk.corr[i][j]), display: "flex", alignItems: "center", justifyContent: "center", fontSize: 8, fontFamily: "inherit", color: c.text2, borderRadius: 2 }}>
+                  {i === j ? "" : Math.round(risk.corr[i][j] * 100)}
+                </span>
+              ))}
+            </React.Fragment>
+          ))}
+        </div>
+      </div>
+      <div style={{ ...type.caption, color: c.text3, marginTop: 10, lineHeight: 1.5 }}>
+        Cell = correlation × 100. Red pairs move together (risk concentrates); blue pairs offset.
+        {risk.topPairs?.length ? ` Most coupled: ${risk.topPairs.slice(0, 3).map((p) => `${p.a}–${p.b} (${p.corr.toFixed(2)})`).join(", ")}.` : ""}
+        {risk.mostDiversifying ? ` Best diversifier: ${risk.mostDiversifying.ticker} (avg ${risk.mostDiversifying.avg.toFixed(2)}).` : ""}
+        {risk.excluded?.length ? ` Excluded (short history): ${risk.excluded.join(", ")}.` : ""}
+      </div>
+    </Card>
+  );
+}
+
 function Conclusion({ text }) {
   if (!text) return null;
   return (
@@ -3130,7 +3190,9 @@ Order the items array most-important first. Return ONLY this JSON:
             if (prices && prices.length) {
               const latest = prices[prices.length - 1];
               const stats = prices.length >= 30 ? calcStats(runBuyAndHold(prices, 10000)) : null;
-              return { ticker: h.ticker, price: latest.close, currency: d.currency, name: d.name, stats };
+              // Keep the raw series: the covariance/correlation matrix below reuses these exact
+              // responses, so cross-asset risk costs zero additional API calls.
+              return { ticker: h.ticker, price: latest.close, currency: d.currency, name: d.name, stats, prices };
             }
           } catch (_) {}
           return { ticker: h.ticker, price: null };
@@ -3149,6 +3211,22 @@ Order the items array most-important first. Return ONLY this JSON:
         return `${h.ticker}: ${h.shares} shares @ ${costLabel} avg cost · current price unavailable`;
       }).join("\n");
 
+      // REAL cross-asset risk: correlation/covariance from the same 1y series fetched above.
+      // Weights = FX-converted market exposure per holding (shares aggregated across rows of the
+      // same ticker); a missing FX rate yields null and portfolioRisk simply omits the weighted
+      // stats while keeping the correlation matrix, which needs no weights.
+      const seriesByTicker = {}, valueByTicker = {};
+      for (const p of priceResults) {
+        if (!p.prices) continue;
+        seriesByTicker[p.ticker] = p.prices;
+        const totalShares = holdings.filter((h) => h.ticker === p.ticker).reduce((a, h) => a + (parseNum(h.shares) || 0), 0);
+        valueByTicker[p.ticker] = p.price != null ? fxConvert(totalShares * p.price, p.currency || "USD", "USD", fxRates) : null;
+      }
+      const risk = computePortfolioRisk(seriesByTicker, valueByTicker);
+      const riskBlock = risk ? `
+COMPUTED PORTFOLIO RISK — ground truth from Atlas's own covariance engine (1y daily returns, real price data — use these EXACT numbers for every correlation/diversification/portfolio-risk statement; do not estimate your own):
+${portfolioRiskText(risk)}` : "";
+
       // Cached market headlines as recency context — already fetched by the Today screen, costs a
       // few hundred tokens instead of a live search.
       const newsCtx = (marketNews?.items || []).slice(0, 5).map((n) => `- ${n.headline} (${n.source}, ${n.date || "recent"})`).join("\n");
@@ -3164,6 +3242,7 @@ CURRENT HOLDINGS with live prices:
 ${holdingsWithPrices}
 
 SPARE CASH AVAILABLE TO DEPLOY: ${spareCash && parseNum(spareCash) > 0 ? `${spareCashCurrency} ${spareCash}` : "not specified"}
+${riskBlock}
 ${newsCtx ? `\nRECENT MARKET HEADLINES (already fetched — context only):\n${newsCtx}\n` : ""}
 For EACH holding decide ONE action: "Buy More","Hold","Trim","Sell" — exactly these four, nothing else (no "Add", no synonyms; "Buy More" already means increase this position). Give scoreForYou 0–100 and one-sentence rationale referencing their cost basis and profile.
 
@@ -3183,7 +3262,7 @@ Schema:
       const reviewMaxTokens = Math.max(2200, holdings.length * 150 + 1000);
       const parsed = await callClaudeAnalyze(sys, "Review my portfolio.", { maxTokens: reviewMaxTokens });
       if (!parsed?.holdings) throw new Error("Couldn't analyze the portfolio. Try again.");
-      const enriched = { ...parsed, holdings: parsed.holdings.map((h) => {
+      const enriched = { ...parsed, risk, holdings: parsed.holdings.map((h) => {
         const p = priceMap[(h.ticker || "").toUpperCase()];
         if (p?.price != null) return { ...h, currentPrice: String(p.price.toFixed(2)) };
         return h;
@@ -3797,6 +3876,7 @@ Schema:
                   <Button variant="ghost" size="sm" onClick={() => analyzePortfolio({ force: true })}>Re-analyze</Button>
                 </div>
               )}
+              {review.risk && <CorrelationCard risk={review.risk} />}
               {review.portfolio.cashAdvice && spareCashDisplay != null && (
                 <Card accentEdge pad={18} style={{ background: c.accentSoft, borderColor: c.accentBorder }}>
                   <Overline color={c.accent} style={{ marginBottom: 8 }}>Deploy {fmtCurrency(spareCashDisplay, portfolioCurrency)} cash</Overline>
