@@ -1360,19 +1360,31 @@ function corrCellColor(v) {
   return t >= 0 ? `rgba(230, 96, 82, ${0.08 + 0.55 * t})` : `rgba(82, 140, 230, ${0.08 + 0.55 * -t})`;
 }
 function CorrelationCard({ risk }) {
+  const [showExplainer, setShowExplainer] = useState(false);
   if (!risk || !risk.tickers || risk.tickers.length < 2) return null;
   const n = risk.tickers.length;
   const cell = n > 12 ? 24 : 30;
   const stats = [
-    risk.portfolioVol != null && ["Portfolio volatility", `${risk.portfolioVol.toFixed(1)}%`, "annualized, exposure-weighted"],
-    risk.weightedStandaloneVol != null && ["Sum of parts", `${risk.weightedStandaloneVol.toFixed(1)}%`, "weighted standalone vols"],
-    risk.diversificationBenefit != null && ["Diversification benefit", `−${Math.max(0, risk.diversificationBenefit).toFixed(0)}%`, "volatility removed by mixing"],
-    risk.avgCorr != null && ["Avg pair correlation", risk.avgCorr.toFixed(2), "1y daily returns"],
+    risk.portfolioVol != null && ["Portfolio volatility", `${risk.portfolioVol.toFixed(1)}%`, "how bumpy a typical year is"],
+    risk.weightedStandaloneVol != null && ["Sum of parts", `${risk.weightedStandaloneVol.toFixed(1)}%`, "bumpiness if mixing didn't help"],
+    risk.diversificationBenefit != null && ["Diversification benefit", `−${Math.max(0, risk.diversificationBenefit).toFixed(0)}%`, "smoothing you get from mixing"],
+    risk.avgCorr != null && ["Avg pair correlation", risk.avgCorr.toFixed(2), "how alike your holdings move"],
   ].filter(Boolean);
   return (
     <Card pad={18}>
-      <Overline color={c.text3} style={{ marginBottom: 4 }}>Correlation &amp; portfolio risk</Overline>
+      <div style={{ display: "flex", alignItems: "baseline", justifyContent: "space-between", gap: 10, flexWrap: "wrap", marginBottom: 4 }}>
+        <Overline color={c.text3}>Correlation &amp; portfolio risk</Overline>
+        <Button variant="ghost" size="sm" onClick={() => setShowExplainer((v) => !v)} style={{ color: c.text3 }}>{showExplainer ? "Hide explainer" : "What does this mean?"}</Button>
+      </div>
       <div style={{ ...type.caption, color: c.text3, marginBottom: 14 }}>Computed from each holding's real 1y daily returns — not estimated.</div>
+      {showExplainer && (
+        <div style={{ ...type.caption, color: c.text2, background: c.surface2, border: `1px solid ${c.hairline}`, borderRadius: radius.sm, padding: "12px 14px", marginBottom: 16, lineHeight: 1.65 }}>
+          <p style={{ margin: "0 0 8px" }}><strong>Correlation</strong> measures how much two of your stocks move together, day to day. <strong>100</strong> means they're basically twins — when one drops, the other drops too. <strong>0</strong> means they're unrelated. <strong>Negative</strong> means one tends to rise when the other falls, which cushions your portfolio.</p>
+          <p style={{ margin: "0 0 8px" }}>Why it matters: owning ten stocks that all move together is closer to owning <em>one big stock</em> than a diversified portfolio. The red cells show where that's happening in yours — those holdings will likely fall on the same bad day. Blue cells are doing real diversification work.</p>
+          <p style={{ margin: "0 0 8px" }}><strong>Portfolio volatility</strong> is how bumpy your portfolio's overall value ride is in a typical year — e.g. 20% means swings on the order of ±20% around its path are normal, not a sign something's wrong. <strong>Sum of parts</strong> is how bumpy it would be if your holdings all moved in lockstep; the gap between the two numbers (the <strong>diversification benefit</strong>) is smoothing you're getting for free, just from owning things that don't move together.</p>
+          <p style={{ margin: 0 }}>None of this predicts returns — it describes risk. Correlations are measured from the past year and can change, especially in a crash, when most stocks temporarily move together. Educational information, not investment advice.</p>
+        </div>
+      )}
       <div style={{ display: "flex", gap: 22, flexWrap: "wrap", marginBottom: 16 }}>
         {stats.map(([label, val, sub]) => (
           <div key={label}>
